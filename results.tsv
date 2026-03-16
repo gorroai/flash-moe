@@ -1,0 +1,11 @@
+commit	model	params_B	active_B	tok_sec	ttft_ms	mem_gb	status	description
+53881f9	Qwen3.5-122B-A10B-4bit	122.0	10.0	0.93	6236	3.7	keep	selective expert direct I/O - 10.3x over naive offload
+198f9f7	Qwen3.5-122B-A10B-4bit	122.0	10.0	1.13	5338	3.8	discard	LRU cache 768 entries - BROKEN OUTPUT (cache eviction race)
+757b156	Qwen3.5-122B-A10B-4bit	122.0	10.0	1.21	6682	3.9	discard	file handle cache + 1536 LRU - BROKEN OUTPUT (cache eviction race)
+0a9ef8c	Qwen3.5-122B-A10B-4bit	122.0	10.0	3.43	2970	10.0	discard	threaded I/O - BROKEN OUTPUT (cache eviction race, garbage text)
+2b54439	Qwen3.5-122B-A10B-4bit	122.0	10.0	3.88	2981	10.5	discard	batched clear - BROKEN OUTPUT (cache eviction race)
+9ac9aa8	Qwen3.5-122B-A10B-4bit	122.0	10.0	2.45	1953	10.5	keep	direct MoE + LRU fix - first correct output, 49% cache hit
+a0063cc	Qwen3.5-122B-A10B-4bit	122.0	10.0	2.54	2157	10.2	keep	coalesced expert reads - 3.7% speedup
+bb0286e	Qwen3.5-122B-A10B-4bit	122.0	10.0	2.67	2100	17.0	keep	3072 LRU entries - 70% hit rate, 5% speedup
+HEAD	Qwen3.5-35B-A3B-4bit	5.4	3.0	36.95	841	14.5	keep	35B baseline (fits DRAM) - reference for speculative decoding
+HEAD	Qwen3.5-397B-A17B-4bit	397.0	17.0	0.47	6305	20.6	keep	397B MOONSHOT - 209GB model on 48GB laptop, 23% cache hit at 5 tokens
