@@ -1772,13 +1772,13 @@ def generate_offload_selective(model, tokenizer, prompt, max_tokens, weight_inde
                 # Fusing them halves the sync overhead for this phase.
                 if profile:
                     t_attn_eval = time.perf_counter()
-                    mx.eval(inds)  # eval ONLY routing; h_mid stays lazy (evaluated during expert compute)
+                    mx.eval(inds)
                     t_attn_eval_done = time.perf_counter()
                     layer_attn_eval_ms = (t_attn_eval_done - t_attn_eval) * 1000
                     layer_route_eval_ms = 0.0
                     layer_routing_ms = (t_attn_eval - t_attn) * 1000
                 else:
-                    mx.eval(inds)  # eval ONLY routing; h_mid stays lazy
+                    mx.eval(inds)
                     attn_router_time = time.time() - t_attn
             else:
                 if profile:
