@@ -186,7 +186,11 @@ def read_expert_slices_direct(filepath, tensor_name, expert_indices, header_cach
 
 
 def _read_single_expert_attrs(expert_idx, layer_idx, expert_file_map, header_cache):
-    """Read all 9 tensor attributes for a single expert using thread-local file handles.
+    """Read all 9 tensor attributes for a single expert using coalesced I/O.
+
+    Instead of 9 individual seek+read operations, groups reads by file, sorts by
+    offset, and merges adjacent reads within a 64KB gap into larger sequential reads.
+    This reduces ~9 seeks per expert to ~1-3 larger reads.
 
     Each thread opens its own file handles (no shared seek positions), reads all
     3 projections x 3 attributes, and returns a dict of results.
@@ -210,63 +214,95 @@ def _read_single_expert_attrs(expert_idx, layer_idx, expert_file_map, header_cac
         'I32': (np.int32, 4),
     }
 
+    COALESCE_GAP = 65536  # 64KB: merge reads with gaps smaller than this
+
+    # Phase 1: Collect all (file, offset, size, metadata) tuples without doing I/O
+    read_specs = []  # list of (filepath, abs_offset, byte_len, proj_name, attr_name, expert_shape, dtype_str, np_dtype)
+    for proj_name in ("gate_proj", "up_proj", "down_proj"):
+        prefix = f"language_model.model.layers.{layer_idx}.mlp.switch_mlp.{proj_name}"
+        for attr_name in ("weight", "scales", "biases"):
+            full_key = f"{prefix}.{attr_name}"
+            if full_key not in expert_file_map:
+                continue
+            filepath = expert_file_map[full_key]
+
+            header, data_start = header_cache[filepath]
+            meta = header[full_key]
+            shape = meta['shape']
+            dtype_str = meta['dtype']
+            tensor_offsets = meta['data_offsets']
+            tensor_start = data_start + tensor_offsets[0]
+            expert_shape = shape[1:]
+
+            np_dtype, elem_size = NP_DTYPE[dtype_str]
+            expert_elems = 1
+            for d in expert_shape:
+                expert_elems *= d
+            expert_bytes = expert_elems * elem_size
+
+            abs_offset = tensor_start + int(expert_idx) * expert_bytes
+            read_specs.append((filepath, abs_offset, expert_bytes, proj_name, attr_name, expert_shape, dtype_str, np_dtype))
+
+    # Phase 2: Group by file, sort by offset, merge adjacent reads
+    by_file = defaultdict(list)
+    for spec in read_specs:
+        by_file[spec[0]].append(spec)
+
     results = {}
-    # Thread-local file handles: filepath -> open file object
     local_handles = {}
-    # I/O instrumentation counters
     io_bytes = 0
     io_seeks = 0
     io_time = 0.0
     array_time = 0.0
 
     try:
-        for proj_name in ("gate_proj", "up_proj", "down_proj"):
-            prefix = f"language_model.model.layers.{layer_idx}.mlp.switch_mlp.{proj_name}"
-            for attr_name in ("weight", "scales", "biases"):
-                full_key = f"{prefix}.{attr_name}"
-                if full_key not in expert_file_map:
-                    continue
-                filepath = expert_file_map[full_key]
+        for filepath, specs in by_file.items():
+            # Sort by file offset
+            specs.sort(key=lambda s: s[1])
 
-                # Parse header (header_cache is pre-populated, so this is just a dict lookup)
-                header, data_start = header_cache[filepath]
-                meta = header[full_key]
-                shape = meta['shape']
-                dtype_str = meta['dtype']
-                tensor_offsets = meta['data_offsets']
-                tensor_start = data_start + tensor_offsets[0]
-                expert_shape = shape[1:]
+            # Merge into coalesced read groups
+            # Each group: (start_offset, total_len, [(local_offset, byte_len, proj_name, attr_name, expert_shape, dtype_str, np_dtype), ...])
+            groups = []
+            for spec in specs:
+                _, abs_offset, byte_len, proj_name, attr_name, expert_shape, dtype_str, np_dtype = spec
+                if groups:
+                    g_start, g_len, g_items = groups[-1]
+                    g_end = g_start + g_len
+                    gap = abs_offset - g_end
+                    if gap <= COALESCE_GAP:
+                        # Extend the current group to cover this read
+                        new_end = abs_offset + byte_len
+                        groups[-1] = (g_start, new_end - g_start, g_items)
+                        local_offset = abs_offset - g_start
+                        g_items.append((local_offset, byte_len, proj_name, attr_name, expert_shape, dtype_str, np_dtype))
+                        continue
+                # Start a new group
+                groups.append((abs_offset, byte_len, [(0, byte_len, proj_name, attr_name, expert_shape, dtype_str, np_dtype)]))
 
-                np_dtype, elem_size = NP_DTYPE[dtype_str]
-                expert_elems = 1
-                for d in expert_shape:
-                    expert_elems *= d
-                expert_bytes = expert_elems * elem_size
+            # Open file handle (reuse within this thread)
+            if filepath not in local_handles:
+                local_handles[filepath] = open(filepath, 'rb')
+            f = local_handles[filepath]
 
-                # Open file handle per filepath (reuse within this thread)
-                if filepath not in local_handles:
-                    local_handles[filepath] = open(filepath, 'rb')
-                f = local_handles[filepath]
-
-                offset = tensor_start + int(expert_idx) * expert_bytes
-
-                # --- Instrumented file I/O ---
+            # Phase 3: Execute coalesced reads and split into individual tensors
+            for g_start, g_len, g_items in groups:
                 t_io = time.time()
-                f.seek(offset)
-                raw = f.read(expert_bytes)
+                f.seek(g_start)
+                raw_chunk = f.read(g_len)
                 io_time += time.time() - t_io
-                io_bytes += expert_bytes
+                io_bytes += g_len
                 io_seeks += 1
 
-                # --- Instrumented array construction ---
                 t_arr = time.time()
-                np_arr = np.frombuffer(raw, dtype=np_dtype).reshape(expert_shape)
+                for local_offset, byte_len, proj_name, attr_name, expert_shape, dtype_str, np_dtype in g_items:
+                    raw = raw_chunk[local_offset:local_offset + byte_len]
+                    np_arr = np.frombuffer(raw, dtype=np_dtype).reshape(expert_shape)
 
-                if dtype_str == 'BF16':
-                    np_f32 = (np_arr.astype(np.uint32) << 16).view(np.float32)
-                    results[(proj_name, attr_name)] = mx.array(np_f32).astype(mx.bfloat16)
-                else:
-                    results[(proj_name, attr_name)] = mx.array(np_arr)
+                    if dtype_str == 'BF16':
+                        np_f32 = (np_arr.astype(np.uint32) << 16).view(np.float32)
+                        results[(proj_name, attr_name)] = mx.array(np_f32).astype(mx.bfloat16)
+                    else:
+                        results[(proj_name, attr_name)] = mx.array(np_arr)
                 array_time += time.time() - t_arr
     finally:
         for fh in local_handles.values():
