@@ -22,11 +22,15 @@
  *           eliminating the CPU round-trip that previously split this into 2 cmd buffers.
  *     CPU:  softmax + top-K + pread all K experts (4 pthreads parallel)
  *     CMD3: all K expert forwards + shared SwiGLU + shared down (DEFERRED commit)
+ *           Batched encoding: 4 encoders for K experts + 2 shared = 6 total
+ *           (vs. old 4*K + 2 = 18 encoders with per-expert encoding)
  *   Total: 3 cmd buffers per layer. CMD3 is submitted async (commit without wait).
- *   The wait+combine for layer N's CMD3 happens at the START of layer N+1,
- *   overlapping ~1ms of GPU expert compute with the next layer's attention+routing.
+ *   The wait+combine for layer N's CMD3 happens at the START of layer N+1.
+ *   Note: CMD3 gets ~0ms overlap (deferred wait at top of next layer).
  *   Multi-expert buffers (MAX_K=8 independent slots) allow all K expert
  *   forwards to be encoded into a single command buffer.
+ *   Batched encoding: 2 encoders per expert (gate+up fused, SwiGLU+down fused)
+ *   + 2 for shared expert = K*2 + 2 total encoders in CMD3.
  *   Double-buffered expert data (buf_multi_expert_data / data_B) for future
  *   async pread overlap with GPU compute.
  *
@@ -104,6 +108,61 @@ static double now_ms(void) {
     struct timeval tv;
     gettimeofday(&tv, NULL);
     return tv.tv_sec * 1000.0 + tv.tv_usec / 1000.0;
+}
+
+// ============================================================================
+// Per-phase timing accumulators for fused_layer_forward
+// Tracks time spent in each pipeline phase across all layers per token.
+// Reset at token boundary, printed as summary.
+// ============================================================================
+
+typedef struct {
+    double deferred_wait;    // waiting for previous CMD3 GPU
+    double deferred_cpu;     // CPU readback + combine for deferred experts
+    double input_norm;       // CPU RMS norm + CMD1 prep
+    double cmd1_submit;      // CMD1 encode + commit
+    double cmd1_wait;        // CMD1 waitUntilCompleted
+    double cpu_attn;         // CPU attention compute (delta-net or full-attn)
+    double cmd2_encode;      // CMD2 encode (o_proj + residual + norm + routing)
+    double cmd2_wait;        // CMD2 commit + waitUntilCompleted
+    double routing_cpu;      // CPU softmax + topK
+    double expert_io;        // parallel pread + cache lookup
+    double cmd3_encode;      // CMD3 encode experts + submit (deferred)
+    double total;            // total per-layer time
+    int count;               // number of layers timed
+} LayerTimingAccum;
+
+static LayerTimingAccum g_timing = {0};
+
+static void timing_reset(void) {
+    memset(&g_timing, 0, sizeof(g_timing));
+}
+
+static void timing_print(void) {
+    if (g_timing.count == 0) return;
+    int n = g_timing.count;
+    fprintf(stderr, "\n[timing] Per-layer breakdown (avg of %d layers, ms):\n", n);
+    fprintf(stderr, "  deferred_wait:  %6.3f\n", g_timing.deferred_wait / n);
+    fprintf(stderr, "  deferred_cpu:   %6.3f\n", g_timing.deferred_cpu / n);
+    fprintf(stderr, "  input_norm:     %6.3f\n", g_timing.input_norm / n);
+    fprintf(stderr, "  cmd1_submit:    %6.3f\n", g_timing.cmd1_submit / n);
+    fprintf(stderr, "  cmd1_wait:      %6.3f\n", g_timing.cmd1_wait / n);
+    fprintf(stderr, "  cpu_attn:       %6.3f\n", g_timing.cpu_attn / n);
+    fprintf(stderr, "  cmd2_encode:    %6.3f\n", g_timing.cmd2_encode / n);
+    fprintf(stderr, "  cmd2_wait:      %6.3f\n", g_timing.cmd2_wait / n);
+    fprintf(stderr, "  routing_cpu:    %6.3f\n", g_timing.routing_cpu / n);
+    fprintf(stderr, "  expert_io:      %6.3f\n", g_timing.expert_io / n);
+    fprintf(stderr, "  cmd3_encode:    %6.3f\n", g_timing.cmd3_encode / n);
+    fprintf(stderr, "  total_layer:    %6.3f\n", g_timing.total / n);
+    fprintf(stderr, "  sum_phases:     %6.3f\n",
+            (g_timing.deferred_wait + g_timing.deferred_cpu + g_timing.input_norm +
+             g_timing.cmd1_submit + g_timing.cmd1_wait + g_timing.cpu_attn +
+             g_timing.cmd2_encode + g_timing.cmd2_wait + g_timing.routing_cpu +
+             g_timing.expert_io + g_timing.cmd3_encode) / n);
+    fprintf(stderr, "  cmd_buffers:    %d (3 per layer: CMD1+CMD2+CMD3)\n", n * 3);
+    fprintf(stderr, "  sync_waits:     %d (2 per layer: CMD1+CMD2, CMD3 deferred)\n", n * 2);
+    fprintf(stderr, "  gpu_encoders:   ~%d per layer (CMD1:3-4, CMD2:8-12, CMD3:~10)\n",
+            22);  // approximate
 }
 
 // ============================================================================
@@ -644,6 +703,9 @@ typedef struct {
     id<MTLBuffer> buf_attn_scores;  // [NUM_ATTN_HEADS * MAX_SEQ_LEN floats] all heads' scores
     id<MTLBuffer> buf_attn_out;     // [NUM_ATTN_HEADS * HEAD_DIM floats] full attention output
     id<MTLBuffer> buf_attn_gate;    // [NUM_ATTN_HEADS * HEAD_DIM floats] sigmoid gate
+    // Shared event for CPU-GPU synchronization (async pipeline)
+    id<MTLSharedEvent> pipeline_event;   // CPU signals when buf_input is ready
+    uint64_t event_value;                // monotonically increasing event counter
 } MetalCtx;
 
 static MetalCtx *g_metal = NULL;
@@ -811,6 +873,10 @@ static MetalCtx *metal_setup(void) {
                NUM_FULL_ATTN_LAYERS, kv_cache_size / 1e6,
                (double)(NUM_ATTN_HEADS * MAX_SEQ_LEN * sizeof(float)) / 1e6);
     }
+
+    // Create shared event for CPU-GPU async pipeline
+    ctx->pipeline_event = [ctx->device newSharedEvent];
+    ctx->event_value = 0;
 
     printf("[metal] Inference pipelines ready (multi-expert[%d] + shared buffers allocated)\n", MAX_K);
     return ctx;
@@ -1257,6 +1323,97 @@ static void gpu_encode_expert_forward_slot_buf(
         [enc dispatchThreadgroups:MTLSizeMake(num_tgs, 1, 1)
             threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
         [enc endEncoding];
+    }
+}
+
+// Batched expert encoding: encode K experts using 2 encoders per expert
+// (gate+up fused, SwiGLU+down fused) + 2 for shared = K*2 + 2 encoders total.
+// With K=4: 10 encoders (vs. old 4*K + 2 = 18 with per-operation encoding).
+// Each expert gets its own encoder pair for GPU parallelism across experts.
+// Within each encoder, gate+up (or SwiGLU+down) are serialized but share
+// encoder creation overhead. Net win: fewer encoders, same parallelism.
+static void gpu_encode_experts_batched(
+    MetalCtx *ctx,
+    id<MTLCommandBuffer> cmdbuf,
+    int K,                       // number of experts to encode
+    const int *valid,            // which experts are valid [MAX_K]
+    id<MTLBuffer> __strong *expert_bufs   // per-expert weight data buffers [MAX_K]
+) {
+    NSUInteger gate_w_off = 0;
+    NSUInteger gate_s_off = 2097152;
+    NSUInteger gate_b_off = 2228224;
+    NSUInteger up_w_off   = 2359296;
+    NSUInteger up_s_off   = 4456448;
+    NSUInteger up_b_off   = 4587520;
+    NSUInteger down_w_off = 4718592;
+    NSUInteger down_s_off = 6815744;
+    NSUInteger down_b_off = 6946816;
+
+    uint32_t gate_up_out = MOE_INTERMEDIATE;
+    uint32_t gate_up_in  = HIDDEN_DIM;
+    uint32_t down_out    = HIDDEN_DIM;
+    uint32_t down_in     = MOE_INTERMEDIATE;
+    uint32_t gs          = GROUP_SIZE;
+    uint32_t gate_up_tgs = (gate_up_out + 7) / 8;
+    uint32_t down_tgs    = (down_out + 7) / 8;
+    uint32_t swiglu_tgs  = (gate_up_out + 255) / 256;
+
+    // Per-expert: Encoder A (gate+up), Encoder B (SwiGLU+down)
+    // Separate encoders per expert enables GPU parallelism across experts.
+    // Within each encoder, operations serialize (gate then up, SwiGLU then down).
+    for (int k = 0; k < K; k++) {
+        if (!valid[k]) continue;
+
+        // Encoder A: gate_proj + up_proj (both read same input, write different outputs)
+        {
+            id<MTLComputeCommandEncoder> enc = [cmdbuf computeCommandEncoder];
+            // gate_proj
+            [enc setComputePipelineState:ctx->matvec_v3];
+            [enc setBuffer:expert_bufs[k]                  offset:gate_w_off  atIndex:0];
+            [enc setBuffer:expert_bufs[k]                  offset:gate_s_off  atIndex:1];
+            [enc setBuffer:expert_bufs[k]                  offset:gate_b_off  atIndex:2];
+            [enc setBuffer:ctx->buf_multi_expert_input     offset:0           atIndex:3];
+            [enc setBuffer:ctx->buf_multi_expert_gate[k]   offset:0           atIndex:4];
+            [enc setBytes:&gate_up_out length:4 atIndex:5];
+            [enc setBytes:&gate_up_in  length:4 atIndex:6];
+            [enc setBytes:&gs          length:4 atIndex:7];
+            [enc dispatchThreadgroups:MTLSizeMake(gate_up_tgs, 1, 1)
+                threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+            // up_proj (same encoder, serialized after gate — shares encoder overhead)
+            [enc setBuffer:expert_bufs[k]                  offset:up_w_off  atIndex:0];
+            [enc setBuffer:expert_bufs[k]                  offset:up_s_off  atIndex:1];
+            [enc setBuffer:expert_bufs[k]                  offset:up_b_off  atIndex:2];
+            [enc setBuffer:ctx->buf_multi_expert_up[k]     offset:0          atIndex:4];
+            [enc dispatchThreadgroups:MTLSizeMake(gate_up_tgs, 1, 1)
+                threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+            [enc endEncoding];
+        }
+
+        // Encoder B: SwiGLU + down_proj (SwiGLU depends on gate+up from Enc A)
+        {
+            id<MTLComputeCommandEncoder> enc = [cmdbuf computeCommandEncoder];
+            // SwiGLU
+            [enc setComputePipelineState:ctx->swiglu];
+            [enc setBuffer:ctx->buf_multi_expert_gate[k] offset:0 atIndex:0];
+            [enc setBuffer:ctx->buf_multi_expert_up[k]   offset:0 atIndex:1];
+            [enc setBuffer:ctx->buf_multi_expert_act[k]  offset:0 atIndex:2];
+            [enc setBytes:&gate_up_out length:4 atIndex:3];
+            [enc dispatchThreadgroups:MTLSizeMake(swiglu_tgs, 1, 1)
+                threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+            // down_proj (same encoder, serialized after SwiGLU)
+            [enc setComputePipelineState:ctx->matvec_v3];
+            [enc setBuffer:expert_bufs[k]                  offset:down_w_off  atIndex:0];
+            [enc setBuffer:expert_bufs[k]                  offset:down_s_off  atIndex:1];
+            [enc setBuffer:expert_bufs[k]                  offset:down_b_off  atIndex:2];
+            [enc setBuffer:ctx->buf_multi_expert_act[k]    offset:0           atIndex:3];
+            [enc setBuffer:ctx->buf_multi_expert_out[k]    offset:0           atIndex:4];
+            [enc setBytes:&down_out length:4 atIndex:5];
+            [enc setBytes:&down_in  length:4 atIndex:6];
+            [enc setBytes:&gs       length:4 atIndex:7];
+            [enc dispatchThreadgroups:MTLSizeMake(down_tgs, 1, 1)
+                threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+            [enc endEncoding];
+        }
     }
 }
 
@@ -2976,13 +3133,17 @@ typedef struct {
 
 static DeferredExpertState g_deferred = { .active = 0 };
 
-// Complete the deferred GPU expert compute: wait for GPU, read back, accumulate, combine.
-// Must be called before the next layer modifies static scratch buffers.
-static void complete_deferred_experts(void) {
+// Wait for the deferred GPU expert command buffer to complete.
+// Split from finalize so timing can be measured independently.
+static void wait_deferred_experts_gpu(void) {
     if (!g_deferred.active) return;
-
-    // Wait for the async GPU expert command buffer
     [g_deferred.cmd_experts waitUntilCompleted];
+}
+
+// CPU readback + accumulate + combine after GPU is done.
+// Must be called after wait_deferred_experts_gpu().
+static void finalize_deferred_experts(void) {
+    if (!g_deferred.active) return;
 
     // Read back and accumulate routed expert outputs
     float moe_out[HIDDEN_DIM];
@@ -3010,6 +3171,13 @@ static void complete_deferred_experts(void) {
 
     g_deferred.active = 0;
     g_deferred.cmd_experts = nil;
+}
+
+// Complete the deferred GPU expert compute: wait for GPU, read back, accumulate, combine.
+// Must be called before the next layer modifies static scratch buffers.
+static void complete_deferred_experts(void) {
+    wait_deferred_experts_gpu();
+    finalize_deferred_experts();
 }
 
 // ============================================================================
@@ -3090,10 +3258,8 @@ static void fused_layer_forward(
     int K,                   // number of active experts
     int packed_fd            // fd for packed expert file
 ) {
-    // Complete any deferred GPU expert compute from the previous layer.
-    // By now, the GPU has had ~3.5ms of the current layer's attention+routing
-    // to finish the previous layer's ~1ms expert compute — always done.
-    complete_deferred_experts();
+    double t_layer_start = now_ms();
+    double t0, t1;
 
     init_layer_scratch();
     if (!layer_cache_built) build_layer_cache(wf);
@@ -3101,21 +3267,12 @@ static void fused_layer_forward(
     int is_full = (kv != NULL);
 
     // =====================================================================
-    // PHASE 1: Build & submit CMD1 (attention projections, non-blocking)
+    // PHASE 1: Deferred completion + CMD1 (attention projections)
     // =====================================================================
 
-    float *normed = s_normed;
-    float *residual = s_residual;
-    cpu_vec_copy(residual, hidden, HIDDEN_DIM);
-
-    // ---- Input LayerNorm (CPU — fast, ~0.01ms) ----
-    cpu_rms_norm(hidden, lc->input_norm_w, normed, HIDDEN_DIM, RMS_NORM_EPS);
-
-    // ---- Prepare attention projection specs ----
+    // ---- Prepare attention projection specs (doesn't depend on hidden) ----
     int num_attn_specs = 0;
     BatchMatvecSpec attn_specs[5];
-
-    // Attention projection pointers (set below, used after CMD1)
     float *q_proj_out = NULL, *k_out = NULL, *v_out = NULL;
     float *qkv_out = NULL, *z_out = NULL, *beta_out = NULL, *alpha_out = NULL;
 
@@ -3153,34 +3310,60 @@ static void fused_layer_forward(
         }
     }
 
-    // ---- Submit CMD1: attention projections (NON-BLOCKING commit) ----
+    // ---- Deferred completion + CMD1 (sequential) ----
+    float *normed = s_normed;
+    float *residual = s_residual;
     id<MTLCommandBuffer> cmd1 = nil;
+
+    // Complete deferred experts from previous layer
+    t0 = now_ms();
+    wait_deferred_experts_gpu();
+    t1 = now_ms();
+    g_timing.deferred_wait += t1 - t0;
+
+    t0 = t1;
+    finalize_deferred_experts();
+    t1 = now_ms();
+    g_timing.deferred_cpu += t1 - t0;
+
+    // Input norm
+    t0 = t1;
+    cpu_vec_copy(residual, hidden, HIDDEN_DIM);
+    cpu_rms_norm(hidden, lc->input_norm_w, normed, HIDDEN_DIM, RMS_NORM_EPS);
+    t1 = now_ms();
+    g_timing.input_norm += t1 - t0;
+
+    // Submit CMD1: attention projections
+    t0 = t1;
     if (g_metal && g_metal->wf_buf && num_attn_specs > 0) {
         memcpy([g_metal->buf_input contents], normed, HIDDEN_DIM * sizeof(float));
         cmd1 = [g_metal->queue commandBuffer];
         gpu_encode_batch_matvec(g_metal, cmd1, attn_specs, num_attn_specs);
-        [cmd1 commit];  // NON-BLOCKING: GPU starts working, CPU continues
+        [cmd1 commit];
     } else {
-        // CPU fallback (synchronous)
         for (int i = 0; i < num_attn_specs; i++) {
             BatchMatvecSpec *s = &attn_specs[i];
             cpu_dequant_matvec(s->W, s->scales, s->biases, normed, s->out_cpu,
                                s->out_dim, s->in_dim, s->group_size);
         }
     }
+    t1 = now_ms();
+    g_timing.cmd1_submit += t1 - t0;
 
-    // ---- While GPU runs CMD1: no overlap work yet, but we saved the wait ----
-    // (Future: could prefetch tensor pointers here)
-
-    // ---- Wait for CMD1 to complete ----
+    // Wait for CMD1
+    t0 = t1;
     if (cmd1) {
         [cmd1 waitUntilCompleted];
         gpu_flush_batch_results(g_metal, attn_specs, num_attn_specs);
     }
+    t1 = now_ms();
+    g_timing.cmd1_wait += t1 - t0;
 
     // =====================================================================
     // PHASE 2: CPU attention compute
     // =====================================================================
+
+    t0 = now_ms();
 
     float *attn_projected = s_attn_proj;
     memset(attn_projected, 0, HIDDEN_DIM * sizeof(float));
@@ -3443,6 +3626,11 @@ static void fused_layer_forward(
     //   Buffer flow: batch_out[6]->buf_output->buf_h_mid->buf_input->batch_out[0-3]
     // =====================================================================
 
+    t1 = now_ms();
+    g_timing.cpu_attn += t1 - t0;
+
+    t0 = t1;
+
     float *h_post = s_h_post;
     float *h_mid = s_h_mid;
     float *gate_scores = s_gate_scores;
@@ -3655,7 +3843,11 @@ static void fused_layer_forward(
         // buf_input already contains h_post from Enc 4 output -- no memcpy needed
         gpu_encode_batch_matvec(g_metal, cmd_fused, moe_specs, 4);
 
+        t1 = now_ms();
+        g_timing.cmd2_encode += t1 - t0;
+
         // ---- Single commit+wait for all 8 encoders ----
+        t0 = t1;
         [cmd_fused commit];
         [cmd_fused waitUntilCompleted];
 
@@ -3667,6 +3859,8 @@ static void fused_layer_forward(
         memcpy(h_post, [g_metal->buf_input contents], HIDDEN_DIM * sizeof(float));
         // Update hidden state to h_mid (= residual + o_proj)
         memcpy(hidden, h_mid, HIDDEN_DIM * sizeof(float));
+        t1 = now_ms();
+        g_timing.cmd2_wait += t1 - t0;
 
     } else {
         // ---- Non-fused fallback path ----
@@ -3699,16 +3893,23 @@ static void fused_layer_forward(
             };
             fast_batch_matvec(h_post, HIDDEN_DIM, moe_specs, 4);
         }
+        t1 = now_ms();
+        g_timing.cmd2_encode += t1 - t0;
+        g_timing.cmd2_wait += 0;  // no GPU wait in fallback
     }
 
     // ---- Softmax + top-K (CPU) ----
+    t0 = now_ms();
     cpu_softmax(gate_scores, NUM_EXPERTS);
     int expert_indices[64];
     float expert_weights[64];
     cpu_topk(gate_scores, NUM_EXPERTS, K, expert_indices, expert_weights);
     cpu_normalize_weights(expert_weights, K);
+    t1 = now_ms();
+    g_timing.routing_cpu += t1 - t0;
 
     // ---- Parallel pread + GPU experts ----
+    t0 = t1;
     float *moe_out = s_moe_out;
     memset(moe_out, 0, HIDDEN_DIM * sizeof(float));
     float *shared_out = s_shared_out;
@@ -3800,17 +4001,20 @@ static void fused_layer_forward(
         }
 
         // Step 2: copy input
+        t1 = now_ms();
+        g_timing.expert_io += t1 - t0;
+
+        t0 = t1;
         memcpy([g_metal->buf_multi_expert_input contents], h_post, HIDDEN_DIM * sizeof(float));
 
-        // Step 3: encode ALL experts + shared expert into ONE command buffer
+        // Step 3: encode ALL experts + shared expert into ONE command buffer.
+        // Batched encoding: 4 encoders for K experts + 2 for shared = 6 total
+        // (vs. 4*K + 2 = 18 with old per-expert encoding).
         id<MTLCommandBuffer> cmd_experts = [g_metal->queue commandBuffer];
 
-        for (int k = 0; k < actual_K; k++) {
-            if (!valid[k]) continue;
-            gpu_encode_expert_forward_slot_buf(g_metal, cmd_experts, k, expert_bufs[k]);
-        }
+        gpu_encode_experts_batched(g_metal, cmd_experts, actual_K, valid, expert_bufs);
 
-        // Also encode shared expert SwiGLU + down_proj in the same cmd buffer
+        // Shared expert SwiGLU + down_proj (2 more encoders)
         memcpy([g_metal->buf_shared_gate contents], shared_gate,
                SHARED_INTERMEDIATE * sizeof(float));
         memcpy([g_metal->buf_shared_up contents], shared_up,
@@ -3844,6 +4048,11 @@ static void fused_layer_forward(
         // fused_layer_forward(), overlapping ~1ms of GPU expert compute
         // with the next layer's attention+routing work.
         [cmd_experts commit];
+        t1 = now_ms();
+        g_timing.cmd3_encode += t1 - t0;
+
+        g_timing.count++;
+        g_timing.total += t1 - t_layer_start;
 
         // Save state for deferred completion
         g_deferred.active = 1;
@@ -3937,6 +4146,11 @@ static void fused_layer_forward(
     for (int i = 0; i < HIDDEN_DIM; i++) {
         hidden[i] = h_mid[i] + moe_out[i] + shared_out[i];
     }
+
+    t1 = now_ms();
+    g_timing.cmd3_encode += t1 - t0;  // includes CPU expert compute for non-GPU paths
+    g_timing.count++;
+    g_timing.total += t1 - t_layer_start;
 
     // h_post, h_mid, gate_scores, moe_out, shared_out, shared_gate, shared_up
     // are all static scratch buffers — no free needed.
@@ -4269,6 +4483,7 @@ int main(int argc, char **argv) {
         int total_generated = 1;
 
         // ---- Auto-regressive generation ----
+        timing_reset();
         for (int gen = 1; gen < max_tokens; gen++) {
             double t_gen_start = now_ms();
 
@@ -4320,6 +4535,7 @@ int main(int argc, char **argv) {
                     gen, max_tokens, next_token, tok_time, 1000.0 / tok_time);
         }
 
+        timing_print();
         printf("\n\n--- Statistics ---\n");
         double total_time = now_ms() - t0;
         printf("Total time:     %.1f s\n", total_time / 1000.0);
