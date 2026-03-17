@@ -64,3 +64,4 @@ HEAD	Qwen3.5-397B-A17B-4bit	397.0	17.0	8.71	0	0	keep	METAL ENGINE: 114.8ms/tok, 
 HEAD	Qwen3.5-397B-A17B-4bit	397.0	17.0	13.90	0	0	keep	METAL ENGINE: 71.9ms! 13.9 tok/s! Per-K scratch buffers → ONE cmd buffer per layer. BROKE 10 TOK/S!
 HEAD	Qwen3.5-397B-A17B-4bit	397.0	17.0	14.40	0	0	keep	METAL ENGINE: 69.4ms! CPU weighted sum eliminates 60 cmd buffers. 14.4 tok/s!
 HEAD	Qwen3.5-397B-A17B-4bit	397.0	17.0	0.28	25235	5.5	keep	C/METAL E2E: "The sum of 2+2 is" — COHERENT OUTPUT! CPU attention bottleneck. Shader barrier fix.
+HEAD	Qwen3.5-397B-A17B-4bit	397.0	17.0	1.85	12000	5.5	keep	C/METAL E2E QUALITY: "Here's a thinking process that leads to..." — 1.85 tok/s, GPU matmuls!
