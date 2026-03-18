@@ -310,9 +310,17 @@ static void md_print(const char *text) {
         }
 
         // Bullet lists at line start: - item or * item → • item
-        if (g_md.line_start && (c == '-' || c == '*') && text[i+1] == ' ') {
+        // Handle both "- text" (one token) and "-" + " text" (split across tokens)
+        if (g_md.line_start && c == '-' && (text[i+1] == ' ' || text[i+1] == '\0')) {
             printf("  \033[33m•\033[0m");  // yellow bullet
-            i++; // skip the space
+            if (text[i+1] == ' ') i++; // skip the space if present
+            g_md.line_start = 0;
+            continue;
+        }
+        // * as bullet only when followed by space (not bold **)
+        if (g_md.line_start && c == '*' && text[i+1] == ' ') {
+            printf("  \033[33m•\033[0m");
+            i++;
             g_md.line_start = 0;
             continue;
         }
