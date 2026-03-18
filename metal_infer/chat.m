@@ -322,6 +322,82 @@ int main(int argc, char **argv) {
 
         reset_delta_net_state();
 
+        // ---- Cache system prompt: prefill once, snapshot state ----
+        // Encode system prompt tokens
+        const char *sys_prompt =
+            "<|im_start|>system\nYou are a helpful assistant. /think\n"
+            "Keep your thinking concise and focused — aim for under 300 words "
+            "in your <think> block before responding.<|im_end|>\n";
+        init_tokenizer();
+        uint32_t sys_ids[256];
+        int sys_n = bpe_encode(&g_tokenizer, sys_prompt, sys_ids, 256);
+        if (sys_n > 0) {
+            fprintf(stderr, "[chat] Pre-caching system prompt (%d tokens)...\n", sys_n);
+            // Batch embed
+            float *sys_embeds = malloc((size_t)sys_n * HIDDEN_DIM * sizeof(float));
+            for (int i = 0; i < sys_n; i++)
+                embed_lookup(wf, sys_ids[i], sys_embeds + (size_t)i * HIDDEN_DIM);
+            // Prefill with discard for intermediate tokens
+            for (int i = 0; i < sys_n; i++) {
+                memcpy(hidden, sys_embeds + (size_t)i * HIDDEN_DIM, HIDDEN_DIM * sizeof(float));
+                for (int layer = 0; layer < NUM_LAYERS; layer++) {
+                    int is_full = ((layer + 1) % FULL_ATTN_INTERVAL == 0);
+                    fused_layer_forward(wf, layer, hidden,
+                                        is_full ? kv_caches[layer] : NULL,
+                                        is_full ? NULL : layer_states[layer],
+                                        pos,
+                                        layer_mmaps[layer] != MAP_FAILED ? layer_mmaps[layer] : NULL,
+                                        K, layer_fds[layer]);
+                }
+                if (i < sys_n - 1)
+                    discard_deferred_experts();
+                else
+                    complete_deferred_experts();
+                pos++;
+            }
+            free(sys_embeds);
+            // Add system tokens to conversation history
+            for (int i = 0; i < sys_n; i++) conv_append(&conv, sys_ids[i]);
+            conv.processed = conv.count;
+            fprintf(stderr, "[chat] System prompt cached (pos=%d)\n", pos);
+        }
+
+        // Snapshot state after system prompt for /clear restoration
+        int sys_prompt_pos = pos;
+        int sys_prompt_conv_count = conv.count;
+        size_t kv_dim = NUM_KV_HEADS * HEAD_DIM;
+        size_t conv_state_sz = (CONV_KERNEL_SIZE - 1) * LINEAR_CONV_DIM * sizeof(float);
+        size_t ssm_state_sz = LINEAR_NUM_V_HEADS * LINEAR_VALUE_DIM * LINEAR_KEY_DIM * sizeof(float);
+
+        // KV cache snapshots
+        float *kv_k_snaps[NUM_LAYERS], *kv_v_snaps[NUM_LAYERS];
+        int kv_lens[NUM_LAYERS];
+        memset(kv_k_snaps, 0, sizeof(kv_k_snaps));
+        memset(kv_v_snaps, 0, sizeof(kv_v_snaps));
+        for (int i = 0; i < NUM_LAYERS; i++) {
+            if (kv_caches[i] && kv_caches[i]->len > 0) {
+                size_t sz = kv_caches[i]->len * kv_dim * sizeof(float);
+                kv_k_snaps[i] = malloc(sz);
+                kv_v_snaps[i] = malloc(sz);
+                memcpy(kv_k_snaps[i], kv_caches[i]->k_cache, sz);
+                memcpy(kv_v_snaps[i], kv_caches[i]->v_cache, sz);
+                kv_lens[i] = kv_caches[i]->len;
+            }
+        }
+        // Linear attention snapshots
+        float *la_conv_snaps[NUM_LAYERS], *la_ssm_snaps[NUM_LAYERS];
+        memset(la_conv_snaps, 0, sizeof(la_conv_snaps));
+        memset(la_ssm_snaps, 0, sizeof(la_ssm_snaps));
+        for (int i = 0; i < NUM_LAYERS; i++) {
+            if (layer_states[i]) {
+                LinearAttnState *s = (LinearAttnState *)layer_states[i];
+                la_conv_snaps[i] = malloc(conv_state_sz);
+                la_ssm_snaps[i] = malloc(ssm_state_sz);
+                memcpy(la_conv_snaps[i], s->conv_state, conv_state_sz);
+                memcpy(la_ssm_snaps[i], s->ssm_state, ssm_state_sz);
+            }
+        }
+
         double t_init = now_ms();
         printf("\nModel loaded in %.1f s. Ready to chat.\n\n", (t_init - t0) / 1000.0);
 
@@ -357,26 +433,42 @@ int main(int argc, char **argv) {
             }
 
             if (strcmp(input_line, "/clear") == 0) {
+                // Restore to system prompt snapshot (not zero)
                 conv_reset(&conv);
-                pos = 0;
-                // Reset KV caches
+                // Re-add system prompt tokens to conversation
+                for (int i = 0; i < sys_prompt_conv_count && i < sys_n; i++)
+                    conv_append(&conv, sys_ids[i]);
+                conv.processed = sys_prompt_conv_count;
+                pos = sys_prompt_pos;
+                // Restore KV caches
                 for (int i = 0; i < NUM_LAYERS; i++) {
-                    if (kv_caches[i]) kv_caches[i]->len = 0;
-                    if (layer_states[i]) {
+                    if (kv_caches[i] && kv_k_snaps[i]) {
+                        size_t sz = kv_lens[i] * kv_dim * sizeof(float);
+                        memcpy(kv_caches[i]->k_cache, kv_k_snaps[i], sz);
+                        memcpy(kv_caches[i]->v_cache, kv_v_snaps[i], sz);
+                        kv_caches[i]->len = kv_lens[i];
+                    } else if (kv_caches[i]) {
+                        kv_caches[i]->len = 0;
+                    }
+                    if (layer_states[i] && la_conv_snaps[i]) {
                         LinearAttnState *s = (LinearAttnState *)layer_states[i];
-                        memset(s->conv_state, 0, (CONV_KERNEL_SIZE - 1) * LINEAR_CONV_DIM * sizeof(float));
-                        memset(s->ssm_state, 0, LINEAR_NUM_V_HEADS * LINEAR_VALUE_DIM * LINEAR_KEY_DIM * sizeof(float));
+                        memcpy(s->conv_state, la_conv_snaps[i], conv_state_sz);
+                        memcpy(s->ssm_state, la_ssm_snaps[i], ssm_state_sz);
+                    } else if (layer_states[i]) {
+                        LinearAttnState *s = (LinearAttnState *)layer_states[i];
+                        memset(s->conv_state, 0, conv_state_sz);
+                        memset(s->ssm_state, 0, ssm_state_sz);
                     }
                 }
                 reset_delta_net_state();
-                printf("[cleared] Conversation reset.\n\n");
+                printf("[cleared] Conversation reset to system prompt.\n\n");
                 continue;
             }
 
             // ---- Encode user message to tokens ----
             uint32_t *msg_tokens = malloc(MAX_CONV_TOKENS * sizeof(uint32_t));
-            int is_first = (conv.count == 0);
-            int n_msg = encode_user_message(input_line, msg_tokens, MAX_CONV_TOKENS - conv.count, is_first);
+            // System prompt is pre-cached — never include it in user turns
+            int n_msg = encode_user_message(input_line, msg_tokens, MAX_CONV_TOKENS - conv.count, 0);
             if (n_msg < 0) {
                 fprintf(stderr, "[error] Failed to tokenize input. Is encode_prompt.py available?\n\n");
                 free(msg_tokens);
