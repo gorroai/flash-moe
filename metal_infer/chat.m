@@ -399,8 +399,49 @@ int main(int argc, char **argv) {
             double t_prefill = now_ms();
             int prefill_count = conv.count - conv.processed;
 
-            for (int i = conv.processed; i < conv.count; i++) {
-                embed_lookup(wf, conv.tokens[i], hidden);
+            // Batch prefill: pre-embed all tokens, use discard for intermediates
+            float *chat_embed_batch = NULL;
+            if (prefill_count > 1) {
+                chat_embed_batch = malloc((size_t)prefill_count * HIDDEN_DIM * sizeof(float));
+                for (int i = 0; i < prefill_count; i++) {
+                    embed_lookup(wf, conv.tokens[conv.processed + i],
+                                 chat_embed_batch + (size_t)i * HIDDEN_DIM);
+                }
+            }
+            // Intermediate prefill tokens: discard last-layer expert output
+            for (int i = conv.processed; i < conv.count - 1; i++) {
+                int bi = i - conv.processed;
+                if (chat_embed_batch) {
+                    memcpy(hidden, chat_embed_batch + (size_t)bi * HIDDEN_DIM,
+                           HIDDEN_DIM * sizeof(float));
+                } else {
+                    embed_lookup(wf, conv.tokens[i], hidden);
+                }
+
+                for (int layer = 0; layer < NUM_LAYERS; layer++) {
+                    int is_full = ((layer + 1) % FULL_ATTN_INTERVAL == 0);
+                    fused_layer_forward(wf, layer, hidden,
+                                        is_full ? kv_caches[layer] : NULL,
+                                        is_full ? NULL : layer_states[layer],
+                                        pos,
+                                        layer_mmaps[layer] != MAP_FAILED ? layer_mmaps[layer] : NULL,
+                                        K, layer_fds[layer]);
+                }
+                discard_deferred_experts();
+                pos++;
+
+                fprintf(stderr, "  [prefill] %d/%d\r", i - conv.processed + 1, prefill_count);
+            }
+            // Last prefill token: full completion (need hidden for logits)
+            {
+                int last_i = conv.count - 1;
+                int bi = last_i - conv.processed;
+                if (chat_embed_batch) {
+                    memcpy(hidden, chat_embed_batch + (size_t)bi * HIDDEN_DIM,
+                           HIDDEN_DIM * sizeof(float));
+                } else {
+                    embed_lookup(wf, conv.tokens[last_i], hidden);
+                }
 
                 for (int layer = 0; layer < NUM_LAYERS; layer++) {
                     int is_full = ((layer + 1) % FULL_ATTN_INTERVAL == 0);
@@ -413,12 +454,8 @@ int main(int argc, char **argv) {
                 }
                 complete_deferred_experts();
                 pos++;
-
-                // For non-last prefill tokens, skip logits computation
-                if (i < conv.count - 1) {
-                    fprintf(stderr, "  [prefill] %d/%d\r", i - conv.processed + 1, prefill_count);
-                }
             }
+            if (chat_embed_batch) { free(chat_embed_batch); chat_embed_batch = NULL; }
             conv.processed = conv.count;
 
             double prefill_ms = now_ms() - t_prefill;

@@ -3774,6 +3774,20 @@ static void complete_deferred_experts(void) {
     finalize_deferred_experts();
 }
 
+// Discard the deferred GPU expert result: wait for GPU to finish (for buffer safety)
+// but skip the CPU readback/combine. Used during prefill for intermediate tokens
+// where the hidden state will be immediately overwritten by the next token's embedding.
+// This saves ~0.1-0.2ms per prefill token (avoids unnecessary memcpy + combine work).
+static void discard_deferred_experts(void) {
+    wait_deferred_experts_gpu();
+    // Clear deferred state without reading back results
+    if (g_deferred.active) {
+        g_deferred.active = 0;
+        g_deferred.gpu_combined = 0;
+        g_deferred.cmd_experts = nil;
+    }
+}
+
 // ============================================================================
 // Fused layer forward: GPU/CPU overlap + deferred expert pipeline
 //
@@ -5646,9 +5660,44 @@ static void serve_loop(
     PromptTokens *sys_pt = tokenize_chat_message("");  // empty user = just system prompt
     int sys_pos = 0;
     if (sys_pt && sys_pt->count > 0) {
-        for (int i = 0; i < sys_pt->count; i++) {
+        // Pre-embed all system prompt tokens
+        float *sys_embed_batch = NULL;
+        if (sys_pt->count > 1) {
+            sys_embed_batch = malloc((size_t)sys_pt->count * HIDDEN_DIM * sizeof(float));
+            for (int i = 0; i < sys_pt->count; i++) {
+                embed_lookup(wf, sys_pt->ids[i], sys_embed_batch + (size_t)i * HIDDEN_DIM);
+            }
+        }
+        // Intermediate system prompt tokens: discard last-layer expert output
+        for (int i = 0; i < sys_pt->count - 1; i++) {
             cache_telemetry_note_token();
-            embed_lookup(wf, sys_pt->ids[i], hidden);
+            if (sys_embed_batch) {
+                memcpy(hidden, sys_embed_batch + (size_t)i * HIDDEN_DIM,
+                       HIDDEN_DIM * sizeof(float));
+            } else {
+                embed_lookup(wf, sys_pt->ids[i], hidden);
+            }
+            for (int layer = 0; layer < NUM_LAYERS; layer++) {
+                int is_full = ((layer + 1) % FULL_ATTN_INTERVAL == 0);
+                fused_layer_forward(wf, layer, hidden,
+                                    is_full ? kv_caches[layer] : NULL,
+                                    is_full ? NULL : layer_states[layer],
+                                    sys_pos,
+                                    layer_mmaps[layer] != MAP_FAILED ? layer_mmaps[layer] : NULL,
+                                    K, layer_fds[layer]);
+            }
+            discard_deferred_experts();
+            sys_pos++;
+        }
+        // Last system prompt token: full completion
+        {
+            cache_telemetry_note_token();
+            if (sys_embed_batch) {
+                memcpy(hidden, sys_embed_batch + (size_t)(sys_pt->count - 1) * HIDDEN_DIM,
+                       HIDDEN_DIM * sizeof(float));
+            } else {
+                embed_lookup(wf, sys_pt->ids[0], hidden);
+            }
             for (int layer = 0; layer < NUM_LAYERS; layer++) {
                 int is_full = ((layer + 1) % FULL_ATTN_INTERVAL == 0);
                 fused_layer_forward(wf, layer, hidden,
@@ -5661,6 +5710,7 @@ static void serve_loop(
             complete_deferred_experts();
             sys_pos++;
         }
+        if (sys_embed_batch) { free(sys_embed_batch); sys_embed_batch = NULL; }
         // Sync CPU state → GPU for delta-net
         sync_cpu_to_gpu_delta_state_serve(layer_states);
         fprintf(stderr, "[serve] System prompt cached: %d tokens prefilled\n", sys_pos);
@@ -5869,11 +5919,46 @@ static void serve_loop(
             // ---- Send SSE headers ----
             http_write_str(client_fd, SSE_HEADERS);
 
-            // ---- Prefill ----
+            // ---- Batch prefill ----
             double t_prefill = now_ms();
-            for (int i = 0; i < pt->count; i++) {
+            // Pre-embed all request tokens
+            float *serve_embed_batch = NULL;
+            if (pt->count > 1) {
+                serve_embed_batch = malloc((size_t)pt->count * HIDDEN_DIM * sizeof(float));
+                for (int i = 0; i < pt->count; i++) {
+                    embed_lookup(wf, pt->ids[i], serve_embed_batch + (size_t)i * HIDDEN_DIM);
+                }
+            }
+            // Intermediate prefill tokens: discard last-layer expert output
+            for (int i = 0; i < pt->count - 1; i++) {
                 cache_telemetry_note_token();
-                embed_lookup(wf, pt->ids[i], hidden);
+                if (serve_embed_batch) {
+                    memcpy(hidden, serve_embed_batch + (size_t)i * HIDDEN_DIM,
+                           HIDDEN_DIM * sizeof(float));
+                } else {
+                    embed_lookup(wf, pt->ids[i], hidden);
+                }
+                for (int layer = 0; layer < NUM_LAYERS; layer++) {
+                    int is_full = ((layer + 1) % FULL_ATTN_INTERVAL == 0);
+                    fused_layer_forward(wf, layer, hidden,
+                                        is_full ? kv_caches[layer] : NULL,
+                                        is_full ? NULL : layer_states[layer],
+                                        pos,
+                                        layer_mmaps[layer] != MAP_FAILED ? layer_mmaps[layer] : NULL,
+                                        K, layer_fds[layer]);
+                }
+                discard_deferred_experts();
+                pos++;
+            }
+            // Last prefill token: full completion (need hidden for logits)
+            {
+                cache_telemetry_note_token();
+                if (serve_embed_batch) {
+                    memcpy(hidden, serve_embed_batch + (size_t)(pt->count - 1) * HIDDEN_DIM,
+                           HIDDEN_DIM * sizeof(float));
+                } else {
+                    embed_lookup(wf, pt->ids[0], hidden);
+                }
                 for (int layer = 0; layer < NUM_LAYERS; layer++) {
                     int is_full = ((layer + 1) % FULL_ATTN_INTERVAL == 0);
                     fused_layer_forward(wf, layer, hidden,
@@ -5886,6 +5971,7 @@ static void serve_loop(
                 complete_deferred_experts();
                 pos++;
             }
+            if (serve_embed_batch) { free(serve_embed_batch); serve_embed_batch = NULL; }
             double prefill_ms = now_ms() - t_prefill;
             fprintf(stderr, "[serve] %s prefill=%d tokens in %.0fms\n",
                     request_id, pt->count, prefill_ms);
@@ -6310,23 +6396,78 @@ int main(int argc, char **argv) {
         printf("--- Generating %d tokens ---\n", max_tokens);
         int pos = 0;  // position counter for RoPE
 
-        for (int token_idx = 0; token_idx < pt->count + max_tokens; token_idx++) {
-            double t_token_start = now_ms();
+        // ---- Batch prefill: pre-embed all prompt tokens ----
+        // Embedding all tokens upfront into a batch buffer avoids interleaving
+        // embed_lookup with GPU work, and enables the optimized prefill loop below.
+        float *embed_batch = NULL;
+        if (pt->count > 1) {
+            embed_batch = malloc((size_t)pt->count * HIDDEN_DIM * sizeof(float));
+            double t_embed = now_ms();
+            for (int i = 0; i < pt->count; i++) {
+                embed_lookup(wf, pt->ids[i], embed_batch + (size_t)i * HIDDEN_DIM);
+            }
+            double embed_ms = now_ms() - t_embed;
+            printf("  [prefill] batch embed %d tokens: %.1f ms\n", pt->count, embed_ms);
+        }
 
-            // Get current token
-            int current_token;
-            if (token_idx < pt->count) {
-                current_token = pt->ids[token_idx];
-            } else {
-                // Will be set after sampling
-                break;  // handled below
+        // ---- Batch prefill loop ----
+        // Process all prompt tokens through the model. For intermediate tokens
+        // (not the last), we use discard_deferred_experts() which waits for the GPU
+        // but skips the CPU readback/combine of the last layer's expert outputs.
+        // This is safe because the hidden state from intermediate prefill tokens
+        // is immediately overwritten by the next token's embedding — the recurrent
+        // state (KV cache, delta-net state) is already updated inside fused_layer_forward.
+        if (pt->count > 1) {
+            double t_prefill_batch = now_ms();
+            double first_tok_ms = 0;
+
+            for (int token_idx = 0; token_idx < pt->count - 1; token_idx++) {
+                double t_tok = now_ms();
+
+                // Load pre-embedded token from batch buffer
+                cache_telemetry_note_token();
+                memcpy(hidden, embed_batch + (size_t)token_idx * HIDDEN_DIM,
+                       HIDDEN_DIM * sizeof(float));
+
+                // Run through all 60 transformer layers
+                for (int layer = 0; layer < NUM_LAYERS; layer++) {
+                    int is_full = ((layer + 1) % FULL_ATTN_INTERVAL == 0);
+                    fused_layer_forward(wf, layer, hidden,
+                                        is_full ? kv_caches[layer] : NULL,
+                                        is_full ? NULL : layer_states[layer],
+                                        pos,
+                                        layer_mmaps[layer] != MAP_FAILED ? layer_mmaps[layer] : NULL,
+                                        K, layer_fds[layer]);
+                }
+
+                // Discard last layer's expert output — hidden will be overwritten
+                // by the next token's embedding. Only wait for GPU (buffer safety).
+                discard_deferred_experts();
+                pos++;
+
+                if (token_idx == 0) {
+                    first_tok_ms = now_ms() - t_tok;
+                }
             }
 
-            // ---- Embedding ----
-            cache_telemetry_note_token();
-            embed_lookup(wf, current_token, hidden);
+            double prefill_batch_ms = now_ms() - t_prefill_batch;
+            double avg_ms = (pt->count > 2) ?
+                (prefill_batch_ms - first_tok_ms) / (pt->count - 2) : first_tok_ms;
+            printf("  [prefill] %d/%d tokens: %.0f ms (first: %.0f ms, rest avg: %.0f ms)\n",
+                   pt->count - 1, pt->count, prefill_batch_ms, first_tok_ms, avg_ms);
+        }
 
-            // ---- 60 Transformer layers (fused: 1+K cmd buffers per layer) ----
+        // ---- Last prefill token (or single-token prompt) ----
+        // This one needs full completion since we need hidden state for logits.
+        {
+            cache_telemetry_note_token();
+            if (embed_batch) {
+                memcpy(hidden, embed_batch + (size_t)(pt->count - 1) * HIDDEN_DIM,
+                       HIDDEN_DIM * sizeof(float));
+            } else {
+                embed_lookup(wf, pt->ids[0], hidden);
+            }
+
             for (int layer = 0; layer < NUM_LAYERS; layer++) {
                 int is_full = ((layer + 1) % FULL_ATTN_INTERVAL == 0);
                 fused_layer_forward(wf, layer, hidden,
@@ -6336,20 +6477,12 @@ int main(int argc, char **argv) {
                                     layer_mmaps[layer] != MAP_FAILED ? layer_mmaps[layer] : NULL,
                                     K, layer_fds[layer]);
             }
-            // Complete last layer's deferred GPU experts before final norm
+            // Full completion — need hidden state for final norm + lm_head
             complete_deferred_experts();
-
             pos++;
-
-            // Only compute logits for the last prompt token and generated tokens
-            if (token_idx >= pt->count - 1) {
-                break;  // process logits below
-            }
-
-            double t_token_end = now_ms();
-            printf("  [prefill] token %d/%d: %.0f ms\n",
-                   token_idx + 1, pt->count, t_token_end - t_token_start);
         }
+
+        if (embed_batch) { free(embed_batch); embed_batch = NULL; }
 
         // ---- Final norm ----
         if (final_norm_w) {
