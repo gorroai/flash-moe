@@ -402,9 +402,7 @@ def main():
     parser = argparse.ArgumentParser(
         description='Requantize 4-bit packed experts to 2-bit')
     parser.add_argument('--model', type=str,
-                        default=os.path.expanduser(
-                            '~/.cache/huggingface/hub/models--mlx-community--Qwen3.5-397B-A17B-4bit'
-                            '/snapshots/39159bd8aa74f5c8446d2b2dc584f62bb51cb0d3'),
+                        default=os.path.expanduser('~/Models/flash_mlx_4bit'),
                         help='Path to model directory (containing packed_experts/)')
     parser.add_argument('--output', type=str, default=None,
                         help='Output directory (default: MODEL/packed_experts_2bit)')
@@ -412,6 +410,9 @@ def main():
                         help='Process only this layer (0-59). Default: all layers.')
     parser.add_argument('--verify', action='store_true',
                         help='Verify by dequantizing 2-bit output and comparing to 4-bit')
+    parser.add_argument('--skip-layers', type=str, default=None,
+                        help='Layers to keep at 4-bit (e.g. "27" or "27,30,45"). '
+                             'These layers will NOT be requantized.')
     parser.add_argument('--experts', type=int, default=NUM_EXPERTS,
                         help=f'Number of experts per layer (default: {NUM_EXPERTS})')
     args = parser.parse_args()
@@ -438,12 +439,26 @@ def main():
             print(f"ERROR: No layer_XX.bin files found in {input_dir}", file=sys.stderr)
             sys.exit(1)
 
+    # Parse skip-layers
+    skip_layers = set()
+    if args.skip_layers:
+        for part in args.skip_layers.split(','):
+            part = part.strip()
+            if '-' in part:
+                a, b = part.split('-', 1)
+                skip_layers.update(range(int(a), int(b) + 1))
+            else:
+                skip_layers.add(int(part))
+        layers = [l for l in layers if l not in skip_layers]
+
     num_experts = args.experts
 
     print(f"Model:       {model_path}")
     print(f"Input:       {input_dir}")
     print(f"Output:      {output_dir}")
     print(f"Layers:      {layers}")
+    if skip_layers:
+        print(f"Skipped:     {sorted(skip_layers)} (kept at 4-bit)")
     print(f"Experts:     {num_experts}")
     print(f"4-bit size:  {EXPERT_SIZE_4BIT:,} bytes/expert  "
           f"({num_experts * EXPERT_SIZE_4BIT / 1e9:.2f} GB/layer)")

@@ -155,8 +155,14 @@ typedef struct {
     double spec_route;       // speculative early routing (gate matvec + topK)
     double expert_io;        // parallel pread + cache lookup
     double cmd3_encode;      // CMD3 encode experts + submit (deferred)
+    double lm_head;          // LM head projection (per-token, outside layer loop)
     double total;            // total per-layer time
+    double total_linear;     // total time for linear attention layers
+    double total_full;       // total time for full attention layers
     int count;               // number of layers timed
+    int count_linear;        // linear attention layers timed
+    int count_full;          // full attention layers timed
+    int token_count;         // number of tokens (for lm_head avg)
 } LayerTimingAccum;
 
 static LayerTimingAccum g_timing = {0};
@@ -193,8 +199,11 @@ static int g_use_lz4 = 0;                        // auto-detected from packed_ex
 static int g_expert_freq[NUM_LAYERS][NUM_EXPERTS];  // activation count per (layer, expert)
 static int g_freq_tracking = 0;  // enabled by --freq flag
 static int g_use_2bit = 0;       // enabled by --2bit flag: use packed_experts_2bit/ + 2-bit kernel
+static int g_layer_is_2bit[NUM_LAYERS];  // per-layer quant: 1=2-bit, 0=4-bit (for mixed quant)
 static int g_cache_telemetry_enabled = 0;  // enabled by --cache-telemetry flag
 static int g_think_budget = 2048; // max thinking tokens before force-emitting </think>
+static int g_stream_mode = 0;    // --stream: clean output only, no progress/stats
+static int g_nax_disabled = 1;   // NAX disabled by default (slower for M=1 decode); --nax to enable
 
 // Tiered I/O: cold fds (F_NOCACHE) for first reads, warm fds (page cached) for repeats
 static int *g_layer_fds_cold = NULL;    // [NUM_LAYERS] cold fds (set in main)
@@ -219,6 +228,10 @@ static inline int expert_pick_fd(int layer, int expert, int warm_fd) {
 // Active expert size based on quantization mode
 static inline size_t active_expert_size(void) {
     return g_use_2bit ? EXPERT_SIZE_2BIT : EXPERT_SIZE;
+}
+
+static inline size_t layer_expert_size(int layer) {
+    return g_layer_is_2bit[layer] ? EXPERT_SIZE_2BIT : EXPERT_SIZE;
 }
 static int g_freq_total_tokens = 0;  // total tokens processed while tracking
 
@@ -347,7 +360,54 @@ static void timing_print(void) {
     fprintf(stderr, "  routing_cpu:    %6.3f\n", g_timing.routing_cpu / n);
     fprintf(stderr, "  expert_io:      %6.3f\n", g_timing.expert_io / n);
     fprintf(stderr, "  cmd3_encode:    %6.3f\n", g_timing.cmd3_encode / n);
+    if (g_timing.token_count > 0)
+        fprintf(stderr, "  lm_head:        %6.3f  (per token, %d tokens)\n",
+                g_timing.lm_head / g_timing.token_count, g_timing.token_count);
     fprintf(stderr, "  total_layer:    %6.3f\n", g_timing.total / n);
+    if (g_timing.count_linear > 0)
+        fprintf(stderr, "  avg_linear:     %6.3f  (GatedDeltaNet, %d layers)\n",
+                g_timing.total_linear / g_timing.count_linear, g_timing.count_linear);
+    if (g_timing.count_full > 0)
+        fprintf(stderr, "  avg_full_attn:  %6.3f  (standard attn, %d layers)\n",
+                g_timing.total_full / g_timing.count_full, g_timing.count_full);
+
+    // Per-token decode breakdown
+    if (g_timing.token_count > 0) {
+        int toks = g_timing.token_count;
+        // Dense/attention (CMD1 + cpu_attn): Q/K/V projections + attention compute
+        double dense_attn_ms = (g_timing.cmd1_submit + g_timing.cmd1_wait + g_timing.cpu_attn) / n * 60;
+        // o_proj + norm + routing + shared expert (CMD2)
+        double oproj_shared_ms = (g_timing.cmd2_encode + g_timing.cmd2_wait + g_timing.routing_cpu) / n * 60;
+        // Routed expert I/O (SSD pread K=4 experts)
+        double expert_io_ms = g_timing.expert_io / n * 60;
+        // Routed expert compute (CMD3 GPU forward)
+        double expert_compute_ms = (g_timing.cmd3_encode + g_timing.deferred_wait + g_timing.deferred_cpu) / n * 60;
+        // LM head
+        double lm_ms = g_timing.lm_head / toks;
+        // Total per token
+        double total_ms = dense_attn_ms + oproj_shared_ms + expert_io_ms + expert_compute_ms + lm_ms;
+
+        // Linear attn vs full attn time
+        double linear_ms = (g_timing.count_linear > 0) ? g_timing.total_linear / g_timing.count_linear * 45 / toks : 0;
+        double full_ms = (g_timing.count_full > 0) ? g_timing.total_full / g_timing.count_full * 15 / toks : 0;
+
+        fprintf(stderr, "\n[decode breakdown per token]\n");
+        fprintf(stderr, "  Dense/attn (CMD1):    %6.1f ms  %4.1f%%  (Q/K/V proj + attn, 60 layers)\n",
+                dense_attn_ms, 100*dense_attn_ms/total_ms);
+        fprintf(stderr, "    GatedDeltaNet:      %6.1f ms         (45 linear layers)\n", linear_ms);
+        fprintf(stderr, "    Full attention:     %6.1f ms         (15 full layers)\n", full_ms);
+        fprintf(stderr, "  o_proj+shared (CMD2): %6.1f ms  %4.1f%%  (o_proj, norm, routing, shared expert)\n",
+                oproj_shared_ms, 100*oproj_shared_ms/total_ms);
+        fprintf(stderr, "  Expert I/O (SSD):     %6.1f ms  %4.1f%%  (pread K=4 experts × 60 layers)\n",
+                expert_io_ms, 100*expert_io_ms/total_ms);
+        fprintf(stderr, "  Expert compute (CMD3):%6.1f ms  %4.1f%%  (GPU forward K=4 × 60 layers)\n",
+                expert_compute_ms, 100*expert_compute_ms/total_ms);
+        fprintf(stderr, "  LM head:              %6.1f ms  %4.1f%%  (248K × 4096 matvec)\n",
+                lm_ms, 100*lm_ms/total_ms);
+        fprintf(stderr, "  ─────────────────────────────────\n");
+        fprintf(stderr, "  Total per token:      %6.1f ms  (%.1f tok/s)\n",
+                total_ms, 1000.0/total_ms);
+    }
     fprintf(stderr, "  sum_phases:     %6.3f\n",
             (g_timing.deferred_wait + g_timing.deferred_cpu + g_timing.input_norm +
              g_timing.cmd1_submit + g_timing.cmd1_wait + g_timing.spec_route +
@@ -647,9 +707,18 @@ static PromptTokens *load_prompt_tokens(const char *path) {
 static bpe_tokenizer g_tokenizer;
 static int g_tokenizer_loaded = 0;
 
+static const char *g_model_path_for_tokenizer = NULL;
+
 static void init_tokenizer(void) {
     if (g_tokenizer_loaded) return;
+    char model_tok[1024];
+    if (g_model_path_for_tokenizer) {
+        snprintf(model_tok, sizeof(model_tok), "%s/tokenizer.bin", g_model_path_for_tokenizer);
+    } else {
+        model_tok[0] = '\0';
+    }
     const char *paths[] = {
+        model_tok[0] ? model_tok : NULL,
         "tokenizer.bin",
         "metal_infer/tokenizer.bin",
         NULL
@@ -839,6 +908,22 @@ static void cpu_vec_zero(float *dst, int dim) {
     memset(dst, 0, dim * sizeof(float));
 }
 
+// Cross-entropy loss for a single token: -log(softmax(logits)[target_id])
+static float cross_entropy_loss(const float *logits, int vocab_size, int target_id) {
+    // Numerically stable log-softmax: subtract max first
+    float max_val = logits[0];
+    for (int i = 1; i < vocab_size; i++) {
+        if (logits[i] > max_val) max_val = logits[i];
+    }
+    // Use double accumulator for precision over 248K vocab entries
+    double sum_exp = 0.0;
+    for (int i = 0; i < vocab_size; i++) {
+        sum_exp += exp((double)(logits[i] - max_val));
+    }
+    float log_prob = (logits[target_id] - max_val) - (float)log(sum_exp);
+    return -log_prob;  // NLL (positive)
+}
+
 // Argmax
 static int cpu_argmax(const float *x, int dim) {
     int best = 0;
@@ -905,6 +990,16 @@ typedef struct {
     id<MTLComputePipelineState> matvec_v5;  // LUT dequant variant
     id<MTLComputePipelineState> matvec_fast;  // for in_dim > 4096
     id<MTLComputePipelineState> matvec_2bit;  // 2-bit expert dequant kernel
+    // NAX (Metal 4 / M5+) pipelines
+    id<MTLLibrary>              nax_library;   // compiled with Metal 4.0 (NULL if not available)
+    id<MTLComputePipelineState> nax_dequant;   // 4-bit → half dequant kernel
+    id<MTLComputePipelineState> nax_f32_to_half; // float32 → half conversion
+    id<MTLComputePipelineState> nax_gemm;      // NAX tensor matmul2d
+    id<MTLComputePipelineState> nax_extract;   // extract row 0 from column-major output
+    id<MTLBuffer>               nax_w_half;    // dequantized weight buffer (half)
+    id<MTLBuffer>               nax_x_half;    // input converted to half (padded to 32 rows)
+    id<MTLBuffer>               nax_c_buf;     // padded output buffer [32, VOCAB_SIZE]
+    int                         has_nax;       // 1 if NAX hardware available
     id<MTLComputePipelineState> rms_norm_sum;
     id<MTLComputePipelineState> rms_norm_apply;
     id<MTLComputePipelineState> rms_norm_apply_bf16;
@@ -1066,6 +1161,53 @@ static MetalCtx *metal_setup(void) {
     if (!ctx->rms_norm_qk)       fprintf(stderr, "[metal] WARNING: rms_norm_qk pipeline failed (CPU fallback)\n");
     if (!ctx->compute_decay_beta) fprintf(stderr, "[metal] WARNING: compute_decay_beta pipeline failed (CPU fallback)\n");
     if (!ctx->gated_rms_norm)     fprintf(stderr, "[metal] WARNING: gated_rms_norm pipeline failed (CPU fallback)\n");
+
+    // ---- NAX (Metal 4 / M5+) ----
+    ctx->has_nax = 0;
+    if (@available(macOS 26.2, *)) {
+        if ([ctx->device supportsFamily:(MTLGPUFamily)5002]) {
+            // Try compiling NAX shaders with Metal 4.0
+            NSArray *nax_paths = @[@"nax_gemm.metal", @"metal_infer/nax_gemm.metal"];
+            NSString *nax_src = nil;
+            for (NSString *p in nax_paths) {
+                nax_src = [NSString stringWithContentsOfFile:p encoding:NSUTF8StringEncoding error:&error];
+                if (nax_src) break;
+            }
+            if (nax_src) {
+                MTLCompileOptions *nax_opts = [[MTLCompileOptions alloc] init];
+                nax_opts.languageVersion = (MTLLanguageVersion)0x40000;  // Metal 4.0
+                nax_opts.mathMode = MTLMathModeFast;
+                ctx->nax_library = [ctx->device newLibraryWithSource:nax_src options:nax_opts error:&error];
+                if (ctx->nax_library) {
+                    id<MTLComputePipelineState> (^naxPipe)(NSString *) = ^(NSString *name) {
+                        id<MTLFunction> fn = [ctx->nax_library newFunctionWithName:name];
+                        if (!fn) return (id<MTLComputePipelineState>)nil;
+                        NSError *e2 = nil;
+                        return [ctx->device newComputePipelineStateWithFunction:fn error:&e2];
+                    };
+                    ctx->nax_dequant = naxPipe(@"nax_dequant_4bit");
+                    ctx->nax_f32_to_half = naxPipe(@"nax_f32_to_half");
+                    ctx->nax_gemm = naxPipe(@"nax_gemm_f32_input");
+                    ctx->nax_extract = naxPipe(@"nax_extract_row0");
+                    if (ctx->nax_dequant && ctx->nax_gemm && ctx->nax_f32_to_half) {
+                        ctx->has_nax = 1;
+                        // Pre-allocate buffers for LM head (largest projection: 248320×4096)
+                        // M is padded to 32 for NAX tile alignment
+                        ctx->nax_w_half = [ctx->device newBufferWithLength:(size_t)VOCAB_SIZE * HIDDEN_DIM * sizeof(uint16_t)
+                                                                   options:MTLResourceStorageModeShared];
+                        ctx->nax_x_half = [ctx->device newBufferWithLength:(size_t)32 * HIDDEN_DIM * sizeof(uint16_t)
+                                                                   options:MTLResourceStorageModeShared];
+                        ctx->nax_c_buf = [ctx->device newBufferWithLength:(size_t)32 * VOCAB_SIZE * sizeof(float)
+                                                                   options:MTLResourceStorageModeShared];
+                        printf("[metal] NAX (Metal 4) enabled — tensor matmul for LM head\n");
+                    }
+                }
+            }
+            if (!ctx->has_nax) {
+                printf("[metal] NAX shader compile failed, using standard kernels\n");
+            }
+        }
+    }
 
     if (!ctx->matvec_v3 || !ctx->matvec_fast) {
         fprintf(stderr, "ERROR: Required Metal pipeline missing\n");
@@ -1321,6 +1463,111 @@ static void gpu_dequant_matvec(
     memcpy(out_f32, [o_buf contents], o_size);
 }
 
+// Track whether LM head weights have been dequantized to nax_w_half
+static int g_nax_lmhead_dequantized = 0;
+
+// NAX 2-pass dispatch: dequant weights to half (cached), convert input to half, then NAX GEMM
+// Only used for large projections (LM head) where NAX provides significant speedup
+static void gpu_nax_dequant_gemm(
+    MetalCtx *ctx,
+    const void *W_packed, const void *scales, const void *biases,
+    const float *x_f32, float *out_f32,
+    uint32_t out_dim, uint32_t in_dim, uint32_t group_size
+) {
+    uint32_t num_groups = in_dim / group_size;
+    NSUInteger w_off = (NSUInteger)((const char *)W_packed - (const char *)[ctx->wf_buf contents]);
+    NSUInteger s_off = (NSUInteger)((const char *)scales   - (const char *)[ctx->wf_buf contents]);
+    NSUInteger b_off = (NSUInteger)((const char *)biases   - (const char *)[ctx->wf_buf contents]);
+
+    // Pad M to NAX tile size (32) to avoid cooperative tensor store overflow
+    const uint32_t NAX_BM = 32;
+    uint32_t M_padded = NAX_BM;  // always pad to at least one full tile
+
+    // Ensure NAX buffers are large enough
+    size_t w_half_size = (size_t)out_dim * in_dim * sizeof(uint16_t);
+    if ([ctx->nax_w_half length] < w_half_size) {
+        ctx->nax_w_half = [ctx->device newBufferWithLength:w_half_size options:MTLResourceStorageModeShared];
+    }
+    size_t x_half_size = (size_t)M_padded * in_dim * sizeof(uint16_t);
+    if ([ctx->nax_x_half length] < x_half_size) {
+        ctx->nax_x_half = [ctx->device newBufferWithLength:x_half_size options:MTLResourceStorageModeShared];
+    }
+    size_t c_size = (size_t)M_padded * out_dim * sizeof(float);
+    if ([ctx->buf_output length] < c_size) {
+        // Need a larger output buffer for padded M
+        // Use a temporary buffer
+    }
+
+    // Copy input to buf_input (only 1 row of actual data, zero-pad rest for M_padded=32)
+    size_t input_padded_size = (size_t)M_padded * in_dim * sizeof(float);
+    if ([ctx->buf_input length] < input_padded_size) {
+        ctx->buf_input = [ctx->device newBufferWithLength:input_padded_size options:MTLResourceStorageModeShared];
+    }
+    memcpy([ctx->buf_input contents], x_f32, in_dim * sizeof(float));
+    memset((char *)[ctx->buf_input contents] + in_dim * sizeof(float), 0,
+           (M_padded - 1) * in_dim * sizeof(float));
+
+    // Pass 1: Dequantize 4-bit weights → half (cached after first call)
+    if (!g_nax_lmhead_dequantized) {
+        id<MTLCommandBuffer> deq_cmd = [ctx->queue commandBuffer];
+        id<MTLComputeCommandEncoder> enc = [deq_cmd computeCommandEncoder];
+        [enc setComputePipelineState:ctx->nax_dequant];
+        [enc setBuffer:ctx->wf_buf    offset:w_off atIndex:0];
+        [enc setBuffer:ctx->wf_buf    offset:s_off atIndex:1];
+        [enc setBuffer:ctx->wf_buf    offset:b_off atIndex:2];
+        [enc setBuffer:ctx->nax_w_half offset:0    atIndex:3];
+        [enc setBytes:&out_dim length:4 atIndex:4];
+        [enc setBytes:&in_dim  length:4 atIndex:5];
+        uint32_t total_groups = out_dim * num_groups;
+        uint32_t tg_size = 256;
+        uint32_t num_tgs = (total_groups + tg_size - 1) / tg_size;
+        [enc dispatchThreadgroups:MTLSizeMake(num_tgs, 1, 1)
+            threadsPerThreadgroup:MTLSizeMake(tg_size, 1, 1)];
+        [enc endEncoding];
+        [deq_cmd commit]; [deq_cmd waitUntilCompleted];
+        g_nax_lmhead_dequantized = 1;
+        fprintf(stderr, "[nax] LM head weights dequantized to half (cached, %.1f MB)\n",
+                (double)out_dim * in_dim * 2 / 1e6);
+    }
+
+    // NAX GEMM: C[M_padded, N] = x_f32[M_padded, K] @ W_half[N, K]^T
+    // nax_gemm_f32_input converts f32→half inline (no separate pass)
+    id<MTLBuffer> c_buf = ctx->nax_c_buf;
+
+    id<MTLCommandBuffer> cmdbuf = [ctx->queue commandBuffer];
+    id<MTLComputeCommandEncoder> enc = [cmdbuf computeCommandEncoder];
+    [enc setComputePipelineState:ctx->nax_gemm];
+    [enc setBuffer:ctx->buf_input  offset:0 atIndex:0];  // A[M_padded, K] float32
+    [enc setBuffer:ctx->nax_w_half offset:0 atIndex:1];  // B[N, K] half (cached)
+    [enc setBuffer:c_buf           offset:0 atIndex:2];  // C[M_padded, N] float32
+    [enc setBytes:&M_padded length:4 atIndex:3];
+    [enc setBytes:&out_dim  length:4 atIndex:4];
+    [enc setBytes:&in_dim   length:4 atIndex:5];
+    int gx = (out_dim + 31) / 32;
+    int gy = (M_padded + 31) / 32;
+    [enc dispatchThreadgroups:MTLSizeMake(gx, gy, 1)
+        threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+    [enc endEncoding];
+
+    // Extract row 0 from column-major output on GPU (avoids slow strided CPU readback)
+    {
+        id<MTLComputeCommandEncoder> enc2 = [cmdbuf computeCommandEncoder];
+        [enc2 setComputePipelineState:ctx->nax_extract];
+        [enc2 setBuffer:c_buf          offset:0 atIndex:0];  // column-major input
+        [enc2 setBuffer:ctx->buf_output offset:0 atIndex:1]; // row-major output
+        [enc2 setBytes:&out_dim  length:4 atIndex:2];
+        [enc2 setBytes:&M_padded length:4 atIndex:3];
+        [enc2 dispatchThreads:MTLSizeMake(out_dim, 1, 1)
+            threadsPerThreadgroup:MTLSizeMake(MIN(out_dim, (uint32_t)1024), 1, 1)];
+        [enc2 endEncoding];
+    }
+
+    [cmdbuf commit];
+    [cmdbuf waitUntilCompleted];
+
+    memcpy(out_f32, [ctx->buf_output contents], out_dim * sizeof(float));
+}
+
 // Wrapper: use GPU if available and weight buffer is set, CPU otherwise
 static void fast_dequant_matvec(
     const uint32_t *W, const uint16_t *scales, const uint16_t *biases,
@@ -1328,8 +1575,15 @@ static void fast_dequant_matvec(
     int out_dim, int in_dim, int group_size
 ) {
     if (g_metal && g_metal->wf_buf) {
-        gpu_dequant_matvec(g_metal, W, scales, biases, x, out,
-                           (uint32_t)out_dim, (uint32_t)in_dim, (uint32_t)group_size);
+        // Use NAX for LM head only (248320 × 4096) — largest projection
+        // NAX tile is 32×32; M is padded to 32 for single-token decode
+        if (g_metal->has_nax && !g_nax_disabled && out_dim > 100000) {
+            gpu_nax_dequant_gemm(g_metal, W, scales, biases, x, out,
+                                 (uint32_t)out_dim, (uint32_t)in_dim, (uint32_t)group_size);
+        } else {
+            gpu_dequant_matvec(g_metal, W, scales, biases, x, out,
+                               (uint32_t)out_dim, (uint32_t)in_dim, (uint32_t)group_size);
+        }
     } else {
         cpu_dequant_matvec(W, scales, biases, x, out, out_dim, in_dim, group_size);
     }
@@ -4006,6 +4260,10 @@ static void fused_layer_forward(
     int K,                   // number of active experts
     int packed_fd            // fd for packed expert file
 ) {
+    // Per-layer quant: temporarily set g_use_2bit for this layer (mixed quant support)
+    int saved_use_2bit = g_use_2bit;
+    if (g_use_2bit) g_use_2bit = g_layer_is_2bit[layer_idx];
+
     double t_layer_start = 0, t0 = 0, t1 = 0;
     if (g_timing_enabled) { t_layer_start = now_ms(); }
     int pred_started = 0;  // set to 1 if we started prediction preads during CMD1_wait
@@ -5436,7 +5694,10 @@ static void fused_layer_forward(
             t1 = now_ms();
             g_timing.cmd3_encode += t1 - t0;
             g_timing.count++;
-            g_timing.total += t1 - t_layer_start;
+            double layer_time = t1 - t_layer_start;
+            g_timing.total += layer_time;
+            if (kv) { g_timing.total_full += layer_time; g_timing.count_full++; }
+            else    { g_timing.total_linear += layer_time; g_timing.count_linear++; }
         }
 
         // Save state for deferred completion
@@ -5459,6 +5720,7 @@ static void fused_layer_forward(
         // Return immediately — GPU experts are running async.
         // The next call to fused_layer_forward() or complete_deferred_experts()
         // will wait for the GPU and apply the final combine.
+        g_use_2bit = saved_use_2bit;  // restore (mixed quant)
         return;
 
     } else if (packed_fd >= 0) {
@@ -5543,11 +5805,17 @@ static void fused_layer_forward(
         t1 = now_ms();
         g_timing.cmd3_encode += t1 - t0;  // includes CPU expert compute for non-GPU paths
         g_timing.count++;
-        g_timing.total += t1 - t_layer_start;
+        double layer_time_cpu = t1 - t_layer_start;
+        g_timing.total += layer_time_cpu;
+        if (kv) { g_timing.total_full += layer_time_cpu; g_timing.count_full++; }
+        else    { g_timing.total_linear += layer_time_cpu; g_timing.count_linear++; }
     }
 
     // h_post, h_mid, gate_scores, moe_out, shared_out, shared_gate, shared_up
     // are all static scratch buffers — no free needed.
+
+    // Restore global 2-bit flag (mixed quant)
+    g_use_2bit = saved_use_2bit;
 }
 
 // ============================================================================
@@ -6517,6 +6785,10 @@ static void print_usage(const char *prog) {
     printf("  --predict            Enable temporal expert prediction (prefetch during CMD1_wait)\n");
     printf("  --collect-routing F  Log routing data to binary file F (for predictor training)\n");
     printf("  --think-budget N     Max thinking tokens before force </think> (default: 2048, 0=unlimited)\n");
+    printf("  --ppl PATH           Measure perplexity on ground truth token file\n");
+    printf("  --stream             Clean streaming output (no progress, no stats)\n");
+    printf("  --nax                Enable NAX tensor matmul for LM head (M5+, slower for single-token)\n");
+    printf("  --no-nax             Disable NAX (default)\n");
     printf("  --serve PORT         Run HTTP server (OpenAI-compatible API)\n");
     printf("  --help               This message\n");
 }
@@ -6529,6 +6801,7 @@ int main(int argc, char **argv) {
         const char *vocab_path = NULL;
         const char *prompt_tokens_path = NULL;
         const char *prompt_text = NULL;
+        const char *ppl_tokens_path = NULL;
         int max_tokens = 20;
         int K = 4;
         int cache_entries = 0;  // default 0: trust OS page cache (38% faster than Metal LRU)
@@ -6557,6 +6830,10 @@ int main(int argc, char **argv) {
             {"serve",         required_argument, 0, 'R'},
             {"predict",       no_argument,       0, 'D'},
             {"collect-routing", required_argument, 0, 'Z'},
+            {"ppl",           required_argument, 0, 'Q'},
+            {"stream",        no_argument,       0, 'O'},
+            {"nax",           no_argument,       0, 'X'},
+            {"no-nax",        no_argument,       0, 'x'},
             {"help",          no_argument,       0, 'h'},
             {0, 0, 0, 0}
         };
@@ -6591,42 +6868,60 @@ int main(int argc, char **argv) {
                     break;
                 case 'B': g_think_budget = atoi(optarg); break;
                 case 'R': serve_port = atoi(optarg); break;
+                case 'Q': ppl_tokens_path = optarg; break;
+                case 'O': g_stream_mode = 1; break;
+                case 'X': g_nax_disabled = 0; break;  // --nax: enable
+                case 'x': g_nax_disabled = 1; break;  // --no-nax: disable
                 case 'h': print_usage(argv[0]); return 0;
                 default:  print_usage(argv[0]); return 1;
             }
         }
 
-        // Build default paths
+        // Build default paths — check <model_path>/ first, then legacy locations
         char default_weights[1024], default_manifest[1024], default_vocab[1024];
 
-        // Try to find files relative to the executable
         if (!weights_path) {
             snprintf(default_weights, sizeof(default_weights),
-                     "metal_infer/model_weights.bin");
+                     "%s/model_weights.bin", model_path);
             if (access(default_weights, R_OK) != 0) {
                 snprintf(default_weights, sizeof(default_weights),
-                         "model_weights.bin");
+                         "metal_infer/model_weights.bin");
+                if (access(default_weights, R_OK) != 0) {
+                    snprintf(default_weights, sizeof(default_weights),
+                             "model_weights.bin");
+                }
             }
             weights_path = default_weights;
         }
         if (!manifest_path) {
             snprintf(default_manifest, sizeof(default_manifest),
-                     "metal_infer/model_weights.json");
+                     "%s/model_weights.json", model_path);
             if (access(default_manifest, R_OK) != 0) {
                 snprintf(default_manifest, sizeof(default_manifest),
-                         "model_weights.json");
+                         "metal_infer/model_weights.json");
+                if (access(default_manifest, R_OK) != 0) {
+                    snprintf(default_manifest, sizeof(default_manifest),
+                             "model_weights.json");
+                }
             }
             manifest_path = default_manifest;
         }
         if (!vocab_path) {
             snprintf(default_vocab, sizeof(default_vocab),
-                     "metal_infer/vocab.bin");
+                     "%s/vocab.bin", model_path);
             if (access(default_vocab, R_OK) != 0) {
                 snprintf(default_vocab, sizeof(default_vocab),
-                         "vocab.bin");
+                         "metal_infer/vocab.bin");
+                if (access(default_vocab, R_OK) != 0) {
+                    snprintf(default_vocab, sizeof(default_vocab),
+                             "vocab.bin");
+                }
             }
             vocab_path = default_vocab;
         }
+
+        // Set model path for tokenizer lookup
+        g_model_path_for_tokenizer = model_path;
 
         // ---- Initialize Metal ----
         g_metal = metal_setup();
@@ -6648,21 +6943,23 @@ int main(int argc, char **argv) {
             g_expert_cache = expert_cache_new(g_metal->device, cache_entries);
         }
 
-        printf("=== Qwen3.5-397B-A17B Metal Inference Engine ===\n");
-        printf("Model:    %s\n", model_path);
-        printf("Weights:  %s\n", weights_path);
-        printf("Manifest: %s\n", manifest_path);
-        printf("Vocab:    %s\n", vocab_path);
-        printf("K:        %d experts/layer\n", K);
-        printf("Quant:    %s experts (%zu bytes each)\n", g_use_2bit ? "2-bit" : "4-bit", active_expert_size());
-        printf("Linear:   %s\n", gpu_linear_attn_enabled ? "fused GPU delta-net" : "CPU/hybrid fallback");
-        printf("Tokens:   %d\n", max_tokens);
-        if (g_malloc_cache) {
-            printf("Cache:    malloc %d entries (%.1f GB)\n",
-                   malloc_cache_entries, (double)malloc_cache_entries * active_expert_size() / 1e9);
-        } else {
-            printf("Cache:    %d entries%s\n", cache_entries,
-                   cache_entries > 0 ? "" : " (disabled)");
+        if (!g_stream_mode) {
+            printf("=== Qwen3.5-397B-A17B Metal Inference Engine ===\n");
+            printf("Model:    %s\n", model_path);
+            printf("Weights:  %s\n", weights_path);
+            printf("Manifest: %s\n", manifest_path);
+            printf("Vocab:    %s\n", vocab_path);
+            printf("K:        %d experts/layer\n", K);
+            printf("Quant:    %s experts (%zu bytes each)\n", g_use_2bit ? "2-bit" : "4-bit", active_expert_size());
+            printf("Linear:   %s\n", gpu_linear_attn_enabled ? "fused GPU delta-net" : "CPU/hybrid fallback");
+            printf("Tokens:   %d\n", max_tokens);
+            if (g_malloc_cache) {
+                printf("Cache:    malloc %d entries (%.1f GB)\n",
+                       malloc_cache_entries, (double)malloc_cache_entries * active_expert_size() / 1e9);
+            } else {
+                printf("Cache:    %d entries%s\n", cache_entries,
+                       cache_entries > 0 ? "" : " (disabled)");
+            }
         }
 
         double t0 = now_ms();
@@ -6709,9 +7006,11 @@ int main(int argc, char **argv) {
                 fprintf(stderr, "ERROR: Failed to load prompt tokens from %s\n", prompt_tokens_path);
                 return 1;
             }
-            printf("[prompt] %d tokens:", pt->count);
-            for (int i = 0; i < pt->count && i < 20; i++) {
-                printf(" %d", pt->ids[i]);
+            if (!g_stream_mode) {
+                printf("[prompt] %d tokens:", pt->count);
+                for (int i = 0; i < pt->count && i < 20; i++) {
+                    printf(" %d", pt->ids[i]);
+                }
             }
             printf("\n");
         }
@@ -6750,11 +7049,34 @@ int main(int argc, char **argv) {
         // Reset the global seen-expert bitset
         memset(g_expert_seen, 0, sizeof(g_expert_seen));
 
+        int layers_2bit = 0, layers_4bit = 0;
+        memset(g_layer_is_2bit, 0, sizeof(g_layer_is_2bit));
+
         for (int i = 0; i < NUM_LAYERS; i++) {
             char path[1024];
-            snprintf(path, sizeof(path), "%s/%s/layer_%02d.bin", model_path,
-                     g_use_2bit ? "packed_experts_2bit" : "packed_experts", i);
-            layer_fds[i] = open(path, O_RDONLY);
+            layer_fds[i] = -1;
+
+            if (g_use_2bit) {
+                // Try 2-bit first
+                snprintf(path, sizeof(path), "%s/packed_experts_2bit/layer_%02d.bin", model_path, i);
+                layer_fds[i] = open(path, O_RDONLY);
+                if (layer_fds[i] >= 0) {
+                    g_layer_is_2bit[i] = 1;
+                    layers_2bit++;
+                } else {
+                    // Fall back to 4-bit for this layer
+                    snprintf(path, sizeof(path), "%s/packed_experts/layer_%02d.bin", model_path, i);
+                    layer_fds[i] = open(path, O_RDONLY);
+                    if (layer_fds[i] >= 0) {
+                        g_layer_is_2bit[i] = 0;
+                        layers_4bit++;
+                    }
+                }
+            } else {
+                snprintf(path, sizeof(path), "%s/packed_experts/layer_%02d.bin", model_path, i);
+                layer_fds[i] = open(path, O_RDONLY);
+            }
+
             layer_fds_cold[i] = -1;  // no longer used (trust OS page cache)
             layer_mmaps[i] = MAP_FAILED;
             layer_mmap_sizes[i] = 0;
@@ -6778,6 +7100,9 @@ int main(int argc, char **argv) {
             }
         }
         printf("[experts] %d/%d packed layer files available (mmap'd)\n", expert_layers_available, NUM_LAYERS);
+        if (g_use_2bit && layers_4bit > 0) {
+            printf("[mixed-quant] %d layers at 2-bit, %d layers at 4-bit\n", layers_2bit, layers_4bit);
+        }
 
         // ---- LZ4 compressed experts: auto-detect and load ----
         {
@@ -6869,10 +7194,91 @@ int main(int argc, char **argv) {
             return 0;
         }
 
+        // ---- PPL evaluation mode ----
+        if (ppl_tokens_path) {
+            PromptTokens *gt = load_prompt_tokens(ppl_tokens_path);
+            if (!gt) {
+                fprintf(stderr, "ERROR: Failed to load PPL tokens from %s\n", ppl_tokens_path);
+                free(hidden); free(logits);
+                return 1;
+            }
+            int num_eval = gt->count - 1;
+            printf("=== Perplexity Evaluation ===\n");
+            printf("Tokens: %d (scoring %d predictions)\n", gt->count, num_eval);
+            printf("Quant:  %s\n", g_use_2bit ? "2-bit" : "4-bit");
+
+            reset_delta_net_state();
+            if (g_cache_telemetry_enabled) cache_telemetry_reset();
+
+            double total_nll = 0.0;
+            int tokens_scored = 0;
+            int pos = 0;
+            double t_ppl_start = now_ms();
+
+            for (int i = 0; i < gt->count; i++) {
+                // Embed token[i]
+                embed_lookup(wf, gt->ids[i], hidden);
+
+                // Run 60 layers
+                for (int layer = 0; layer < NUM_LAYERS; layer++) {
+                    int is_full = ((layer + 1) % FULL_ATTN_INTERVAL == 0);
+                    fused_layer_forward(wf, layer, hidden,
+                                        is_full ? kv_caches[layer] : NULL,
+                                        is_full ? NULL : layer_states[layer],
+                                        pos,
+                                        layer_mmaps[layer] != MAP_FAILED ? layer_mmaps[layer] : NULL,
+                                        K, layer_fds[layer]);
+                }
+                complete_deferred_experts();
+                pos++;
+
+                // Score: compute cross-entropy for predicting token[i+1]
+                if (i < gt->count - 1) {
+                    float *normed = malloc(HIDDEN_DIM * sizeof(float));
+                    cpu_rms_norm(hidden, final_norm_w, normed, HIDDEN_DIM, RMS_NORM_EPS);
+                    memcpy(hidden, normed, HIDDEN_DIM * sizeof(float));
+                    free(normed);
+
+                    lm_head_forward(wf, hidden, logits);
+
+                    float nll = cross_entropy_loss(logits, VOCAB_SIZE, gt->ids[i + 1]);
+                    total_nll += nll;
+                    tokens_scored++;
+
+                    // Progress every 10 tokens
+                    if (tokens_scored % 10 == 0 || tokens_scored == num_eval) {
+                        double elapsed = now_ms() - t_ppl_start;
+                        double avg_nll = total_nll / tokens_scored;
+                        fprintf(stderr, "\r[ppl] %d/%d tokens | NLL=%.4f | PPL=%.2f | %.2f tok/s",
+                                tokens_scored, num_eval, avg_nll, exp(avg_nll),
+                                tokens_scored * 1000.0 / elapsed);
+                    }
+                }
+            }
+
+            double elapsed_s = (now_ms() - t_ppl_start) / 1000.0;
+            double avg_nll = total_nll / tokens_scored;
+            double ppl = exp(avg_nll);
+
+            fprintf(stderr, "\n");
+            printf("\n=== Perplexity Results ===\n");
+            printf("Tokens evaluated: %d\n", tokens_scored);
+            printf("Cross-entropy:    %.4f nats\n", avg_nll);
+            printf("Perplexity:       %.2f\n", ppl);
+            printf("Time:             %.1f s (%.2f tok/s)\n", elapsed_s,
+                   tokens_scored / elapsed_s);
+            printf("Quant:            %s\n", g_use_2bit ? "2-bit" : "4-bit");
+
+            free(gt->ids); free(gt);
+            free(hidden); free(logits);
+            io_pool_shutdown();
+            return 0;
+        }
+
         // ---- Generate tokens ----
         reset_delta_net_state();  // zero GPU delta-net state before generation
         if (g_cache_telemetry_enabled) cache_telemetry_reset();
-        printf("--- Generating %d tokens ---\n", max_tokens);
+        if (!g_stream_mode) printf("--- Generating %d tokens ---\n", max_tokens);
         int pos = 0;  // position counter for RoPE
 
         // ---- Batch prefill: pre-embed all prompt tokens ----
@@ -6886,7 +7292,7 @@ int main(int argc, char **argv) {
                 embed_lookup(wf, pt->ids[i], embed_batch + (size_t)i * HIDDEN_DIM);
             }
             double embed_ms = now_ms() - t_embed;
-            printf("  [prefill] batch embed %d tokens: %.1f ms\n", pt->count, embed_ms);
+            if (!g_stream_mode) printf("  [prefill] batch embed %d tokens: %.1f ms\n", pt->count, embed_ms);
         }
 
         // ---- Batch prefill loop ----
@@ -6932,7 +7338,7 @@ int main(int argc, char **argv) {
             double prefill_batch_ms = now_ms() - t_prefill_batch;
             double avg_ms = (pt->count > 2) ?
                 (prefill_batch_ms - first_tok_ms) / (pt->count - 2) : first_tok_ms;
-            printf("  [prefill] %d/%d tokens: %.0f ms (first: %.0f ms, rest avg: %.0f ms)\n",
+            if (!g_stream_mode) printf("  [prefill] %d/%d tokens: %.0f ms (first: %.0f ms, rest avg: %.0f ms)\n",
                    pt->count - 1, pt->count, prefill_batch_ms, first_tok_ms, avg_ms);
         }
 
@@ -6998,10 +7404,11 @@ int main(int argc, char **argv) {
             fprintf(stderr, "[debug] hidden rms after final_norm=%.4f, logits rms=%.4f\n",
                     vec_rms(hidden, HIDDEN_DIM), vec_rms(logits, VOCAB_SIZE));
         }
-        printf("[ttft] %.0f ms (prefill %d tokens + lm_head %.0f ms)\n",
-               ttft_ms, pt->count, lm_ms);
-
-        printf("\n--- Output ---\n");
+        if (!g_stream_mode) {
+            printf("[ttft] %.0f ms (prefill %d tokens + lm_head %.0f ms)\n",
+                   ttft_ms, pt->count, lm_ms);
+            printf("\n--- Output ---\n");
+        }
         printf("%s", decode_token(vocab, next_token));
         fflush(stdout);
 
@@ -7020,7 +7427,8 @@ int main(int argc, char **argv) {
 
             // Check EOS
             if (next_token == EOS_TOKEN_1 || next_token == EOS_TOKEN_2) {
-                fprintf(stderr, "\n[eos] Token %d at position %d\n", next_token, gen);
+                if (!g_stream_mode)
+                    fprintf(stderr, "\n[eos] Token %d at position %d\n", next_token, gen);
                 break;
             }
 
@@ -7056,7 +7464,13 @@ int main(int argc, char **argv) {
             }
 
             // LM head
+            double t_lm_gen = now_ms();
             lm_head_forward(wf, hidden, logits);
+            double lm_gen_ms = now_ms() - t_lm_gen;
+            if (g_timing_enabled) {
+                g_timing.lm_head += lm_gen_ms;
+                g_timing.token_count++;
+            }
 
             // Greedy sample
             next_token = cpu_argmax(logits, VOCAB_SIZE);
@@ -7076,46 +7490,56 @@ int main(int argc, char **argv) {
             double tok_time = t_gen_end - t_gen_start;
 
             // Print progress to stderr
-            fprintf(stderr, "  [gen %d/%d] token_id=%d (%.0f ms, %.2f tok/s)\n",
-                    gen, max_tokens, next_token, tok_time, 1000.0 / tok_time);
+            if (!g_stream_mode)
+                fprintf(stderr, "  [gen %d/%d] token_id=%d (%.0f ms, %.2f tok/s)\n",
+                        gen, max_tokens, next_token, tok_time, 1000.0 / tok_time);
         }
 
-        if (g_timing_enabled) timing_print();
-        printf("\n\n--- Statistics ---\n");
-        double total_time = now_ms() - t0;
-        printf("Total time:     %.1f s\n", total_time / 1000.0);
-        printf("TTFT:           %.0f ms\n", ttft_ms);
-        printf("Tokens:         %d generated\n", total_generated);
-        if (total_generated > 1) {
+        if (g_stream_mode) {
+            double total_time = now_ms() - t0;
             double gen_time = total_time - ttft_ms;
-            printf("Generation:     %.1f s (%.2f tok/s)\n",
-                   gen_time / 1000.0, (total_generated - 1) * 1000.0 / gen_time);
+            double decode_tps = (total_generated > 1) ? (total_generated - 1) * 1000.0 / gen_time : 0;
+            double prefill_tps = (pt->count > 0) ? pt->count * 1000.0 / ttft_ms : 0;
+            printf("\n\ndecode: %.2f t/s, prefill: %.2f t/s\n", decode_tps, prefill_tps);
         }
-        printf("Config:         K=%d experts, %d layers\n", K, NUM_LAYERS);
-        if (g_expert_cache) {
-            uint64_t total = g_expert_cache->hits + g_expert_cache->misses;
-            printf("Expert cache:   %llu hits, %llu misses (%.1f%% hit rate), %d/%d entries used\n",
-                   g_expert_cache->hits, g_expert_cache->misses,
-                   total > 0 ? 100.0 * g_expert_cache->hits / total : 0.0,
-                   g_expert_cache->num_entries, g_expert_cache->max_entries);
-            cache_telemetry_print(g_expert_cache->hits, g_expert_cache->misses);
-        } else if (g_malloc_cache) {
-            uint64_t total = g_malloc_cache->hits + g_malloc_cache->misses;
-            printf("Expert cache:   malloc %llu hits, %llu misses (%.1f%% hit rate), %d/%d entries used\n",
-                   g_malloc_cache->hits, g_malloc_cache->misses,
-                   total > 0 ? 100.0 * g_malloc_cache->hits / total : 0.0,
-                   g_malloc_cache->num_entries, g_malloc_cache->max_entries);
-            cache_telemetry_print(g_malloc_cache->hits, g_malloc_cache->misses);
-        }
+        if (g_timing_enabled) timing_print();
+        if (!g_stream_mode) {
+            printf("\n\n--- Statistics ---\n");
+            double total_time = now_ms() - t0;
+            printf("Total time:     %.1f s\n", total_time / 1000.0);
+            printf("TTFT:           %.0f ms\n", ttft_ms);
+            printf("Tokens:         %d generated\n", total_generated);
+            if (total_generated > 1) {
+                double gen_time = total_time - ttft_ms;
+                printf("Generation:     %.1f s (%.2f tok/s)\n",
+                       gen_time / 1000.0, (total_generated - 1) * 1000.0 / gen_time);
+            }
+            printf("Config:         K=%d experts, %d layers\n", K, NUM_LAYERS);
+            if (g_expert_cache) {
+                uint64_t total = g_expert_cache->hits + g_expert_cache->misses;
+                printf("Expert cache:   %llu hits, %llu misses (%.1f%% hit rate), %d/%d entries used\n",
+                       g_expert_cache->hits, g_expert_cache->misses,
+                       total > 0 ? 100.0 * g_expert_cache->hits / total : 0.0,
+                       g_expert_cache->num_entries, g_expert_cache->max_entries);
+                cache_telemetry_print(g_expert_cache->hits, g_expert_cache->misses);
+            } else if (g_malloc_cache) {
+                uint64_t total = g_malloc_cache->hits + g_malloc_cache->misses;
+                printf("Expert cache:   malloc %llu hits, %llu misses (%.1f%% hit rate), %d/%d entries used\n",
+                       g_malloc_cache->hits, g_malloc_cache->misses,
+                       total > 0 ? 100.0 * g_malloc_cache->hits / total : 0.0,
+                       g_malloc_cache->num_entries, g_malloc_cache->max_entries);
+                cache_telemetry_print(g_malloc_cache->hits, g_malloc_cache->misses);
+            }
 
-        if (g_spec_route_attempts > 0) {
-            printf("Spec routing:   %llu attempts, %llu preloads, %llu hits (%.1f%% prediction accuracy)\n",
-                   g_spec_route_attempts, g_spec_route_preloads, g_spec_route_hits,
-                   g_spec_route_attempts > 0
-                       ? 100.0 * g_spec_route_hits / g_spec_route_attempts : 0.0);
-        }
+            if (g_spec_route_attempts > 0) {
+                printf("Spec routing:   %llu attempts, %llu preloads, %llu hits (%.1f%% prediction accuracy)\n",
+                       g_spec_route_attempts, g_spec_route_preloads, g_spec_route_hits,
+                       g_spec_route_attempts > 0
+                           ? 100.0 * g_spec_route_hits / g_spec_route_attempts : 0.0);
+            }
 
-        if (g_freq_tracking) freq_print_analysis(K);
+            if (g_freq_tracking) freq_print_analysis(K);
+        }
         if (g_routing_log) {
             fclose(g_routing_log);
             fprintf(stderr, "[routing] Logged %d samples to routing data file\n",

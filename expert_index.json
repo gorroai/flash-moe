@@ -1,5 +1,5 @@
 {
-  "model_path": "/Users/danielwoods/.cache/huggingface/hub/models--mlx-community--Qwen3.5-397B-A17B-4bit/snapshots/39159bd8aa74f5c8446d2b2dc584f62bb51cb0d3",
+  "model_path": "/Users/anemll/Models/mlx-community-Qwen3.5-397B-A17B-4bit",
   "expert_reads": {
     "0": {
       "gate_proj.weight": {
