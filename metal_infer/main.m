@@ -78,7 +78,7 @@
 #define EXPERT_SIZE      7077888   // Total bytes per expert
 
 // Default model path
-#define MODEL_PATH "/Users/danielwoods/.cache/huggingface/hub/models--mlx-community--Qwen3.5-397B-A17B-4bit/snapshots/39159bd8aa74f5c8446d2b2dc584f62bb51cb0d3"
+#define MODEL_PATH "~/.cache/huggingface/hub/models--mlx-community--Qwen3.5-397B-A17B-4bit/snapshots/39159bd8aa74f5c8446d2b2dc584f62bb51cb0d3"
 
 // ============================================================================
 // Timing helper
@@ -88,6 +88,12 @@ static double now_ms(void) {
     struct timeval tv;
     gettimeofday(&tv, NULL);
     return tv.tv_sec * 1000.0 + tv.tv_usec / 1000.0;
+}
+
+static NSString *expand_user_path(const char *path) {
+    if (!path) return nil;
+    NSString *ns_path = [NSString stringWithUTF8String:path];
+    return ns_path ? [ns_path stringByExpandingTildeInPath] : nil;
 }
 
 // ============================================================================
@@ -1535,6 +1541,11 @@ int main(int argc, char **argv) {
                 case 'h': print_usage(argv[0]); return 0;
                 default:  print_usage(argv[0]); return 1;
             }
+        }
+
+        NSString *model_path_string = expand_user_path(model_path);
+        if (model_path_string) {
+            model_path = [model_path_string fileSystemRepresentation];
         }
 
         // Clamp K to valid range

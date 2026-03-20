@@ -114,6 +114,14 @@
 #define DOWN_S_OFF_2  3670016
 #define DOWN_B_OFF_2  3801088
 
+// Optional 8-bit down_proj override sidecar layout (configured per model)
+#define Q8_DOWN_W_OFF       0
+#define Q8_DOWN_W_SIZE      4194304
+#define Q8_DOWN_S_OFF       4194304
+#define Q8_DOWN_S_SIZE      262144
+#define Q8_DOWN_BLOCK_SIZE  32
+#define Q8_DOWN_EXPERT_SIZE 4456448
+
 // KV cache maximum context length
 #define MAX_SEQ_LEN 1048576  // 1M context — only 15 full-attn layers need KV cache, ~15GB at max
 #define GPU_KV_SEQ  8192     // GPU KV buffer pre-allocation (grows if exceeded, falls back to CPU attn)
@@ -124,7 +132,7 @@
 #define THINK_START_TOKEN   248068  // <think>
 #define THINK_END_TOKEN     248069  // </think>
 
-#define MODEL_PATH_DEFAULT "/Users/danielwoods/.cache/huggingface/hub/models--mlx-community--Qwen3.5-397B-A17B-4bit/snapshots/39159bd8aa74f5c8446d2b2dc584f62bb51cb0d3"
+#define MODEL_PATH_DEFAULT "~/.cache/huggingface/hub/models--mlx-community--Qwen3.5-397B-A17B-4bit/snapshots/39159bd8aa74f5c8446d2b2dc584f62bb51cb0d3"
 
 // ============================================================================
 // Timing helper
@@ -134,6 +142,92 @@ static double now_ms(void) {
     struct timeval tv;
     gettimeofday(&tv, NULL);
     return tv.tv_sec * 1000.0 + tv.tv_usec / 1000.0;
+}
+
+static NSString *expand_user_path(const char *path) {
+    if (!path) return nil;
+    NSString *ns_path = [NSString stringWithUTF8String:path];
+    return ns_path ? [ns_path stringByExpandingTildeInPath] : nil;
+}
+
+static int g_q8_downproj_layers[NUM_LAYERS] = {0};
+static int *g_q8_downproj_fds = NULL;
+static void **g_q8_downproj_mmaps = NULL;
+static size_t *g_q8_downproj_mmap_sizes = NULL;
+
+static inline int layer_has_q8_downproj(int layer_idx) {
+    return (layer_idx >= 0 && layer_idx < NUM_LAYERS) ? g_q8_downproj_layers[layer_idx] : 0;
+}
+
+static int load_q8_downproj_override_config(
+    const char *model_path,
+    int *layer_fds,
+    void **layer_mmaps,
+    size_t *layer_mmap_sizes
+) {
+    memset(g_q8_downproj_layers, 0, sizeof(g_q8_downproj_layers));
+    for (int i = 0; i < NUM_LAYERS; i++) {
+        layer_fds[i] = -1;
+        layer_mmaps[i] = MAP_FAILED;
+        layer_mmap_sizes[i] = 0;
+    }
+
+    NSString *layout_path = [NSString stringWithFormat:@"%s/packed_experts_q8_down/layout.json", model_path];
+    if (access([layout_path fileSystemRepresentation], R_OK) != 0) return 0;
+
+    NSData *layout_data = [NSData dataWithContentsOfFile:layout_path];
+    if (!layout_data) {
+        fprintf(stderr, "WARNING: failed to read q8 down_proj layout: %s\n",
+                [[layout_path description] UTF8String]);
+        return 0;
+    }
+
+    NSError *json_error = nil;
+    id parsed = [NSJSONSerialization JSONObjectWithData:layout_data options:0 error:&json_error];
+    if (![parsed isKindOfClass:[NSDictionary class]]) {
+        fprintf(stderr, "WARNING: invalid q8 down_proj layout JSON: %s\n",
+                json_error ? [[json_error localizedDescription] UTF8String] : "unknown error");
+        return 0;
+    }
+
+    NSDictionary *layout = (NSDictionary *)parsed;
+    NSString *scope = layout[@"scope"];
+    NSString *quant = layout[@"quant"];
+    NSArray *layers = layout[@"layers"];
+    if (![scope isKindOfClass:[NSString class]] ||
+        ![quant isKindOfClass:[NSString class]] ||
+        ![layers isKindOfClass:[NSArray class]] ||
+        ![scope isEqualToString:@"down_proj"] ||
+        ![quant isEqualToString:@"q8_0"]) {
+        fprintf(stderr, "WARNING: unsupported q8 down_proj layout metadata\n");
+        return 0;
+    }
+
+    int loaded = 0;
+    for (id item in layers) {
+        if (![item respondsToSelector:@selector(intValue)]) continue;
+        int layer_idx = [item intValue];
+        if (layer_idx < 0 || layer_idx >= NUM_LAYERS) continue;
+
+        char path[1024];
+        snprintf(path, sizeof(path), "%s/packed_experts_q8_down/layer_%02d.bin", model_path, layer_idx);
+        int fd = open(path, O_RDONLY);
+        if (fd < 0) continue;
+
+        g_q8_downproj_layers[layer_idx] = 1;
+        layer_fds[layer_idx] = fd;
+
+        struct stat st;
+        if (fstat(fd, &st) == 0 && st.st_size > 0) {
+            layer_mmaps[layer_idx] = mmap(NULL, st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
+            if (layer_mmaps[layer_idx] != MAP_FAILED) {
+                layer_mmap_sizes[layer_idx] = st.st_size;
+            }
+        }
+        loaded++;
+    }
+
+    return loaded;
 }
 
 // ============================================================================
@@ -194,7 +288,14 @@ static int g_expert_freq[NUM_LAYERS][NUM_EXPERTS];  // activation count per (lay
 static int g_freq_tracking = 0;  // enabled by --freq flag
 static int g_use_2bit = 0;       // enabled by --2bit flag: use packed_experts_2bit/ + 2-bit kernel
 static int g_cache_telemetry_enabled = 0;  // enabled by --cache-telemetry flag
+static int g_expert_limit = 0;   // debug: restrict routing to experts [0, N)
 static int g_think_budget = 2048; // max thinking tokens before force-emitting </think>
+static int g_trace_last_prompt_token = 0;  // enabled by --trace-last-prompt
+static int g_trace_generated_tokens = 0;   // trace first N generated-token steps
+static int g_trace_active = 0;             // transient: only while tracing the selected token
+static int g_trace_token_kind = 0;         // 0=last prompt token, 1=generated token step
+static int g_trace_token_index = -1;       // prompt index or generation step number
+static int gpu_dense_matvec_enabled = 1;   // shared dense matvec path (can disable via --cpu-matvec)
 
 // Tiered I/O: cold fds (F_NOCACHE) for first reads, warm fds (page cached) for repeats
 static int *g_layer_fds_cold = NULL;    // [NUM_LAYERS] cold fds (set in main)
@@ -221,6 +322,11 @@ static inline size_t active_expert_size(void) {
     return g_use_2bit ? EXPERT_SIZE_2BIT : EXPERT_SIZE;
 }
 static int g_freq_total_tokens = 0;  // total tokens processed while tracking
+
+static float vec_rms(const float *v, int n);
+static float vec_max_abs_diff(const float *a, const float *b, int n);
+static float vec_mean_abs_diff(const float *a, const float *b, int n);
+static float vec_cosine_similarity(const float *a, const float *b, int n);
 
 typedef struct {
     uint64_t token_clock;
@@ -377,6 +483,12 @@ static float bf16_to_f32(uint16_t bf16) {
     return f;
 }
 
+static float f16_to_f32(uint16_t f16_bits) {
+    _Float16 f16;
+    memcpy(&f16, &f16_bits, sizeof(f16));
+    return (float)f16;
+}
+
 __attribute__((unused))
 static uint16_t f32_to_bf16(float f) {
     uint32_t bits;
@@ -396,7 +508,7 @@ typedef struct {
     size_t size;
     int ndim;
     int shape[4];
-    char dtype[8];  // "U32", "BF16", "F32"
+    char dtype[8];  // "U32", "BF16", "F32", "I8", "F16"
 } TensorInfo;
 
 typedef struct {
@@ -472,6 +584,16 @@ typedef struct {
 
 static TensorHTEntry tensor_ht[TENSOR_HT_SIZE];
 static int tensor_ht_built = 0;
+static void *g_weight_base = NULL;
+static size_t g_weight_size = 0;
+
+typedef struct {
+    uint64_t key;
+    TensorInfo *value;
+} TensorOffsetHTEntry;
+
+static TensorOffsetHTEntry tensor_offset_ht[TENSOR_HT_SIZE];
+static int tensor_offset_ht_built = 0;
 
 static uint32_t fnv1a(const char *s) {
     uint32_t h = 2166136261u;
@@ -485,6 +607,7 @@ static uint32_t fnv1a(const char *s) {
 static void build_tensor_ht(TensorManifest *m) {
     if (tensor_ht_built) return;
     memset(tensor_ht, 0, sizeof(tensor_ht));
+    memset(tensor_offset_ht, 0, sizeof(tensor_offset_ht));
     for (int i = 0; i < m->num_tensors; i++) {
         uint32_t idx = fnv1a(m->tensors[i].name) & (TENSOR_HT_SIZE - 1);
         while (tensor_ht[idx].key) {
@@ -492,8 +615,17 @@ static void build_tensor_ht(TensorManifest *m) {
         }
         tensor_ht[idx].key = m->tensors[i].name;
         tensor_ht[idx].value = &m->tensors[i];
+
+        uint64_t off_key = (uint64_t)m->tensors[i].offset + 1;
+        uint32_t off_idx = (uint32_t)((off_key * 11400714819323198485ull) >> 51) & (TENSOR_HT_SIZE - 1);
+        while (tensor_offset_ht[off_idx].key) {
+            off_idx = (off_idx + 1) & (TENSOR_HT_SIZE - 1);
+        }
+        tensor_offset_ht[off_idx].key = off_key;
+        tensor_offset_ht[off_idx].value = &m->tensors[i];
     }
     tensor_ht_built = 1;
+    tensor_offset_ht_built = 1;
 }
 
 static TensorInfo *find_tensor(TensorManifest *m, const char *name) {
@@ -550,6 +682,8 @@ static WeightFile *open_weights(const char *bin_path, const char *json_path) {
     wf->data = data;
     wf->size = size;
     wf->manifest = manifest;
+    g_weight_base = data;
+    g_weight_size = size;
 
     printf("[weights] mmap'd %.2f GB from %s\n", size / 1e9, bin_path);
     return wf;
@@ -566,6 +700,20 @@ static void *get_tensor_ptr(WeightFile *wf, const char *name) {
 
 static TensorInfo *get_tensor_info(WeightFile *wf, const char *name) {
     return find_tensor(wf->manifest, name);
+}
+
+static TensorInfo *get_tensor_info_from_ptr(const void *ptr) {
+    if (!tensor_offset_ht_built || !g_weight_base || !ptr) return NULL;
+    intptr_t rel = (const char *)ptr - (const char *)g_weight_base;
+    if (rel < 0 || (uint64_t)rel >= g_weight_size) return NULL;
+
+    uint64_t off_key = (uint64_t)rel + 1;
+    uint32_t idx = (uint32_t)((off_key * 11400714819323198485ull) >> 51) & (TENSOR_HT_SIZE - 1);
+    while (tensor_offset_ht[idx].key) {
+        if (tensor_offset_ht[idx].key == off_key) return tensor_offset_ht[idx].value;
+        idx = (idx + 1) & (TENSOR_HT_SIZE - 1);
+    }
+    return NULL;
 }
 
 // ============================================================================
@@ -646,10 +794,19 @@ static PromptTokens *load_prompt_tokens(const char *path) {
 
 static bpe_tokenizer g_tokenizer;
 static int g_tokenizer_loaded = 0;
+static char g_tokenizer_model_path[1024] = {0};
+
+static void set_tokenizer_model_path(const char *model_path) {
+    g_tokenizer_model_path[0] = '\0';
+    if (!model_path || !model_path[0]) return;
+    snprintf(g_tokenizer_model_path, sizeof(g_tokenizer_model_path),
+             "%s/tokenizer.bin", model_path);
+}
 
 static void init_tokenizer(void) {
     if (g_tokenizer_loaded) return;
     const char *paths[] = {
+        g_tokenizer_model_path[0] ? g_tokenizer_model_path : NULL,
         "tokenizer.bin",
         "metal_infer/tokenizer.bin",
         NULL
@@ -734,6 +891,70 @@ static void cpu_dequant_matvec(
     }
 }
 
+static void cpu_q8_0_matvec(
+    const int8_t *W, const uint16_t *scales_f16,
+    const float *x, float *out,
+    int out_dim, int in_dim, int block_size
+) {
+    int num_blocks = in_dim / block_size;
+    for (int row = 0; row < out_dim; row++) {
+        float acc = 0.0f;
+        const int8_t *w_row = W + (size_t)row * in_dim;
+        const uint16_t *s_row = scales_f16 + (size_t)row * num_blocks;
+        for (int b = 0; b < num_blocks; b++) {
+            float scale = f16_to_f32(s_row[b]);
+            int base = b * block_size;
+            for (int i = 0; i < block_size; i++) {
+                acc += ((float)w_row[base + i] * scale) * x[base + i];
+            }
+        }
+        out[row] = acc;
+    }
+}
+
+static void cpu_f32_matvec(
+    const float *W,
+    const float *x, float *out,
+    int out_dim, int in_dim
+) {
+    for (int row = 0; row < out_dim; row++) {
+        const float *w_row = W + (size_t)row * in_dim;
+        float acc = 0.0f;
+        for (int i = 0; i < in_dim; i++) {
+            acc += w_row[i] * x[i];
+        }
+        out[row] = acc;
+    }
+}
+
+typedef enum {
+    MATRIX_FMT_AFFINE_4BIT = 0,
+    MATRIX_FMT_Q8_0 = 1,
+    MATRIX_FMT_F32 = 2,
+} MatrixFormat;
+
+static MatrixFormat matrix_format_for_tensors(const TensorInfo *w_info, const TensorInfo *s_info) {
+    if (w_info && strcmp(w_info->dtype, "F32") == 0) {
+        return MATRIX_FMT_F32;
+    }
+    if (w_info && s_info &&
+        strcmp(w_info->dtype, "I8") == 0 &&
+        strcmp(s_info->dtype, "F16") == 0) {
+        return MATRIX_FMT_Q8_0;
+    }
+    return MATRIX_FMT_AFFINE_4BIT;
+}
+
+static int q8_0_block_size_from_scales(const TensorInfo *s_info, int in_dim) {
+    if (s_info && s_info->ndim >= 2 && s_info->shape[1] > 0) {
+        int num_blocks = s_info->shape[1];
+        if (num_blocks > 0 && in_dim % num_blocks == 0) {
+            return in_dim / num_blocks;
+        }
+    }
+    return 32;
+}
+
 // RMS normalization: out = x * w / rms(x)
 static void cpu_rms_norm(const float *x, const uint16_t *w_bf16, float *out, int dim, float eps) {
     float sum_sq = 0.0f;
@@ -798,6 +1019,13 @@ static void cpu_topk(const float *scores, int dim, int K, int *indices, float *v
             values[min_k] = scores[i];
             indices[min_k] = i;
         }
+    }
+}
+
+static void apply_expert_limit(float *scores, int dim) {
+    if (g_expert_limit <= 0 || g_expert_limit >= dim) return;
+    for (int i = g_expert_limit; i < dim; i++) {
+        scores[i] = -1.0f;  // post-softmax scores are non-negative, so this excludes them from top-k
     }
 }
 
@@ -905,6 +1133,9 @@ typedef struct {
     id<MTLComputePipelineState> matvec_v5;  // LUT dequant variant
     id<MTLComputePipelineState> matvec_fast;  // for in_dim > 4096
     id<MTLComputePipelineState> matvec_2bit;  // 2-bit expert dequant kernel
+    id<MTLComputePipelineState> matvec_q8_0;  // dense/shared Q8_0 kernel
+    id<MTLComputePipelineState> matvec_f32;   // dense/shared F32 kernel
+    id<MTLComputePipelineState> matvec_8bit;  // optional 8-bit down_proj override kernel
     id<MTLComputePipelineState> rms_norm_sum;
     id<MTLComputePipelineState> rms_norm_apply;
     id<MTLComputePipelineState> rms_norm_apply_bf16;
@@ -937,6 +1168,7 @@ typedef struct {
     #define MAX_K 8
     id<MTLBuffer> buf_multi_expert_data[MAX_K];   // [EXPERT_SIZE bytes] each — buffer set A
     id<MTLBuffer> buf_multi_expert_data_B[MAX_K]; // [EXPERT_SIZE bytes] each — buffer set B (prefetch)
+    id<MTLBuffer> buf_multi_expert_down_q8[MAX_K]; // [Q8_DOWN_EXPERT_SIZE bytes] each — optional sidecar data
     id<MTLBuffer> buf_multi_expert_gate[MAX_K];   // [MOE_INTERMEDIATE floats]
     id<MTLBuffer> buf_multi_expert_up[MAX_K];     // [MOE_INTERMEDIATE floats]
     id<MTLBuffer> buf_multi_expert_act[MAX_K];    // [MOE_INTERMEDIATE floats]
@@ -1045,6 +1277,9 @@ static MetalCtx *metal_setup(void) {
     ctx->matvec_v5     = makePipe(@"dequant_matvec_4bit_v5");  // LUT variant (no uint→float conversions)
     ctx->matvec_fast   = makePipe(@"dequant_matvec_4bit_fast");
     ctx->matvec_2bit   = makePipe(@"dequant_matvec_2bit");
+    ctx->matvec_q8_0   = makePipe(@"dequant_matvec_q8_0");
+    ctx->matvec_f32    = makePipe(@"matvec_f32");
+    ctx->matvec_8bit   = makePipe(@"dequant_matvec_8bit");
     ctx->rms_norm_sum  = makePipe(@"rms_norm_sum_sq");
     ctx->rms_norm_apply = makePipe(@"rms_norm_apply");
     ctx->rms_norm_apply_bf16 = makePipe(@"rms_norm_apply_bf16");
@@ -1131,6 +1366,8 @@ static MetalCtx *metal_setup(void) {
                                                                          length:expert_alloc_size
                                                                         options:MTLResourceStorageModeShared
                                                                     deallocator:nil];
+        ctx->buf_multi_expert_down_q8[k] = [ctx->device newBufferWithLength:Q8_DOWN_EXPERT_SIZE
+                                                                    options:MTLResourceStorageModeShared];
         ctx->buf_multi_expert_gate[k] = [ctx->device newBufferWithLength:MOE_INTERMEDIATE * sizeof(float)
                                                                  options:MTLResourceStorageModeShared];
         ctx->buf_multi_expert_up[k]   = [ctx->device newBufferWithLength:MOE_INTERMEDIATE * sizeof(float)
@@ -1264,7 +1501,7 @@ static void metal_set_weights(MetalCtx *ctx, void *data, size_t size) {
 // We wrap the ENTIRE mmap'd weight file as a single Metal buffer and use
 // byte offsets to point each shader argument at the right tensor.
 // This avoids per-tensor buffer creation and the page-alignment constraint.
-static void gpu_dequant_matvec(
+static void gpu_dequant_matvec_4bit(
     MetalCtx *ctx,
     const void *W_packed, const void *scales, const void *biases,
     const float *x_f32, float *out_f32,
@@ -1321,17 +1558,105 @@ static void gpu_dequant_matvec(
     memcpy(out_f32, [o_buf contents], o_size);
 }
 
+static void gpu_dequant_matvec_q8_0(
+    MetalCtx *ctx,
+    const void *W_q8, const void *scales, const float *x_f32, float *out_f32,
+    uint32_t out_dim, uint32_t in_dim, uint32_t block_size
+) {
+    memcpy([ctx->buf_input contents], x_f32, in_dim * sizeof(float));
+
+    size_t o_size = (size_t)out_dim * sizeof(float);
+    NSUInteger w_off = (NSUInteger)((const char *)W_q8    - (const char *)[ctx->wf_buf contents]);
+    NSUInteger s_off = (NSUInteger)((const char *)scales - (const char *)[ctx->wf_buf contents]);
+
+    id<MTLBuffer> o_buf = ctx->buf_output;
+    if (o_size > [o_buf length]) {
+        o_buf = [ctx->device newBufferWithLength:o_size options:MTLResourceStorageModeShared];
+    }
+
+    id<MTLCommandBuffer> cmdbuf = [ctx->queue commandBuffer];
+    id<MTLComputeCommandEncoder> enc = [cmdbuf computeCommandEncoder];
+    [enc setComputePipelineState:ctx->matvec_q8_0];
+    [enc setBuffer:ctx->wf_buf    offset:w_off atIndex:0];
+    [enc setBuffer:ctx->wf_buf    offset:s_off atIndex:1];
+    [enc setBuffer:ctx->buf_input offset:0     atIndex:2];
+    [enc setBuffer:o_buf          offset:0     atIndex:3];
+    [enc setBytes:&out_dim        length:4     atIndex:4];
+    [enc setBytes:&in_dim         length:4     atIndex:5];
+    [enc setBytes:&block_size     length:4     atIndex:6];
+    uint32_t num_tgs = (out_dim + 63) / 64;
+    [enc dispatchThreadgroups:MTLSizeMake(num_tgs, 1, 1)
+        threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+    [enc endEncoding];
+    [cmdbuf commit];
+    [cmdbuf waitUntilCompleted];
+
+    memcpy(out_f32, [o_buf contents], o_size);
+}
+
+static void gpu_matvec_f32(
+    MetalCtx *ctx,
+    const void *W_f32, const float *x_f32, float *out_f32,
+    uint32_t out_dim, uint32_t in_dim
+) {
+    memcpy([ctx->buf_input contents], x_f32, in_dim * sizeof(float));
+
+    size_t o_size = (size_t)out_dim * sizeof(float);
+    NSUInteger w_off = (NSUInteger)((const char *)W_f32 - (const char *)[ctx->wf_buf contents]);
+
+    id<MTLBuffer> o_buf = ctx->buf_output;
+    if (o_size > [o_buf length]) {
+        o_buf = [ctx->device newBufferWithLength:o_size options:MTLResourceStorageModeShared];
+    }
+
+    id<MTLCommandBuffer> cmdbuf = [ctx->queue commandBuffer];
+    id<MTLComputeCommandEncoder> enc = [cmdbuf computeCommandEncoder];
+    [enc setComputePipelineState:ctx->matvec_f32];
+    [enc setBuffer:ctx->wf_buf    offset:w_off atIndex:0];
+    [enc setBuffer:ctx->buf_input offset:0     atIndex:1];
+    [enc setBuffer:o_buf          offset:0     atIndex:2];
+    [enc setBytes:&out_dim        length:4     atIndex:3];
+    [enc setBytes:&in_dim         length:4     atIndex:4];
+    uint32_t num_tgs = (out_dim + 63) / 64;
+    [enc dispatchThreadgroups:MTLSizeMake(num_tgs, 1, 1)
+        threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+    [enc endEncoding];
+    [cmdbuf commit];
+    [cmdbuf waitUntilCompleted];
+
+    memcpy(out_f32, [o_buf contents], o_size);
+}
+
 // Wrapper: use GPU if available and weight buffer is set, CPU otherwise
 static void fast_dequant_matvec(
-    const uint32_t *W, const uint16_t *scales, const uint16_t *biases,
+    const void *W, const void *scales, const void *biases,
     const float *x, float *out,
     int out_dim, int in_dim, int group_size
 ) {
-    if (g_metal && g_metal->wf_buf) {
-        gpu_dequant_matvec(g_metal, W, scales, biases, x, out,
-                           (uint32_t)out_dim, (uint32_t)in_dim, (uint32_t)group_size);
+    TensorInfo *w_info = get_tensor_info_from_ptr(W);
+    TensorInfo *s_info = get_tensor_info_from_ptr(scales);
+    MatrixFormat fmt = matrix_format_for_tensors(w_info, s_info);
+    if (fmt == MATRIX_FMT_F32) {
+        if (gpu_dense_matvec_enabled && g_metal && g_metal->wf_buf && g_metal->matvec_f32) {
+            gpu_matvec_f32(g_metal, W, x, out, (uint32_t)out_dim, (uint32_t)in_dim);
+        } else {
+            cpu_f32_matvec((const float *)W, x, out, out_dim, in_dim);
+        }
+    } else if (fmt == MATRIX_FMT_Q8_0) {
+        int block_size = (s_info && s_info->ndim >= 2 && s_info->shape[1] > 0) ? (in_dim / s_info->shape[1]) : 32;
+        if (gpu_dense_matvec_enabled && g_metal && g_metal->wf_buf && g_metal->matvec_q8_0) {
+            gpu_dequant_matvec_q8_0(g_metal, W, scales, x, out,
+                                    (uint32_t)out_dim, (uint32_t)in_dim, (uint32_t)block_size);
+        } else {
+            cpu_q8_0_matvec((const int8_t *)W, (const uint16_t *)scales, x, out,
+                            out_dim, in_dim, block_size);
+        }
+    } else if (gpu_dense_matvec_enabled && g_metal && g_metal->wf_buf) {
+        gpu_dequant_matvec_4bit(g_metal, W, scales, biases, x, out,
+                                (uint32_t)out_dim, (uint32_t)in_dim, (uint32_t)group_size);
     } else {
-        cpu_dequant_matvec(W, scales, biases, x, out, out_dim, in_dim, group_size);
+        cpu_dequant_matvec((const uint32_t *)W, (const uint16_t *)scales, (const uint16_t *)biases,
+                           x, out, out_dim, in_dim, group_size);
     }
 }
 
@@ -1365,31 +1690,61 @@ static void gpu_batch_matvec(
 
     for (int i = 0; i < num_specs; i++) {
         BatchMatvecSpec *s = &specs[i];
+        TensorInfo *w_info = get_tensor_info_from_ptr(s->W);
+        TensorInfo *s_info = get_tensor_info_from_ptr(s->scales);
+        MatrixFormat fmt = matrix_format_for_tensors(w_info, s_info);
         NSUInteger w_off = (NSUInteger)((const char *)s->W      - (const char *)[ctx->wf_buf contents]);
         NSUInteger s_off = (NSUInteger)((const char *)s->scales  - (const char *)[ctx->wf_buf contents]);
-        NSUInteger b_off = (NSUInteger)((const char *)s->biases  - (const char *)[ctx->wf_buf contents]);
+        NSUInteger b_off = s->biases
+            ? (NSUInteger)((const char *)s->biases - (const char *)[ctx->wf_buf contents])
+            : 0;
 
         id<MTLBuffer> o_buf = ctx->batch_out[s->batch_slot];
 
         id<MTLComputeCommandEncoder> enc = [cmdbuf computeCommandEncoder];
-        int use_v3 = (s->in_dim <= 4096);
-        [enc setComputePipelineState: use_v3 ? ctx->matvec_v3 : ctx->matvec_fast];
-        [enc setBuffer:ctx->wf_buf  offset:w_off atIndex:0];
-        [enc setBuffer:ctx->wf_buf  offset:s_off atIndex:1];
-        [enc setBuffer:ctx->wf_buf  offset:b_off atIndex:2];
-        [enc setBuffer:ctx->buf_input offset:0   atIndex:3];
-        [enc setBuffer:o_buf        offset:0     atIndex:4];
-        [enc setBytes:&s->out_dim   length:4     atIndex:5];
-        [enc setBytes:&s->in_dim    length:4     atIndex:6];
-        [enc setBytes:&s->group_size length:4    atIndex:7];
-
-        if (use_v3) {
-            uint32_t num_tgs = (s->out_dim + 7) / 8;
+        if (fmt == MATRIX_FMT_F32) {
+            [enc setComputePipelineState:ctx->matvec_f32];
+            [enc setBuffer:ctx->wf_buf    offset:w_off atIndex:0];
+            [enc setBuffer:ctx->buf_input offset:0     atIndex:1];
+            [enc setBuffer:o_buf          offset:0     atIndex:2];
+            [enc setBytes:&s->out_dim     length:4     atIndex:3];
+            [enc setBytes:&s->in_dim      length:4     atIndex:4];
+            uint32_t num_tgs = (s->out_dim + 63) / 64;
             [enc dispatchThreadgroups:MTLSizeMake(num_tgs, 1, 1)
-                threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
-        } else {
-            [enc dispatchThreadgroups:MTLSizeMake(s->out_dim, 1, 1)
                 threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+        } else if (fmt == MATRIX_FMT_Q8_0) {
+            uint32_t block_size = (uint32_t)q8_0_block_size_from_scales(s_info, (int)s->in_dim);
+            [enc setComputePipelineState:ctx->matvec_q8_0];
+            [enc setBuffer:ctx->wf_buf    offset:w_off atIndex:0];
+            [enc setBuffer:ctx->wf_buf    offset:s_off atIndex:1];
+            [enc setBuffer:ctx->buf_input offset:0     atIndex:2];
+            [enc setBuffer:o_buf          offset:0     atIndex:3];
+            [enc setBytes:&s->out_dim     length:4     atIndex:4];
+            [enc setBytes:&s->in_dim      length:4     atIndex:5];
+            [enc setBytes:&block_size     length:4     atIndex:6];
+            uint32_t num_tgs = (s->out_dim + 63) / 64;
+            [enc dispatchThreadgroups:MTLSizeMake(num_tgs, 1, 1)
+                threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+        } else {
+            int use_v3 = (s->in_dim <= 4096);
+            [enc setComputePipelineState: use_v3 ? ctx->matvec_v3 : ctx->matvec_fast];
+            [enc setBuffer:ctx->wf_buf    offset:w_off atIndex:0];
+            [enc setBuffer:ctx->wf_buf    offset:s_off atIndex:1];
+            [enc setBuffer:ctx->wf_buf    offset:b_off atIndex:2];
+            [enc setBuffer:ctx->buf_input offset:0     atIndex:3];
+            [enc setBuffer:o_buf          offset:0     atIndex:4];
+            [enc setBytes:&s->out_dim     length:4     atIndex:5];
+            [enc setBytes:&s->in_dim      length:4     atIndex:6];
+            [enc setBytes:&s->group_size  length:4     atIndex:7];
+
+            if (use_v3) {
+                uint32_t num_tgs = (s->out_dim + 7) / 8;
+                [enc dispatchThreadgroups:MTLSizeMake(num_tgs, 1, 1)
+                    threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+            } else {
+                [enc dispatchThreadgroups:MTLSizeMake(s->out_dim, 1, 1)
+                    threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+            }
         }
         [enc endEncoding];
     }
@@ -1419,31 +1774,61 @@ static void gpu_encode_batch_matvec(
 ) {
     for (int i = 0; i < num_specs; i++) {
         BatchMatvecSpec *s = &specs[i];
+        TensorInfo *w_info = get_tensor_info_from_ptr(s->W);
+        TensorInfo *s_info = get_tensor_info_from_ptr(s->scales);
+        MatrixFormat fmt = matrix_format_for_tensors(w_info, s_info);
         NSUInteger w_off = (NSUInteger)((const char *)s->W      - (const char *)[ctx->wf_buf contents]);
         NSUInteger s_off = (NSUInteger)((const char *)s->scales  - (const char *)[ctx->wf_buf contents]);
-        NSUInteger b_off = (NSUInteger)((const char *)s->biases  - (const char *)[ctx->wf_buf contents]);
+        NSUInteger b_off = s->biases
+            ? (NSUInteger)((const char *)s->biases - (const char *)[ctx->wf_buf contents])
+            : 0;
 
         id<MTLBuffer> o_buf = ctx->batch_out[s->batch_slot];
 
         id<MTLComputeCommandEncoder> enc = [cmdbuf computeCommandEncoder];
-        int use_v3 = (s->in_dim <= 4096);
-        [enc setComputePipelineState: use_v3 ? ctx->matvec_v3 : ctx->matvec_fast];
-        [enc setBuffer:ctx->wf_buf  offset:w_off atIndex:0];
-        [enc setBuffer:ctx->wf_buf  offset:s_off atIndex:1];
-        [enc setBuffer:ctx->wf_buf  offset:b_off atIndex:2];
-        [enc setBuffer:ctx->buf_input offset:0   atIndex:3];
-        [enc setBuffer:o_buf        offset:0     atIndex:4];
-        [enc setBytes:&s->out_dim   length:4     atIndex:5];
-        [enc setBytes:&s->in_dim    length:4     atIndex:6];
-        [enc setBytes:&s->group_size length:4    atIndex:7];
-
-        if (use_v3) {
-            uint32_t num_tgs = (s->out_dim + 7) / 8;
+        if (fmt == MATRIX_FMT_F32) {
+            [enc setComputePipelineState:ctx->matvec_f32];
+            [enc setBuffer:ctx->wf_buf    offset:w_off atIndex:0];
+            [enc setBuffer:ctx->buf_input offset:0     atIndex:1];
+            [enc setBuffer:o_buf          offset:0     atIndex:2];
+            [enc setBytes:&s->out_dim     length:4     atIndex:3];
+            [enc setBytes:&s->in_dim      length:4     atIndex:4];
+            uint32_t num_tgs = (s->out_dim + 63) / 64;
             [enc dispatchThreadgroups:MTLSizeMake(num_tgs, 1, 1)
-                threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
-        } else {
-            [enc dispatchThreadgroups:MTLSizeMake(s->out_dim, 1, 1)
                 threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+        } else if (fmt == MATRIX_FMT_Q8_0) {
+            uint32_t block_size = (uint32_t)q8_0_block_size_from_scales(s_info, (int)s->in_dim);
+            [enc setComputePipelineState:ctx->matvec_q8_0];
+            [enc setBuffer:ctx->wf_buf    offset:w_off atIndex:0];
+            [enc setBuffer:ctx->wf_buf    offset:s_off atIndex:1];
+            [enc setBuffer:ctx->buf_input offset:0     atIndex:2];
+            [enc setBuffer:o_buf          offset:0     atIndex:3];
+            [enc setBytes:&s->out_dim     length:4     atIndex:4];
+            [enc setBytes:&s->in_dim      length:4     atIndex:5];
+            [enc setBytes:&block_size     length:4     atIndex:6];
+            uint32_t num_tgs = (s->out_dim + 63) / 64;
+            [enc dispatchThreadgroups:MTLSizeMake(num_tgs, 1, 1)
+                threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+        } else {
+            int use_v3 = (s->in_dim <= 4096);
+            [enc setComputePipelineState: use_v3 ? ctx->matvec_v3 : ctx->matvec_fast];
+            [enc setBuffer:ctx->wf_buf    offset:w_off atIndex:0];
+            [enc setBuffer:ctx->wf_buf    offset:s_off atIndex:1];
+            [enc setBuffer:ctx->wf_buf    offset:b_off atIndex:2];
+            [enc setBuffer:ctx->buf_input offset:0     atIndex:3];
+            [enc setBuffer:o_buf          offset:0     atIndex:4];
+            [enc setBytes:&s->out_dim     length:4     atIndex:5];
+            [enc setBytes:&s->in_dim      length:4     atIndex:6];
+            [enc setBytes:&s->group_size  length:4     atIndex:7];
+
+            if (use_v3) {
+                uint32_t num_tgs = (s->out_dim + 7) / 8;
+                [enc dispatchThreadgroups:MTLSizeMake(num_tgs, 1, 1)
+                    threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+            } else {
+                [enc dispatchThreadgroups:MTLSizeMake(s->out_dim, 1, 1)
+                    threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+            }
         }
         [enc endEncoding];
     }
@@ -1469,29 +1854,59 @@ static void gpu_encode_dequant_matvec_with_io_bufs(
     id<MTLBuffer> in_buf, id<MTLBuffer> out_buf,
     uint32_t out_dim, uint32_t in_dim, uint32_t group_size
 ) {
+    TensorInfo *w_info = get_tensor_info_from_ptr(W);
+    TensorInfo *s_info = get_tensor_info_from_ptr(scales);
+    MatrixFormat fmt = matrix_format_for_tensors(w_info, s_info);
     NSUInteger w_off = (NSUInteger)((const char *)W      - (const char *)[ctx->wf_buf contents]);
     NSUInteger s_off = (NSUInteger)((const char *)scales  - (const char *)[ctx->wf_buf contents]);
-    NSUInteger b_off = (NSUInteger)((const char *)biases  - (const char *)[ctx->wf_buf contents]);
+    NSUInteger b_off = biases
+        ? (NSUInteger)((const char *)biases - (const char *)[ctx->wf_buf contents])
+        : 0;
 
     id<MTLComputeCommandEncoder> enc = [cmdbuf computeCommandEncoder];
-    int use_v3 = (in_dim <= 4096);
-    [enc setComputePipelineState: use_v3 ? ctx->matvec_v3 : ctx->matvec_fast];
-    [enc setBuffer:ctx->wf_buf offset:w_off atIndex:0];
-    [enc setBuffer:ctx->wf_buf offset:s_off atIndex:1];
-    [enc setBuffer:ctx->wf_buf offset:b_off atIndex:2];
-    [enc setBuffer:in_buf      offset:0     atIndex:3];
-    [enc setBuffer:out_buf     offset:0     atIndex:4];
-    [enc setBytes:&out_dim     length:4     atIndex:5];
-    [enc setBytes:&in_dim      length:4     atIndex:6];
-    [enc setBytes:&group_size  length:4     atIndex:7];
-
-    if (use_v3) {
-        uint32_t num_tgs = (out_dim + 7) / 8;
+    if (fmt == MATRIX_FMT_F32) {
+        [enc setComputePipelineState:ctx->matvec_f32];
+        [enc setBuffer:ctx->wf_buf offset:w_off atIndex:0];
+        [enc setBuffer:in_buf      offset:0     atIndex:1];
+        [enc setBuffer:out_buf     offset:0     atIndex:2];
+        [enc setBytes:&out_dim     length:4     atIndex:3];
+        [enc setBytes:&in_dim      length:4     atIndex:4];
+        uint32_t num_tgs = (out_dim + 63) / 64;
         [enc dispatchThreadgroups:MTLSizeMake(num_tgs, 1, 1)
-            threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
-    } else {
-        [enc dispatchThreadgroups:MTLSizeMake(out_dim, 1, 1)
             threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+    } else if (fmt == MATRIX_FMT_Q8_0) {
+        uint32_t block_size = (uint32_t)q8_0_block_size_from_scales(s_info, (int)in_dim);
+        [enc setComputePipelineState:ctx->matvec_q8_0];
+        [enc setBuffer:ctx->wf_buf offset:w_off atIndex:0];
+        [enc setBuffer:ctx->wf_buf offset:s_off atIndex:1];
+        [enc setBuffer:in_buf      offset:0     atIndex:2];
+        [enc setBuffer:out_buf     offset:0     atIndex:3];
+        [enc setBytes:&out_dim     length:4     atIndex:4];
+        [enc setBytes:&in_dim      length:4     atIndex:5];
+        [enc setBytes:&block_size  length:4     atIndex:6];
+        uint32_t num_tgs = (out_dim + 63) / 64;
+        [enc dispatchThreadgroups:MTLSizeMake(num_tgs, 1, 1)
+            threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+    } else {
+        int use_v3 = (in_dim <= 4096);
+        [enc setComputePipelineState: use_v3 ? ctx->matvec_v3 : ctx->matvec_fast];
+        [enc setBuffer:ctx->wf_buf offset:w_off atIndex:0];
+        [enc setBuffer:ctx->wf_buf offset:s_off atIndex:1];
+        [enc setBuffer:ctx->wf_buf offset:b_off atIndex:2];
+        [enc setBuffer:in_buf      offset:0     atIndex:3];
+        [enc setBuffer:out_buf     offset:0     atIndex:4];
+        [enc setBytes:&out_dim     length:4     atIndex:5];
+        [enc setBytes:&in_dim      length:4     atIndex:6];
+        [enc setBytes:&group_size  length:4     atIndex:7];
+
+        if (use_v3) {
+            uint32_t num_tgs = (out_dim + 7) / 8;
+            [enc dispatchThreadgroups:MTLSizeMake(num_tgs, 1, 1)
+                threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        } else {
+            [enc dispatchThreadgroups:MTLSizeMake(out_dim, 1, 1)
+                threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+        }
     }
     [enc endEncoding];
 }
@@ -1695,9 +2110,12 @@ static void gpu_encode_expert_forward_slot_buf(
 static void gpu_encode_experts_batched(
     MetalCtx *ctx,
     id<MTLCommandBuffer> cmdbuf,
+    int layer_idx,
     int K,                       // number of experts to encode
     const int *valid,            // which experts are valid [MAX_K]
-    id<MTLBuffer> __strong *expert_bufs   // per-expert weight data buffers [MAX_K]
+    id<MTLBuffer> __strong *expert_bufs,  // per-expert weight data buffers [MAX_K]
+    const int *down_q8_valid,
+    id<MTLBuffer> __strong *down_q8_bufs
 ) {
     // Select offsets and pipeline based on quantization mode
     NSUInteger gate_w_off, gate_s_off, gate_b_off;
@@ -1769,17 +2187,40 @@ static void gpu_encode_experts_batched(
             [enc dispatchThreadgroups:MTLSizeMake(swiglu_tgs, 1, 1)
                 threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
             // down_proj (same encoder, serialized after SwiGLU)
-            [enc setComputePipelineState:expert_pipe];
-            [enc setBuffer:expert_bufs[k]                  offset:down_w_off  atIndex:0];
-            [enc setBuffer:expert_bufs[k]                  offset:down_s_off  atIndex:1];
-            [enc setBuffer:expert_bufs[k]                  offset:down_b_off  atIndex:2];
-            [enc setBuffer:ctx->buf_multi_expert_act[k]    offset:0           atIndex:3];
-            [enc setBuffer:ctx->buf_multi_expert_out[k]    offset:0           atIndex:4];
-            [enc setBytes:&down_out length:4 atIndex:5];
-            [enc setBytes:&down_in  length:4 atIndex:6];
-            [enc setBytes:&gs       length:4 atIndex:7];
-            [enc dispatchThreadgroups:MTLSizeMake(down_tgs, 1, 1)
-                threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+            int use_q8_down = (!g_use_2bit &&
+                               layer_has_q8_downproj(layer_idx) &&
+                               down_q8_valid && down_q8_valid[k] &&
+                               down_q8_bufs && down_q8_bufs[k] &&
+                               ctx->matvec_q8_0);
+            if (use_q8_down) {
+                uint32_t q8_block = Q8_DOWN_BLOCK_SIZE;
+                [enc setComputePipelineState:ctx->matvec_q8_0];
+                [enc setBuffer:down_q8_bufs[k]              offset:Q8_DOWN_W_OFF atIndex:0];
+                [enc setBuffer:down_q8_bufs[k]              offset:Q8_DOWN_S_OFF atIndex:1];
+                [enc setBuffer:ctx->buf_multi_expert_act[k] offset:0             atIndex:2];
+                [enc setBuffer:ctx->buf_multi_expert_out[k] offset:0             atIndex:3];
+                [enc setBytes:&down_out   length:4 atIndex:4];
+                [enc setBytes:&down_in    length:4 atIndex:5];
+                [enc setBytes:&q8_block   length:4 atIndex:6];
+            } else {
+                [enc setComputePipelineState:expert_pipe];
+                [enc setBuffer:expert_bufs[k]                  offset:down_w_off  atIndex:0];
+                [enc setBuffer:expert_bufs[k]                  offset:down_s_off  atIndex:1];
+                [enc setBuffer:expert_bufs[k]                  offset:down_b_off  atIndex:2];
+                [enc setBuffer:ctx->buf_multi_expert_act[k]    offset:0           atIndex:3];
+                [enc setBuffer:ctx->buf_multi_expert_out[k]    offset:0           atIndex:4];
+                [enc setBytes:&down_out length:4 atIndex:5];
+                [enc setBytes:&down_in  length:4 atIndex:6];
+                [enc setBytes:&gs       length:4 atIndex:7];
+            }
+            if (use_q8_down) {
+                uint32_t q8_tgs = (down_out + 63) / 64;
+                [enc dispatchThreadgroups:MTLSizeMake(q8_tgs, 1, 1)
+                    threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+            } else {
+                [enc dispatchThreadgroups:MTLSizeMake(down_tgs, 1, 1)
+                    threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+            }
             [enc endEncoding];
         }
     }
@@ -1881,13 +2322,24 @@ static void fast_batch_matvec(
     const float *x, uint32_t x_dim,
     BatchMatvecSpec *specs, int num_specs
 ) {
-    if (g_metal && g_metal->wf_buf) {
+    if (gpu_dense_matvec_enabled && g_metal && g_metal->wf_buf) {
         gpu_batch_matvec(g_metal, x, x_dim, specs, num_specs);
     } else {
         for (int i = 0; i < num_specs; i++) {
             BatchMatvecSpec *s = &specs[i];
-            cpu_dequant_matvec(s->W, s->scales, s->biases, x, s->out_cpu,
-                               s->out_dim, s->in_dim, s->group_size);
+            TensorInfo *w_info = get_tensor_info_from_ptr(s->W);
+            TensorInfo *s_info = get_tensor_info_from_ptr(s->scales);
+            MatrixFormat fmt = matrix_format_for_tensors(w_info, s_info);
+            if (fmt == MATRIX_FMT_F32) {
+                cpu_f32_matvec((const float *)s->W, x, s->out_cpu, (int)s->out_dim, (int)s->in_dim);
+            } else if (fmt == MATRIX_FMT_Q8_0) {
+                int block_size = q8_0_block_size_from_scales(s_info, (int)s->in_dim);
+                cpu_q8_0_matvec((const int8_t *)s->W, (const uint16_t *)s->scales,
+                                x, s->out_cpu, (int)s->out_dim, (int)s->in_dim, block_size);
+            } else {
+                cpu_dequant_matvec(s->W, s->scales, s->biases, x, s->out_cpu,
+                                   s->out_dim, s->in_dim, s->group_size);
+            }
         }
     }
 }
@@ -2118,6 +2570,56 @@ static float vec_rms(const float *v, int n) {
     float sum = 0.0f;
     for (int i = 0; i < n; i++) sum += v[i] * v[i];
     return sqrtf(sum / n);
+}
+
+static float vec_max_abs_diff(const float *a, const float *b, int n) {
+    float max_diff = 0.0f;
+    for (int i = 0; i < n; i++) {
+        float d = fabsf(a[i] - b[i]);
+        if (d > max_diff) max_diff = d;
+    }
+    return max_diff;
+}
+
+static float vec_mean_abs_diff(const float *a, const float *b, int n) {
+    double sum = 0.0;
+    for (int i = 0; i < n; i++) sum += fabs((double)a[i] - (double)b[i]);
+    return (float)(sum / (double)n);
+}
+
+static float vec_cosine_similarity(const float *a, const float *b, int n) {
+    double dot = 0.0;
+    double na = 0.0;
+    double nb = 0.0;
+    for (int i = 0; i < n; i++) {
+        double ai = a[i];
+        double bi = b[i];
+        dot += ai * bi;
+        na += ai * ai;
+        nb += bi * bi;
+    }
+    if (na <= 0.0 || nb <= 0.0) return 0.0f;
+    return (float)(dot / (sqrt(na) * sqrt(nb)));
+}
+
+static void trace_dump_vec(const char *tag, int layer_idx, const float *v, int n) {
+    const char *dir = getenv("FLASH_MOE_TRACE_DUMP_DIR");
+    if (!dir || !*dir || !tag || !v || n <= 0) return;
+
+    char path[PATH_MAX];
+    snprintf(path, sizeof(path), "%s/layer_%02d_%s.f32", dir, layer_idx, tag);
+
+    FILE *f = fopen(path, "wb");
+    if (!f) {
+        fprintf(stderr, "[trace] warning: failed to open %s: %s\n", path, strerror(errno));
+        return;
+    }
+    size_t wrote = fwrite(v, sizeof(float), (size_t)n, f);
+    if (wrote != (size_t)n) {
+        fprintf(stderr, "[trace] warning: short write for %s (%zu/%d floats)\n",
+                path, wrote, n);
+    }
+    fclose(f);
 }
 
 __attribute__((unused))
@@ -2709,6 +3211,7 @@ static void moe_forward(
 
     // Softmax routing scores
     cpu_softmax(gate_scores, NUM_EXPERTS);
+    apply_expert_limit(gate_scores, NUM_EXPERTS);
 
     // Top-K expert selection
     int expert_indices[64];
@@ -2861,24 +3364,49 @@ static void moe_forward(
 // ============================================================================
 
 static void embed_lookup(WeightFile *wf, int token_id, float *out) {
-    // Embedding: weight[vocab_size, hidden_dim/8] (U32), scales[vocab_size, groups], biases[vocab_size, groups]
-    // For embedding lookup, we just need one row.
-    // But the embedding is quantized: each row has hidden_dim/8 uint32 values (packed 4-bit)
-    // plus scales and biases per group
-
     TensorInfo *w_info = get_tensor_info(wf, "model.embed_tokens.weight");
     TensorInfo *s_info = get_tensor_info(wf, "model.embed_tokens.scales");
     TensorInfo *b_info = get_tensor_info(wf, "model.embed_tokens.biases");
 
-    if (!w_info || !s_info || !b_info) {
+    if (!w_info || !s_info) {
         fprintf(stderr, "ERROR: embedding tensors not found\n");
         memset(out, 0, HIDDEN_DIM * sizeof(float));
         return;
     }
 
-    // w shape: [248320, 512] U32 -> each row has 512 uint32 = 4096 packed 4-bit values
-    int packed_cols = w_info->shape[1];  // 512
-    int num_groups = s_info->shape[1];   // 64
+    MatrixFormat fmt = matrix_format_for_tensors(w_info, s_info);
+    if (fmt == MATRIX_FMT_F32) {
+        const float *W = (const float *)((char *)wf->data + w_info->offset);
+        const float *w_row = W + (size_t)token_id * HIDDEN_DIM;
+        memcpy(out, w_row, HIDDEN_DIM * sizeof(float));
+        return;
+    } else if (fmt == MATRIX_FMT_Q8_0) {
+        int num_blocks = s_info->shape[1];
+        int block_size = q8_0_block_size_from_scales(s_info, HIDDEN_DIM);
+        const int8_t *W = (const int8_t *)((char *)wf->data + w_info->offset);
+        const uint16_t *S = (const uint16_t *)((char *)wf->data + s_info->offset);
+
+        const int8_t *w_row = W + (size_t)token_id * HIDDEN_DIM;
+        const uint16_t *s_row = S + (size_t)token_id * num_blocks;
+
+        for (int b = 0; b < num_blocks; b++) {
+            float scale = f16_to_f32(s_row[b]);
+            int base = b * block_size;
+            for (int i = 0; i < block_size; i++) {
+                out[base + i] = (float)w_row[base + i] * scale;
+            }
+        }
+        return;
+    }
+
+    if (!b_info) {
+        fprintf(stderr, "ERROR: embedding bias tensor not found for 4-bit path\n");
+        memset(out, 0, HIDDEN_DIM * sizeof(float));
+        return;
+    }
+
+    int packed_cols = w_info->shape[1];
+    int num_groups = s_info->shape[1];
 
     uint32_t *W = (uint32_t *)((char *)wf->data + w_info->offset);
     uint16_t *S = (uint16_t *)((char *)wf->data + s_info->offset);
@@ -2888,8 +3416,8 @@ static void embed_lookup(WeightFile *wf, int token_id, float *out) {
     const uint16_t *s_row = S + (size_t)token_id * num_groups;
     const uint16_t *b_row = B + (size_t)token_id * num_groups;
 
-    int group_size = HIDDEN_DIM / num_groups;  // 4096/64 = 64
-    int packed_per_group = group_size / 8;     // 8
+    int group_size = HIDDEN_DIM / num_groups;
+    int packed_per_group = group_size / 8;
 
     for (int g = 0; g < num_groups; g++) {
         float scale = bf16_to_f32(s_row[g]);
@@ -2925,9 +3453,9 @@ static void lm_head_forward(WeightFile *wf, const float *hidden, float *logits) 
         return;
     }
 
-    uint32_t *W = (uint32_t *)((char *)wf->data + w_info->offset);
-    uint16_t *S = (uint16_t *)((char *)wf->data + s_info->offset);
-    uint16_t *B = (uint16_t *)((char *)wf->data + b_info->offset);
+    const void *W = (const char *)wf->data + w_info->offset;
+    const void *S = (const char *)wf->data + s_info->offset;
+    const void *B = (const char *)wf->data + b_info->offset;
 
     // Full matmul — use GPU if available (248320 output rows!)
     fast_dequant_matvec(W, S, B, hidden, logits, VOCAB_SIZE, HIDDEN_DIM, GROUP_SIZE);
@@ -3183,6 +3711,56 @@ static int parallel_pread_experts_into(
         else {
             fprintf(stderr, "WARNING: expert %d pread: %zd/%zu\n",
                     expert_indices[k], tasks[k].result, esz);
+        }
+    }
+    return loaded;
+}
+
+static int load_q8_downproj_overrides(
+    int layer_idx,
+    int *expert_indices,
+    int K,
+    const int *valid,
+    id<MTLBuffer> __strong *dst_bufs,
+    int *override_valid
+) {
+    for (int k = 0; k < K; k++) override_valid[k] = 0;
+    if (!layer_has_q8_downproj(layer_idx) || !g_q8_downproj_fds) return 0;
+
+    int q8_fd = g_q8_downproj_fds[layer_idx];
+    if (q8_fd < 0) return 0;
+
+    InferPreadTask tasks[MAX_K];
+    int task_to_slot[MAX_K];
+    int num_tasks = 0;
+
+    for (int k = 0; k < K; k++) {
+        if (!valid[k]) continue;
+        tasks[num_tasks].fd = q8_fd;
+        tasks[num_tasks].dst = [dst_bufs[k] contents];
+        tasks[num_tasks].offset = (off_t)expert_indices[k] * Q8_DOWN_EXPERT_SIZE;
+        tasks[num_tasks].size = Q8_DOWN_EXPERT_SIZE;
+        tasks[num_tasks].result = 0;
+        tasks[num_tasks].mmap_base = NULL;
+        tasks[num_tasks].lz4_comp_buf = NULL;
+        tasks[num_tasks].lz4_comp_size = 0;
+        task_to_slot[num_tasks] = k;
+        num_tasks++;
+    }
+
+    if (num_tasks == 0) return 0;
+
+    io_pool_dispatch(tasks, num_tasks);
+
+    int loaded = 0;
+    for (int t = 0; t < num_tasks; t++) {
+        int k = task_to_slot[t];
+        override_valid[k] = (tasks[t].result == (ssize_t)Q8_DOWN_EXPERT_SIZE);
+        if (override_valid[k]) {
+            loaded++;
+        } else {
+            fprintf(stderr, "WARNING: q8 down_proj override layer %d expert %d pread: %zd/%d\n",
+                    layer_idx, expert_indices[k], tasks[t].result, Q8_DOWN_EXPERT_SIZE);
         }
     }
     return loaded;
@@ -3823,6 +4401,19 @@ typedef struct {
     float shared_gate_score;            // saved shared expert gate score
     float *hidden;                      // pointer to hidden state (for writing final result)
     int layer_idx;                      // which layer produced this deferred state
+    int trace_active;                   // 1 if trace metadata is populated for this layer
+    int trace_is_full;                  // 1 for full-attn, 0 for linear-attn
+    int trace_has_ref_hidden;           // 1 if trace_ref_hidden is valid
+    int trace_has_q8_down;              // 1 if layer uses q8 down_proj override
+    float trace_hidden_in_rms;          // hidden RMS before attention
+    float trace_h_mid_rms;              // residual + attention RMS before MoE
+    float trace_h_post_rms;             // post-attention norm RMS before routing
+    float trace_conv_state_rms;         // linear attention conv state RMS before token
+    float trace_ssm_state_rms;          // linear attention recurrent state RMS before token
+    int trace_kv_len;                   // full attention cache length before appending current token
+    float trace_ref_hidden[HIDDEN_DIM]; // CPU MoE reference output for this layer
+    int trace_expert_indices[MAX_K];
+    float trace_expert_weights[MAX_K];
 } DeferredExpertState;
 
 static DeferredExpertState g_deferred = { .active = 0 };
@@ -3874,9 +4465,57 @@ static void finalize_deferred_experts(void) {
         }
     }
 
+    if (g_deferred.trace_active) {
+        trace_dump_vec("hidden_out", g_deferred.layer_idx, g_deferred.hidden, HIDDEN_DIM);
+        if (g_deferred.trace_has_ref_hidden) {
+            trace_dump_vec("hidden_ref", g_deferred.layer_idx, g_deferred.trace_ref_hidden, HIDDEN_DIM);
+        }
+        float hidden_out_rms = vec_rms(g_deferred.hidden, HIDDEN_DIM);
+        float shared_weight = cpu_sigmoid(g_deferred.shared_gate_score);
+        fprintf(stderr,
+                "[trace] token=%s%d layer=%02d type=%s q8_down=%d in_rms=%.6f h_mid_rms=%.6f h_post_rms=%.6f",
+                g_trace_token_kind ? "gen" : "prompt",
+                g_trace_token_index,
+                g_deferred.layer_idx,
+                g_deferred.trace_is_full ? "full" : "linear",
+                g_deferred.trace_has_q8_down,
+                g_deferred.trace_hidden_in_rms,
+                g_deferred.trace_h_mid_rms,
+                g_deferred.trace_h_post_rms);
+        if (g_deferred.trace_is_full) {
+            fprintf(stderr, " kv_len=%d", g_deferred.trace_kv_len);
+        } else {
+            fprintf(stderr, " conv_rms=%.6f ssm_rms=%.6f",
+                    g_deferred.trace_conv_state_rms,
+                    g_deferred.trace_ssm_state_rms);
+        }
+        fprintf(stderr, " shared=%.6f route=", shared_weight);
+        for (int k = 0; k < g_deferred.actual_K; k++) {
+            fprintf(stderr, "%s%d(%.4f)",
+                    (k == 0) ? "" : ",",
+                    g_deferred.trace_expert_indices[k],
+                    g_deferred.trace_expert_weights[k]);
+        }
+        if (g_deferred.trace_has_ref_hidden) {
+            fprintf(stderr,
+                    " out_rms=%.6f ref_rms=%.6f diff_max=%.6f diff_mae=%.6f cos=%.8f%s",
+                    hidden_out_rms,
+                    vec_rms(g_deferred.trace_ref_hidden, HIDDEN_DIM),
+                    vec_max_abs_diff(g_deferred.hidden, g_deferred.trace_ref_hidden, HIDDEN_DIM),
+                    vec_mean_abs_diff(g_deferred.hidden, g_deferred.trace_ref_hidden, HIDDEN_DIM),
+                    vec_cosine_similarity(g_deferred.hidden, g_deferred.trace_ref_hidden, HIDDEN_DIM),
+                    g_deferred.trace_has_q8_down ? " note=q8-ref-uses-4bit-down" : "");
+        } else {
+            fprintf(stderr, " out_rms=%.6f", hidden_out_rms);
+        }
+        fprintf(stderr, "\n");
+    }
+
     g_deferred.active = 0;
     g_deferred.gpu_combined = 0;
     g_deferred.cmd_experts = nil;
+    g_deferred.trace_active = 0;
+    g_deferred.trace_has_ref_hidden = 0;
 }
 
 // Complete the deferred GPU expert compute: wait for GPU, read back, accumulate, combine.
@@ -4014,6 +4653,23 @@ static void fused_layer_forward(
     if (!layer_cache_built) build_layer_cache(wf);
     LayerWeightCache *lc = &layer_cache[layer_idx];
     int is_full = (kv != NULL);
+    float trace_hidden_in_rms = g_trace_active ? vec_rms(hidden, HIDDEN_DIM) : 0.0f;
+    float trace_conv_state_rms = 0.0f;
+    float trace_ssm_state_rms = 0.0f;
+    int trace_kv_len = -1;
+    if (g_trace_active) {
+        if (is_full && kv) {
+            trace_kv_len = kv->len;
+        } else if (!is_full && la_state) {
+            trace_conv_state_rms = vec_rms(la_state->conv_state,
+                                           (CONV_KERNEL_SIZE - 1) * LINEAR_CONV_DIM);
+            trace_ssm_state_rms = vec_rms(la_state->ssm_state,
+                                          LINEAR_NUM_V_HEADS * LINEAR_VALUE_DIM * LINEAR_KEY_DIM);
+        }
+    }
+    if (g_trace_active) {
+        trace_dump_vec("hidden_in", layer_idx, hidden, HIDDEN_DIM);
+    }
 
     // =====================================================================
     // PHASE 1: Deferred completion + CMD1 (attention projections)
@@ -4072,6 +4728,7 @@ static void fused_layer_forward(
     }
     // Can we run the full linear attention pipeline on GPU in CMD1?
     int can_gpu_linear = (gpu_linear_attn_enabled &&
+                          gpu_dense_matvec_enabled &&
                           !is_full && g_metal && g_metal->delta_net_step &&
                           g_metal->conv1d_step && g_metal->rms_norm_qk &&
                           g_metal->compute_decay_beta && g_metal->gated_rms_norm &&
@@ -4085,7 +4742,7 @@ static void fused_layer_forward(
     // We can submit CMD1 immediately — the GPU queue serializes CMD3(N-1) then CMD1(N).
     int prev_gpu_combined = (g_deferred.active && g_deferred.gpu_combined);
 
-    if (prev_gpu_combined && g_metal && g_metal->wf_buf && num_attn_specs > 0) {
+    if (prev_gpu_combined && gpu_dense_matvec_enabled && g_metal && g_metal->wf_buf && num_attn_specs > 0) {
         // ---- FAST PATH: GPU-combined previous CMD3 ----
         // buf_input already has the normalized hidden state from CMD3(N-1).
         // Submit CMD1 immediately — GPU runs CMD3(N-1) then CMD1(N) back-to-back.
@@ -4239,7 +4896,7 @@ static void fused_layer_forward(
 
         // Submit CMD1: attention projections
         if (g_timing_enabled) { t0 = now_ms(); }
-        if (g_metal && g_metal->wf_buf && num_attn_specs > 0) {
+        if (gpu_dense_matvec_enabled && g_metal && g_metal->wf_buf && num_attn_specs > 0) {
             memcpy([g_metal->buf_input contents], normed, HIDDEN_DIM * sizeof(float));
             cmd1 = [g_metal->queue commandBuffer];
             gpu_encode_batch_matvec(g_metal, cmd1, attn_specs, num_attn_specs);
@@ -4649,7 +5306,8 @@ static void fused_layer_forward(
             int linear_layer_idx = layer_idx - (layer_idx + 1) / FULL_ATTN_INTERVAL;
 
             // GPU delta-net path (falls back to CPU if pipeline unavailable)
-            if (g_metal && g_metal->delta_net_step &&
+            if (gpu_linear_attn_enabled &&
+                g_metal && g_metal->delta_net_step &&
                 linear_layer_idx >= 0 && linear_layer_idx < NUM_LINEAR_LAYERS) {
                 // Upload CPU-computed data to GPU scratch buffers
                 memcpy([g_metal->buf_delta_q contents], lin_q, LINEAR_TOTAL_KEY * sizeof(float));
@@ -4783,7 +5441,7 @@ static void fused_layer_forward(
                          && kv && kv->len >= 32 && kv->len < GPU_KV_SEQ);
 
     if ((attn_out_for_oproj || gpu_attn_fuse) && oproj_w && oproj_s && oproj_b &&
-        g_metal && g_metal->wf_buf && have_moe_weights &&
+        gpu_dense_matvec_enabled && g_metal && g_metal->wf_buf && have_moe_weights &&
         g_metal->residual_add && g_metal->rms_norm_sum &&
         g_metal->rms_norm_apply_bf16 && lc->post_attn_norm_w) {
         // ---- FULLY FUSED CMD2 ----
@@ -4892,6 +5550,9 @@ static void fused_layer_forward(
 
         // ---- o_proj matvec ----
         {
+            TensorInfo *oproj_w_info = get_tensor_info_from_ptr(oproj_w);
+            TensorInfo *oproj_s_info = get_tensor_info_from_ptr(oproj_s);
+            MatrixFormat oproj_fmt = matrix_format_for_tensors(oproj_w_info, oproj_s_info);
             NSUInteger w_off = (NSUInteger)((const char *)oproj_w - (const char *)[g_metal->wf_buf contents]);
             NSUInteger s_off = (NSUInteger)((const char *)oproj_s - (const char *)[g_metal->wf_buf contents]);
             NSUInteger b_off = (NSUInteger)((const char *)oproj_b - (const char *)[g_metal->wf_buf contents]);
@@ -4904,17 +5565,49 @@ static void fused_layer_forward(
             uint32_t o_out_dim = HIDDEN_DIM;
             uint32_t o_in_dim = (uint32_t)oproj_in_dim;
             uint32_t o_gs = GROUP_SIZE;
-            [enc setComputePipelineState:g_metal->matvec_fast];
-            [enc setBuffer:g_metal->wf_buf  offset:w_off atIndex:0];
-            [enc setBuffer:g_metal->wf_buf  offset:s_off atIndex:1];
-            [enc setBuffer:g_metal->wf_buf  offset:b_off atIndex:2];
-            [enc setBuffer:oproj_input      offset:0    atIndex:3];
-            [enc setBuffer:g_metal->buf_output offset:0 atIndex:4];
-            [enc setBytes:&o_out_dim  length:4 atIndex:5];
-            [enc setBytes:&o_in_dim   length:4 atIndex:6];
-            [enc setBytes:&o_gs       length:4 atIndex:7];
-            [enc dispatchThreadgroups:MTLSizeMake(o_out_dim, 1, 1)
-                threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+            if (oproj_fmt == MATRIX_FMT_F32) {
+                [enc setComputePipelineState:g_metal->matvec_f32];
+                [enc setBuffer:g_metal->wf_buf      offset:w_off atIndex:0];
+                [enc setBuffer:oproj_input          offset:0     atIndex:1];
+                [enc setBuffer:g_metal->buf_output  offset:0     atIndex:2];
+                [enc setBytes:&o_out_dim  length:4 atIndex:3];
+                [enc setBytes:&o_in_dim   length:4 atIndex:4];
+                uint32_t tgs = (o_out_dim + 63) / 64;
+                [enc dispatchThreadgroups:MTLSizeMake(tgs, 1, 1)
+                    threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+            } else if (oproj_fmt == MATRIX_FMT_Q8_0) {
+                uint32_t block_size = (uint32_t)q8_0_block_size_from_scales(oproj_s_info, oproj_in_dim);
+                [enc setComputePipelineState:g_metal->matvec_q8_0];
+                [enc setBuffer:g_metal->wf_buf      offset:w_off atIndex:0];
+                [enc setBuffer:g_metal->wf_buf      offset:s_off atIndex:1];
+                [enc setBuffer:oproj_input          offset:0     atIndex:2];
+                [enc setBuffer:g_metal->buf_output  offset:0     atIndex:3];
+                [enc setBytes:&o_out_dim    length:4 atIndex:4];
+                [enc setBytes:&o_in_dim     length:4 atIndex:5];
+                [enc setBytes:&block_size   length:4 atIndex:6];
+                uint32_t tgs = (o_out_dim + 63) / 64;
+                [enc dispatchThreadgroups:MTLSizeMake(tgs, 1, 1)
+                    threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+            } else {
+                int use_v3 = (oproj_in_dim <= 4096);
+                [enc setComputePipelineState:use_v3 ? g_metal->matvec_v3 : g_metal->matvec_fast];
+                [enc setBuffer:g_metal->wf_buf      offset:w_off atIndex:0];
+                [enc setBuffer:g_metal->wf_buf      offset:s_off atIndex:1];
+                [enc setBuffer:g_metal->wf_buf      offset:b_off atIndex:2];
+                [enc setBuffer:oproj_input          offset:0     atIndex:3];
+                [enc setBuffer:g_metal->buf_output  offset:0     atIndex:4];
+                [enc setBytes:&o_out_dim  length:4 atIndex:5];
+                [enc setBytes:&o_in_dim   length:4 atIndex:6];
+                [enc setBytes:&o_gs       length:4 atIndex:7];
+                if (use_v3) {
+                    uint32_t num_tgs = (o_out_dim + 7) / 8;
+                    [enc dispatchThreadgroups:MTLSizeMake(num_tgs, 1, 1)
+                        threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+                } else {
+                    [enc dispatchThreadgroups:MTLSizeMake(o_out_dim, 1, 1)
+                        threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+                }
+            }
             [enc endEncoding];
         }
 
@@ -5030,6 +5723,7 @@ static void fused_layer_forward(
     // ---- Softmax + top-K (CPU) ----
     if (g_timing_enabled) { t0 = now_ms(); }
     cpu_softmax(gate_scores, NUM_EXPERTS);
+    apply_expert_limit(gate_scores, NUM_EXPERTS);
     int expert_indices[64];
     float expert_weights[64];
     cpu_topk(gate_scores, NUM_EXPERTS, K, expert_indices, expert_weights);
@@ -5075,6 +5769,14 @@ static void fused_layer_forward(
     memset(shared_out, 0, HIDDEN_DIM * sizeof(float));
 
     int actual_K = (K > MAX_K) ? MAX_K : K;
+    float trace_ref_hidden[HIDDEN_DIM];
+    int trace_has_ref_hidden = 0;
+
+    if (g_trace_active && packed_fd >= 0) {
+        memcpy(trace_ref_hidden, h_mid, HIDDEN_DIM * sizeof(float));
+        moe_forward(wf, layer_idx, trace_ref_hidden, NULL, K, packed_fd);
+        trace_has_ref_hidden = 1;
+    }
 
     if (packed_fd >= 0 && g_metal && g_metal->buf_multi_expert_data[0]) {
         // GPU multi-expert path with LRU cache + parallel I/O:
@@ -5085,6 +5787,8 @@ static void fused_layer_forward(
 
         int valid[MAX_K];
         id<MTLBuffer> expert_bufs[MAX_K];  // buffer to dispatch from per expert
+        int down_q8_valid[MAX_K] = {0};
+        id<MTLBuffer> down_q8_bufs[MAX_K] = {nil};
 
         if (g_malloc_cache) {
             // ---- Malloc cache path (zero-copy Metal buffer wrappers) ----
@@ -5290,6 +5994,13 @@ static void fused_layer_forward(
             }
         }
 
+        if (!g_use_2bit && layer_has_q8_downproj(layer_idx) && g_metal->buf_multi_expert_down_q8[0]) {
+            for (int k = 0; k < actual_K; k++) down_q8_bufs[k] = g_metal->buf_multi_expert_down_q8[k];
+            load_q8_downproj_overrides(
+                layer_idx, expert_indices, actual_K, valid, down_q8_bufs, down_q8_valid
+            );
+        }
+
         if (g_timing_enabled) { t1 = now_ms(); g_timing.expert_io += t1 - t0; }
 
         // Store this layer's routing for next token's temporal prediction.
@@ -5311,7 +6022,9 @@ static void fused_layer_forward(
         // (vs. 4*K + 2 = 18 with old per-expert encoding).
         id<MTLCommandBuffer> cmd_experts = [g_metal->queue commandBuffer];
 
-        gpu_encode_experts_batched(g_metal, cmd_experts, actual_K, valid, expert_bufs);
+        gpu_encode_experts_batched(
+            g_metal, cmd_experts, layer_idx, actual_K, valid, expert_bufs, down_q8_valid, down_q8_bufs
+        );
 
         // Shared expert SwiGLU + down_proj (2 more encoders)
         // Note: shared_gate/up already copied to GPU buffers above (before async pread wait)
@@ -5447,13 +6160,32 @@ static void fused_layer_forward(
         g_deferred.shared_gate_score = shared_gate_score;
         g_deferred.hidden = hidden;
         g_deferred.layer_idx = layer_idx;
+        g_deferred.trace_active = g_trace_active;
+        g_deferred.trace_is_full = is_full;
+        g_deferred.trace_has_ref_hidden = trace_has_ref_hidden;
+        g_deferred.trace_has_q8_down = (!g_use_2bit && layer_has_q8_downproj(layer_idx)) ? 1 : 0;
+        g_deferred.trace_hidden_in_rms = trace_hidden_in_rms;
+        g_deferred.trace_h_mid_rms = g_trace_active ? vec_rms(h_mid, HIDDEN_DIM) : 0.0f;
+        g_deferred.trace_h_post_rms = g_trace_active ? vec_rms(h_post, HIDDEN_DIM) : 0.0f;
+        g_deferred.trace_conv_state_rms = trace_conv_state_rms;
+        g_deferred.trace_ssm_state_rms = trace_ssm_state_rms;
+        g_deferred.trace_kv_len = trace_kv_len;
+        if (g_trace_active) {
+            trace_dump_vec("h_mid", layer_idx, h_mid, HIDDEN_DIM);
+            trace_dump_vec("h_post", layer_idx, h_post, HIDDEN_DIM);
+        }
         if (!gpu_combine) {
             // Only need to save h_mid for CPU-side combine path
             memcpy(g_deferred.h_mid, h_mid, HIDDEN_DIM * sizeof(float));
         }
+        if (trace_has_ref_hidden) {
+            memcpy(g_deferred.trace_ref_hidden, trace_ref_hidden, HIDDEN_DIM * sizeof(float));
+        }
         for (int k = 0; k < actual_K; k++) {
             g_deferred.expert_weights[k] = expert_weights[k];
             g_deferred.valid[k] = valid[k];
+            g_deferred.trace_expert_indices[k] = expert_indices[k];
+            g_deferred.trace_expert_weights[k] = expert_weights[k];
         }
 
         // Return immediately — GPU experts are running async.
@@ -6506,9 +7238,13 @@ static void print_usage(const char *prog) {
     printf("  --prompt TEXT         Prompt text (requires encode_prompt.py)\n");
     printf("  --tokens N           Max tokens to generate (default: 20)\n");
     printf("  --k N                Active experts per layer (default: 4)\n");
+    printf("  --expert-limit N     Debug: restrict routing to experts [0, N)\n");
     printf("  --cache-entries N    Expert LRU cache size (default: 2500, 0 = disabled)\n");
     printf("  --malloc-cache N     Malloc expert cache entries (e.g., 2581 = 17GB for 80%% hit)\n");
     printf("  --cpu-linear         Disable fused GPU delta-net and use the older CPU/hybrid linear path\n");
+    printf("  --cpu-matvec         Disable shared dense GPU matvecs and use CPU matvec fallback\n");
+    printf("  --trace-last-prompt  Trace the last prompt token layer-by-layer against CPU MoE reference\n");
+    printf("  --trace-generated N  Trace the first N generated-token steps layer-by-layer\n");
     printf("  --timing             Enable per-layer timing breakdown\n");
     printf("  --freq               Enable expert frequency tracking + analysis\n");
     printf("  --cache-telemetry    Report cold vs eviction misses and reuse distance\n");
@@ -6529,6 +7265,7 @@ int main(int argc, char **argv) {
         const char *vocab_path = NULL;
         const char *prompt_tokens_path = NULL;
         const char *prompt_text = NULL;
+        const char *routing_log_path = NULL;
         int max_tokens = 20;
         int K = 4;
         int cache_entries = 0;  // default 0: trust OS page cache (38% faster than Metal LRU)
@@ -6544,9 +7281,13 @@ int main(int argc, char **argv) {
             {"prompt",        required_argument, 0, 'P'},
             {"tokens",        required_argument, 0, 't'},
             {"k",             required_argument, 0, 'k'},
+            {"expert-limit",  required_argument, 0, 'x'},
             {"cache-entries",  required_argument, 0, 'C'},
             {"malloc-cache",   required_argument, 0, 'M'},
             {"cpu-linear",    no_argument,       0, 'L'},
+            {"cpu-matvec",    no_argument,       0, 'U'},
+            {"trace-last-prompt", no_argument,   0, 'Q'},
+            {"trace-generated", required_argument, 0, 'J'},
             {"skip-linear",   no_argument,       0, 'S'},
             {"timing",        no_argument,       0, 'T'},
             {"freq",          no_argument,       0, 'F'},
@@ -6562,7 +7303,7 @@ int main(int argc, char **argv) {
         };
 
         int c;
-        while ((c = getopt_long(argc, argv, "m:w:j:v:p:P:t:k:C:M:R:B:LSTFE2Gh", long_options, NULL)) != -1) {
+        while ((c = getopt_long(argc, argv, "m:w:j:v:p:P:t:k:x:C:M:R:B:LUQJ:STFE2Gh", long_options, NULL)) != -1) {
             switch (c) {
                 case 'm': model_path = optarg; break;
                 case 'w': weights_path = optarg; break;
@@ -6572,9 +7313,13 @@ int main(int argc, char **argv) {
                 case 'P': prompt_text = optarg; break;
                 case 't': max_tokens = atoi(optarg); break;
                 case 'k': K = atoi(optarg); break;
+                case 'x': g_expert_limit = atoi(optarg); break;
                 case 'C': cache_entries = atoi(optarg); break;
                 case 'M': malloc_cache_entries = atoi(optarg); break;
                 case 'L': gpu_linear_attn_enabled = 0; break;
+                case 'U': gpu_dense_matvec_enabled = 0; break;
+                case 'Q': g_trace_last_prompt_token = 1; break;
+                case 'J': g_trace_generated_tokens = atoi(optarg); break;
                 case 'S': linear_attn_bypass = 1; break;
                 case 'T': g_timing_enabled = 1; break;
                 case 'F': g_freq_tracking = 1; break;
@@ -6582,18 +7327,17 @@ int main(int argc, char **argv) {
                 case '2': g_use_2bit = 1; break;
                 case 'G': gpu_linear_attn_enabled = 1; break;
                 case 'D': g_pred_enabled = 1; break;
-                case 'Z':
-                    g_routing_log = fopen(optarg, "wb");
-                    if (!g_routing_log) {
-                        fprintf(stderr, "ERROR: cannot open routing log: %s\n", optarg);
-                        return 1;
-                    }
-                    break;
+                case 'Z': routing_log_path = optarg; break;
                 case 'B': g_think_budget = atoi(optarg); break;
                 case 'R': serve_port = atoi(optarg); break;
                 case 'h': print_usage(argv[0]); return 0;
                 default:  print_usage(argv[0]); return 1;
             }
+        }
+
+        if (g_expert_limit > 0 && K > g_expert_limit) {
+            fprintf(stderr, "ERROR: --k (%d) cannot exceed --expert-limit (%d)\n", K, g_expert_limit);
+            return 1;
         }
 
         // Build default paths
@@ -6628,6 +7372,30 @@ int main(int argc, char **argv) {
             vocab_path = default_vocab;
         }
 
+        NSString *model_path_string = expand_user_path(model_path);
+        NSString *weights_path_string = expand_user_path(weights_path);
+        NSString *manifest_path_string = expand_user_path(manifest_path);
+        NSString *vocab_path_string = expand_user_path(vocab_path);
+        NSString *prompt_tokens_path_string = expand_user_path(prompt_tokens_path);
+        NSString *routing_log_path_string = expand_user_path(routing_log_path);
+
+        if (model_path_string) model_path = [model_path_string fileSystemRepresentation];
+        if (weights_path_string) weights_path = [weights_path_string fileSystemRepresentation];
+        if (manifest_path_string) manifest_path = [manifest_path_string fileSystemRepresentation];
+        if (vocab_path_string) vocab_path = [vocab_path_string fileSystemRepresentation];
+        if (prompt_tokens_path_string) prompt_tokens_path = [prompt_tokens_path_string fileSystemRepresentation];
+        if (routing_log_path_string) routing_log_path = [routing_log_path_string fileSystemRepresentation];
+
+        set_tokenizer_model_path(model_path);
+
+        if (routing_log_path) {
+            g_routing_log = fopen(routing_log_path, "wb");
+            if (!g_routing_log) {
+                fprintf(stderr, "ERROR: cannot open routing log: %s\n", routing_log_path);
+                return 1;
+            }
+        }
+
         // ---- Initialize Metal ----
         g_metal = metal_setup();
         if (!g_metal) {
@@ -6654,8 +7422,10 @@ int main(int argc, char **argv) {
         printf("Manifest: %s\n", manifest_path);
         printf("Vocab:    %s\n", vocab_path);
         printf("K:        %d experts/layer\n", K);
+        if (g_expert_limit > 0) printf("Limit:    first %d experts only (debug)\n", g_expert_limit);
         printf("Quant:    %s experts (%zu bytes each)\n", g_use_2bit ? "2-bit" : "4-bit", active_expert_size());
         printf("Linear:   %s\n", gpu_linear_attn_enabled ? "fused GPU delta-net" : "CPU/hybrid fallback");
+        if (g_trace_last_prompt_token) printf("Trace:    last prompt token (fused MoE vs CPU MoE)\n");
         printf("Tokens:   %d\n", max_tokens);
         if (g_malloc_cache) {
             printf("Cache:    malloc %d entries (%.1f GB)\n",
@@ -6745,6 +7515,9 @@ int main(int argc, char **argv) {
         int layer_fds_cold[NUM_LAYERS];
         void *layer_mmaps[NUM_LAYERS];
         size_t layer_mmap_sizes[NUM_LAYERS];
+        int layer_q8_down_fds[NUM_LAYERS];
+        void *layer_q8_down_mmaps[NUM_LAYERS];
+        size_t layer_q8_down_mmap_sizes[NUM_LAYERS];
         int expert_layers_available = 0;
 
         // Reset the global seen-expert bitset
@@ -6778,6 +7551,17 @@ int main(int argc, char **argv) {
             }
         }
         printf("[experts] %d/%d packed layer files available (mmap'd)\n", expert_layers_available, NUM_LAYERS);
+
+        int q8_down_layers_available = load_q8_downproj_override_config(
+            model_path, layer_q8_down_fds, layer_q8_down_mmaps, layer_q8_down_mmap_sizes
+        );
+        g_q8_downproj_fds = layer_q8_down_fds;
+        g_q8_downproj_mmaps = layer_q8_down_mmaps;
+        g_q8_downproj_mmap_sizes = layer_q8_down_mmap_sizes;
+        if (q8_down_layers_available > 0) {
+            printf("[q8-down] %d/%d layers using 8-bit down_proj overrides\n",
+                   q8_down_layers_available, NUM_LAYERS);
+        }
 
         // ---- LZ4 compressed experts: auto-detect and load ----
         {
@@ -6831,6 +7615,10 @@ int main(int argc, char **argv) {
                 if (layer_fds[i] >= 0) {
                     char dummy[4096];
                     pread(layer_fds[i], dummy, sizeof(dummy), 0);
+                }
+                if (layer_q8_down_fds[i] >= 0) {
+                    char dummy[4096];
+                    pread(layer_q8_down_fds[i], dummy, sizeof(dummy), 0);
                 }
             }
             printf("[warmup] Page cache hint: %.1f ms\n", now_ms() - t_warm);
@@ -6947,6 +7735,14 @@ int main(int argc, char **argv) {
                 embed_lookup(wf, pt->ids[0], hidden);
             }
 
+            if (g_trace_last_prompt_token) {
+                fprintf(stderr, "[trace] comparing fused MoE vs CPU MoE on last prompt token (all %d layers)\n",
+                        NUM_LAYERS);
+                g_trace_active = 1;
+                g_trace_token_kind = 0;
+                g_trace_token_index = pt->count - 1;
+            }
+
             for (int layer = 0; layer < NUM_LAYERS; layer++) {
                 int is_full = ((layer + 1) % FULL_ATTN_INTERVAL == 0);
                 fused_layer_forward(wf, layer, hidden,
@@ -6958,6 +7754,9 @@ int main(int argc, char **argv) {
             }
             // Full completion — need hidden state for final norm + lm_head
             complete_deferred_experts();
+            g_trace_active = 0;
+            g_trace_token_kind = 0;
+            g_trace_token_index = -1;
             pos++;
         }
 
@@ -7030,6 +7829,13 @@ int main(int argc, char **argv) {
             if (in_think) think_tokens++;
 
             // Embed the just-generated token (next iteration)
+            if (g_trace_generated_tokens > 0 && gen <= g_trace_generated_tokens) {
+                fprintf(stderr, "[trace] tracing generated token step %d (embedding token_id=%d)\n",
+                        gen, next_token);
+                g_trace_active = 1;
+                g_trace_token_kind = 1;
+                g_trace_token_index = gen;
+            }
             cache_telemetry_note_token();
             embed_lookup(wf, next_token, hidden);
 
@@ -7045,6 +7851,11 @@ int main(int argc, char **argv) {
             }
             // Complete last layer's deferred GPU experts before final norm
             complete_deferred_experts();
+            if (g_trace_active) {
+                g_trace_active = 0;
+                g_trace_token_kind = 0;
+                g_trace_token_index = -1;
+            }
             pos++;
 
             // Final norm
@@ -7137,8 +7948,10 @@ int main(int argc, char **argv) {
             if (kv_caches[i]) kv_cache_free(kv_caches[i]);
             if (layer_states[i]) linear_attn_state_free(layer_states[i]);
             if (layer_mmaps[i] != MAP_FAILED) munmap(layer_mmaps[i], layer_mmap_sizes[i]);
+            if (layer_q8_down_mmaps[i] != MAP_FAILED) munmap(layer_q8_down_mmaps[i], layer_q8_down_mmap_sizes[i]);
             if (layer_fds[i] >= 0) close(layer_fds[i]);
             if (layer_fds_cold[i] >= 0) close(layer_fds_cold[i]);
+            if (layer_q8_down_fds[i] >= 0) close(layer_q8_down_fds[i]);
         }
         free(layer_states);
         free(kv_caches);

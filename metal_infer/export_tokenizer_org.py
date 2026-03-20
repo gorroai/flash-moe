@@ -18,28 +18,16 @@ Binary format:
     For each entry: uint32 token_id, uint16 str_len, char[str_len]
 """
 import json
-import os
 import struct
 import sys
 
-def parse_merge_pair(pair):
-    if isinstance(pair, str):
-        parts = pair.split(' ', 1)
-        if len(parts) != 2:
-            raise ValueError(f"Unexpected merge rule format: {pair!r}")
-        return parts[0], parts[1]
-    if isinstance(pair, (list, tuple)) and len(pair) == 2:
-        return pair[0], pair[1]
-    raise ValueError(f"Unsupported merge rule type: {type(pair).__name__}")
-
 def main():
     tok_path = sys.argv[1] if len(sys.argv) > 1 else (
-        '~/.cache/huggingface/hub/'
+        '/Users/danielwoods/.cache/huggingface/hub/'
         'models--mlx-community--Qwen3.5-397B-A17B-4bit/'
         'snapshots/39159bd8aa74f5c8446d2b2dc584f62bb51cb0d3/tokenizer.json'
     )
     out_path = sys.argv[2] if len(sys.argv) > 2 else 'tokenizer.bin'
-    tok_path = os.path.expanduser(tok_path)
 
     with open(tok_path, 'r', encoding='utf-8') as f:
         t = json.load(f)
@@ -69,7 +57,7 @@ def main():
 
         # Merges
         for pair in merges:
-            a, b = parse_merge_pair(pair)
+            a, b = pair[0], pair[1]
             ab = a.encode('utf-8')
             bb = b.encode('utf-8')
             f.write(struct.pack('<H', len(ab)))
@@ -89,6 +77,7 @@ def main():
     print(f"  Merges: {len(merges)} rules")
     print(f"  Added tokens: {len(added)} entries")
 
+    import os
     sz = os.path.getsize(out_path)
     print(f"  File size: {sz / 1024 / 1024:.1f} MB")
 

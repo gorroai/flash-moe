@@ -6,6 +6,9 @@
  *   2. dequant_matvec_4bit_fast: SIMD-optimized with simd_sum reduction
  *   3. dequant_matvec_4bit_v3: Fully optimized — tiled threadgroup, vector loads,
  *      coalesced access, shared input cache. Target: <0.1ms per matmul.
+ *   3b. dequant_matvec_8bit: Optional affine 8-bit override kernel for routed down_proj sidecars
+ *   3c. dequant_matvec_q8_0: Dense/shared int8 + fp16-scale matvec (block_size=32)
+ *   3d. matvec_f32: Dense/shared fp32 matvec for preserved gate/router weights
  *   4. swiglu_fused / swiglu_fused_vec4: SwiGLU activation
  *   5. weighted_sum: combine expert outputs with routing weights
  *   6. rms_norm: RMS normalization
@@ -160,6 +163,106 @@ kernel void dequant_matvec_4bit_fast(
             out[tgid] = val;
         }
     }
+}
+
+// ============================================================================
+// Optional affine 8-bit dequant matvec
+// Used for model-configured down_proj override sidecars.
+// Layout:
+//   weights: [out_dim, in_dim] uint8
+//   scales:  [out_dim, in_dim/group_size] bf16
+//   biases:  [out_dim, in_dim/group_size] bf16
+// ============================================================================
+
+kernel void dequant_matvec_8bit(
+    device const uchar*  W_q8       [[buffer(0)]],
+    device const uint16_t* scales   [[buffer(1)]],
+    device const uint16_t* biases   [[buffer(2)]],
+    device const float*    x        [[buffer(3)]],
+    device float*          out      [[buffer(4)]],
+    constant uint&         out_dim  [[buffer(5)]],
+    constant uint&         in_dim   [[buffer(6)]],
+    constant uint&         group_size [[buffer(7)]],
+    uint tid [[thread_position_in_grid]]
+) {
+    if (tid >= out_dim) return;
+
+    uint num_groups = in_dim / group_size;
+    device const uchar* w_row = W_q8 + tid * in_dim;
+    device const uint16_t* s_row = scales + tid * num_groups;
+    device const uint16_t* b_row = biases + tid * num_groups;
+
+    float acc = 0.0f;
+    for (uint g = 0; g < num_groups; g++) {
+        float scale = bf16_to_f32(s_row[g]);
+        float bias  = bf16_to_f32(b_row[g]);
+        uint base = g * group_size;
+        for (uint i = 0; i < group_size; i++) {
+            acc += (float(w_row[base + i]) * scale + bias) * x[base + i];
+        }
+    }
+
+    out[tid] = acc;
+}
+
+// ============================================================================
+// Dense/shared Q8_0-style dequant matvec
+// Layout:
+//   weights: [out_dim, in_dim] int8
+//   scales:  [out_dim, in_dim/block_size] fp16
+//   value = int8 * scale
+// ============================================================================
+
+kernel void dequant_matvec_q8_0(
+    device const char*     W_q8       [[buffer(0)]],
+    device const half*     scales     [[buffer(1)]],
+    device const float*    x          [[buffer(2)]],
+    device float*          out        [[buffer(3)]],
+    constant uint&         out_dim    [[buffer(4)]],
+    constant uint&         in_dim     [[buffer(5)]],
+    constant uint&         block_size [[buffer(6)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    if (gid >= out_dim) return;
+
+    uint num_blocks = in_dim / block_size;
+    device const char* w_row = W_q8 + gid * in_dim;
+    device const half* s_row = scales + gid * num_blocks;
+
+    float acc = 0.0f;
+    for (uint b = 0; b < num_blocks; b++) {
+        float scale = float(s_row[b]);
+        uint base = b * block_size;
+        for (uint i = 0; i < block_size; i++) {
+            acc += float(w_row[base + i]) * scale * x[base + i];
+        }
+    }
+
+    out[gid] = acc;
+}
+
+// ============================================================================
+// Dense/shared F32 matvec
+// Layout:
+//   weights: [out_dim, in_dim] float
+// ============================================================================
+
+kernel void matvec_f32(
+    device const float*    W          [[buffer(0)]],
+    device const float*    x          [[buffer(1)]],
+    device float*          out        [[buffer(2)]],
+    constant uint&         out_dim    [[buffer(3)]],
+    constant uint&         in_dim     [[buffer(4)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    if (gid >= out_dim) return;
+
+    device const float* w_row = W + gid * in_dim;
+    float acc = 0.0f;
+    for (uint i = 0; i < in_dim; i++) {
+        acc += w_row[i] * x[i];
+    }
+    out[gid] = acc;
 }
 
 // ============================================================================
