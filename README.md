@@ -28,10 +28,10 @@ Pure C/Metal inference engine that runs **Qwen3.5-397B-A17B** (a 397 billion par
 | **Q3 GGUF experts** (recommended) | **3.81** | — | **12.9 tok/s** | 163 GB |
 | 4-bit MLX + GGUF Q6 LM head | **3.62** | 1.286 | 9.5 tok/s | 209 GB |
 | 4-bit MLX experts | **3.64** | 1.292 | 9.5 tok/s | 209 GB |
-| Full GGUF resident stack* | 5.18 | 1.645 | slower | 209 GB |
+| Full GGUF resident stack* | **3.49** | 1.250 | 5.1 tok/s | 209 GB |
 | 2-bit MLX experts | 5.71 | 1.742 | 14.5 tok/s | 120 GB |
 
-*Full GGUF resident stack = Q8_0 embedding + Q6_K LM head + Q8_0 attention overlays (4-bit experts). The Q8_0 dense overlays improve quality on short contexts but the Q8_0 attention weights are 2x larger, adding significant decode overhead.
+*Full GGUF resident stack = Q8_0 embedding + Q6_K LM head + Q8_0 attention overlays (4-bit experts). Best PPL (3.49) but 2x slower decode — the Q8_0 attention weights are 2x larger, doubling GPU memory bandwidth for 54% of per-token time.
 
 Q3 GGUF is the best speed/quality tradeoff: near-4-bit quality (PPL 3.81 vs 3.64) at **36% faster decode** (12.9 vs 9.5 tok/s). GGUF Q6 LM head improves PPL for free (1.4ms/tok, 2% of decode time). 2-bit is fastest but PPL degrades 57%. See [Perplexity Evaluation](#perplexity-evaluation) for how to run.
 
@@ -103,11 +103,15 @@ Mixed-source quantization for **Qwen3.5-397B-A17B** combining:
 | MLX 2-bit | 3.75 MB | 0.90 GB | 14.5 tok/s |
 
 Current status:
-- GGUF metadata inspection and tensor sweep complete ([docs/gguf-q3-tensor-sweep.md](docs/gguf-q3-tensor-sweep.md))
-- IQ3_XXS/IQ4_XS/Q5_K dequant kernels adapted from llama.cpp
-- Streamed Q3 expert path working: **11.15 tok/s** avg vs 9.46 tok/s for 4-bit ([docs/q3-vs-4bit-clean-timing-report.md](docs/q3-vs-4bit-clean-timing-report.md))
-- Layer 27 outliers identified (BF16 attention, Q5_K experts) — Unsloth's selective precision
-- 3-bit shared expert conversion in progress
+- Q3 routed experts fully working: **12.9 tok/s** with `--cache-io-split 4` (36% faster than 4-bit)
+- IQ3_XXS/IQ4_XS/Q5_K GPU dequant kernels implemented (vendored from llama.cpp)
+- GGUF metadata-only tensor sweep across all 5 shards ([docs/gguf-q3-tensor-sweep.md](docs/gguf-q3-tensor-sweep.md))
+- Q6_K LM head and Q8_0 embedding integrated (quality gain, no speed impact)
+- Q8_0 full attention and linear attention overlays integrated (quality gain, ~2x decode overhead)
+- Full GGUF resident stack measured: PPL **3.49** (best quality) at 5.1 tok/s ([docs/gguf-hybrid-bringup-log.md](docs/gguf-hybrid-bringup-log.md))
+- Layer 27 outliers handled (BF16 attention, Q5_K experts) — Unsloth's selective precision
+- Per-layer mixed quantization support (`--skip-layers`)
+- Shared expert GGUF conversion not yet scripted (stays MLX 4-bit for now)
 
 **GGUF resident tensors (dense/persistent weights):**
 
@@ -119,7 +123,7 @@ The Unsloth GGUF also provides higher-quality dense tensors that can replace MLX
 | Embedding | Q8_0 | Integrated | Quality improvement |
 | Full attention Q/K/V/O | Q8_0 | Integrated | Slower (~2x dense matmul), better quality |
 | Linear attention QKV | Q8_0 | Integrated | Slower (~2x dense matmul), better quality |
-| Shared experts | Q8_0 / BF16 (L27) | WIP | Not yet scripted |
+| Shared experts | Q8_0 / BF16 (L27) | Not yet scripted | Stays MLX 4-bit for now |
 
 **Note:** The Q8_0 dense/attention overlays improve quality but slow down decode significantly — the dense matmuls (CMD1+CMD2) are 54% of per-token time, and Q8_0 tensors are 2x the size of 4-bit, doubling GPU memory bandwidth for those operations. The LM head (Q6_K) is the sweet spot: only 2% of per-token time, so the quality gain is essentially free. See [docs/q3-vs-4bit-clean-timing-report.md](docs/q3-vs-4bit-clean-timing-report.md) for detailed comparisons.
 
