@@ -42,3 +42,4 @@ metal_infer/repack_experts_lz4
 metal_infer/routing_data.bin
 metal_infer/nax_bench
 metal_infer/nax_bench.ir
+autoresearch/gguf

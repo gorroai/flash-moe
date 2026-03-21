@@ -2064,7 +2064,7 @@ static MetalCtx *metal_setup(void) {
         fprintf(stderr, "ERROR: No Metal device\n");
         free(ctx); return NULL;
     }
-    printf("[metal] Device: %s\n", [[ctx->device name] UTF8String]);
+    if (!g_stream_mode) printf("[metal] Device: %s\n", [[ctx->device name] UTF8String]);
 
     ctx->queue = [ctx->device newCommandQueue];
     if (!ctx->queue) {
@@ -2095,7 +2095,7 @@ static MetalCtx *metal_setup(void) {
                 [[error localizedDescription] UTF8String]);
         free(ctx); return NULL;
     }
-    printf("[metal] Shader compile: %.0f ms\n", now_ms() - t0);
+    if (!g_stream_mode) printf("[metal] Shader compile: %.0f ms\n", now_ms() - t0);
 
     // Create pipelines
     id<MTLComputePipelineState> (^makePipe)(NSString *) = ^(NSString *name) {
@@ -9053,8 +9053,8 @@ int main(int argc, char **argv) {
         int next_token = cpu_argmax(logits, VOCAB_SIZE);
         double ttft_ms = now_ms() - t0;
 
-        // Debug: show top-5 logits for first token
-        {
+        // Debug: show top-5 logits for first token (skip in stream mode)
+        if (!g_stream_mode) {
             // Find top 5 manually
             int top5[5] = {0,0,0,0,0};
             float topv[5] = {-1e30f,-1e30f,-1e30f,-1e30f,-1e30f};
