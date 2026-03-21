@@ -10,6 +10,7 @@
 #   make full     — full 60-layer MoE forward pass (K=4)
 #   make fullbench — benchmark full 60-layer forward (3 iterations)
 #   make chat     — build interactive chat TUI
+#   make cachebench — warm page-cache pread microbenchmark for packed experts
 #   make clean    — remove build artifacts
 #
 # Note: Metal shaders are compiled from source at runtime via
@@ -38,7 +39,11 @@ INFER_SRC = infer.m
 CHAT_TARGET = chat
 CHAT_SRC = chat.m
 
-.PHONY: all clean run verify bench moe moebench full fullbench fast metallib infer infer-run chat-run build-chat
+# Warm page-cache pread microbenchmark
+CACHE_BENCH_TARGET = cachebench
+CACHE_BENCH_SRC = cache_pread_bench.c
+
+.PHONY: all clean run verify bench moe moebench full fullbench fast metallib infer infer-run chat-run build-chat cachebench cachebench-run
 
 all: $(TARGET) $(INFER_TARGET)
 
@@ -63,8 +68,12 @@ $(INFER_TARGET): $(INFER_SRC)
 $(CHAT_TARGET): $(CHAT_SRC) linenoise.c linenoise.h
 	$(CC) -O2 -Wall -fobjc-arc -framework Foundation $(CHAT_SRC) linenoise.c -o $(CHAT_TARGET)
 
+# Build the cache pread microbenchmark
+$(CACHE_BENCH_TARGET): $(CACHE_BENCH_SRC)
+	$(CC) -O3 -Wall -Wextra -std=c11 $(CACHE_BENCH_SRC) -lpthread -o $(CACHE_BENCH_TARGET)
+
 clean:
-	rm -f $(TARGET) $(INFER_TARGET) $(CHAT_TARGET) $(SHADER_AIR) $(SHADER_LIB)
+	rm -f $(TARGET) $(INFER_TARGET) $(CHAT_TARGET) $(CACHE_BENCH_TARGET) $(SHADER_AIR) $(SHADER_LIB)
 
 # Run targets
 run: $(TARGET)
@@ -101,3 +110,6 @@ infer-run: $(INFER_TARGET)
 
 chat-run: $(CHAT_TARGET)
 	./$(CHAT_TARGET) --k 4
+
+cachebench-run: $(CACHE_BENCH_TARGET)
+	./$(CACHE_BENCH_TARGET) --q3-experts --experts 128 --threads 8 --split 4 --passes 5

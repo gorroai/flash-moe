@@ -4571,7 +4571,7 @@ static void lm_head_forward(WeightFile *wf, const float *hidden, float *logits) 
 // Parallel I/O infrastructure for expert pread (from proven main.m pattern)
 // ============================================================================
 
-#define NUM_IO_THREADS 4  // 4 threads for K=4 experts (one per expert)
+#define NUM_IO_THREADS 8  // 8 threads helps cached split-fanout reads; K=4 paths still only issue up to 4 expert blobs
 
 typedef struct {
     int fd;
@@ -4613,6 +4613,7 @@ typedef struct {
     int num_tasks;
     int tasks_completed;
     int generation;          // incremented each dispatch — workers wait for new gen
+    int completed_generation;
     volatile int shutdown;
 } IOThreadPool;
 
@@ -4655,8 +4656,10 @@ static void *io_pool_worker(void *arg) {
 
         pthread_mutex_lock(&g_io_pool.mutex);
         g_io_pool.tasks_completed++;
-        if (g_io_pool.tasks_completed == NUM_IO_THREADS)
+        if (g_io_pool.tasks_completed == NUM_IO_THREADS) {
+            g_io_pool.completed_generation = my_gen;
             pthread_cond_signal(&g_io_pool.work_done);
+        }
     }
     pthread_mutex_unlock(&g_io_pool.mutex);
     return NULL;
@@ -4669,6 +4672,7 @@ static void io_pool_init(void) {
     pthread_cond_init(&g_io_pool.work_done, NULL);
     g_io_pool.shutdown = 0;
     g_io_pool.generation = 0;
+    g_io_pool.completed_generation = 0;
     g_io_pool.tasks = NULL;
     for (int i = 0; i < NUM_IO_THREADS; i++)
         pthread_create(&g_io_pool.threads[i], NULL, io_pool_worker, (void*)(intptr_t)i);
@@ -4677,22 +4681,36 @@ static void io_pool_init(void) {
 
 static dispatch_queue_t g_io_gcd_queue = NULL;
 
-static void io_pool_dispatch(InferPreadTask *tasks, int num_tasks) {
-    if (num_tasks == 0) return;
+static int io_pool_start(InferPreadTask *tasks, int num_tasks) {
+    if (num_tasks == 0) return 0;
     pthread_mutex_lock(&g_io_pool.mutex);
     g_io_pool.tasks = tasks;
     g_io_pool.num_tasks = num_tasks;
     g_io_pool.tasks_completed = 0;
     g_io_pool.generation++;
+    int my_gen = g_io_pool.generation;
     pthread_cond_broadcast(&g_io_pool.work_ready);
-    while (g_io_pool.tasks_completed < NUM_IO_THREADS) {
+    pthread_mutex_unlock(&g_io_pool.mutex);
+    return my_gen;
+}
+
+static void io_pool_wait_generation(int target_gen) {
+    if (target_gen <= 0) return;
+    pthread_mutex_lock(&g_io_pool.mutex);
+    while (g_io_pool.completed_generation < target_gen) {
         pthread_cond_wait(&g_io_pool.work_done, &g_io_pool.mutex);
     }
     pthread_mutex_unlock(&g_io_pool.mutex);
 }
 
+static void io_pool_dispatch(InferPreadTask *tasks, int num_tasks) {
+    if (num_tasks == 0) return;
+    int my_gen = io_pool_start(tasks, num_tasks);
+    io_pool_wait_generation(my_gen);
+}
+
 // ---- Async expert pread pipeline ----
-// Starts pread on background GCD threads immediately after routing.
+// Starts pread on background pool threads immediately after routing.
 // The pread overlaps with shared expert prep + next layer's CMD1+attn+CMD2.
 // Wait for completion right before CMD3 needs the expert data.
 #define MAX_CACHE_IO_SPLIT 8
@@ -4718,8 +4736,8 @@ typedef struct {
     int num_tasks;
     int num_experts;
     int chunks_per_expert;
+    int generation;
     int valid[MAX_K];
-    dispatch_group_t group;
     int active;
 } AsyncPreadState;
 static AsyncPreadState g_async_pread = {0};
@@ -4736,7 +4754,6 @@ static void async_pread_start(int packed_fd, int *expert_indices, int K,
     g_async_pread.chunks_per_expert = chunks;
     g_async_pread.num_tasks = K * chunks;
     g_async_pread.active = 1;
-    if (!g_async_pread.group) g_async_pread.group = dispatch_group_create();
 
     for (int k = 0; k < K; k++) {
         char *dst_base = (char *)[dst_bufs[k] contents];
@@ -4764,20 +4781,13 @@ static void async_pread_start(int packed_fd, int *expert_indices, int K,
         }
     }
 
-    // Fire off parallel preads on GCD — returns immediately
-    static dispatch_queue_t io_q = NULL;
-    if (!io_q) io_q = dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0);
-    for (int i = 0; i < g_async_pread.num_tasks; i++) {
-        InferPreadTask *t = &g_async_pread.tasks[i];
-        dispatch_group_async(g_async_pread.group, io_q, ^{
-            t->result = pread(t->fd, t->dst, t->size, t->offset);
-        });
-    }
+    // Fire off async preads on the persistent pool — returns immediately.
+    g_async_pread.generation = io_pool_start(g_async_pread.tasks, g_async_pread.num_tasks);
 }
 
 static void async_pread_wait(void) {
     if (!g_async_pread.active) return;
-    dispatch_group_wait(g_async_pread.group, DISPATCH_TIME_FOREVER);
+    io_pool_wait_generation(g_async_pread.generation);
     size_t esz = active_expert_size();
     for (int k = 0; k < g_async_pread.num_experts; k++) {
         ssize_t total = 0;

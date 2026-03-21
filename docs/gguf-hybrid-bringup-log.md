@@ -1465,3 +1465,143 @@ Dedicated report:
 
 - `docs/cache-io-split-experiment.md`
 - `docs/cache-io-split-results.md`
+
+## 2026-03-20 27: Persistent pool refinement for cache fanout mode
+
+Refined the experimental routed-expert fanout implementation:
+
+- replaced per-chunk GCD async launches with the persistent I/O worker pool
+- expanded the pool to `8` workers so split fanout can actually exploit more concurrency
+
+Why this refinement was needed:
+
+- the first split prototype showed a strong win, but still paid per-chunk GCD scheduling overhead
+- switching to the persistent pool improved the `split=1` baseline too
+- after widening the pool to `8` workers, `split=4` remained the best steady-state setting
+
+Updated warm-cache sweep, `Q3-GGUF` routed experts only, `200` tokens:
+
+| Split | Decode tok/s | Expert I/O ms | Expert compute ms | Total ms/token | TTFT ms |
+|---|---:|---:|---:|---:|---:|
+| `1` | `11.71` | `32.9` | `1.5` | `84.7` | `1567` |
+| `2` | `12.46` | `27.6` | `1.5` | `79.5` | `1550` |
+| `4` | `12.52` | `27.5` | `1.5` | `79.2` | `1505` |
+| `8` | `12.02` | `27.7` | `1.6` | `82.5` | `1518` |
+
+Updated plain 4-bit comparison, `200` tokens:
+
+| Split | Decode tok/s | Expert I/O ms | Total ms/token |
+|---|---:|---:|---:|
+| `1` | `9.81` | `46.8` | `101.2` |
+| `4` | `10.95` | `34.8` | `90.6` |
+
+Updated all-current-GGUF comparison, `200` tokens:
+
+| Split | Decode tok/s | Expert I/O ms | Expert compute ms | Total ms/token | TTFT ms |
+|---|---:|---:|---:|---:|---:|
+| `1` | `8.79` | `36.6` | `18.6` | `112.8` | `2109` |
+| `4` | `9.41` | `27.5` | `19.0` | `105.3` | `2154` |
+
+Current takeaway:
+
+- the improved implementation still supports `--cache-io-split 4` as the best tested value
+- the persistent-pool rewrite improved the no-extra-fanout path too
+- the best interpretation is now:
+  - persistent low-overhead async routed-expert I/O is a win on its own
+  - extra cached-read fanout up to `4` gives an additional steady-state win
+
+## 2026-03-21 28: Repeated old-vs-new cache-split comparison
+
+Question answered:
+
+- did the persistent-pool implementation actually lower `split=4` throughput, or did it just make the `split=1` baseline healthier?
+
+Method:
+
+- compare old implementation at commit `ec53c39` versus the current local persistent-pool version
+- `Q3-GGUF` routed experts only
+- `split=1` and `split=4`
+- `3` measured runs each
+- short warmup before each measured run
+- alternating old/new order
+- `200` generated tokens
+
+Average results:
+
+| Impl | Split | Decode tok/s | Expert I/O ms | Total ms/token | TTFT ms |
+|---|---:|---:|---:|---:|---:|
+| old | `1` | `11.33` | `33.7` | `87.6` | `1513` |
+| old | `4` | `11.61` | `26.7` | `85.7` | `1547` |
+| new | `1` | `11.80` | `32.6` | `84.1` | `1546` |
+| new | `4` | `12.17` | `27.9` | `81.5` | `1543` |
+
+Answer:
+
+- the persistent-pool implementation is not slower on average
+- it improved both modes:
+  - `split=1`: `11.33 -> 11.80 tok/s`
+  - `split=4`: `11.61 -> 12.17 tok/s`
+- the apparent reduction in the split bonus is mostly because the baseline path also improved
+
+Working interpretation:
+
+- persistent low-overhead async expert I/O is a real win
+- `split=4` remains the best tested extra-fanout setting
+
+## 2026-03-21 29: Standalone warm-cache `pread()` microbench
+
+Added a dedicated packed-expert cache microbenchmark:
+
+- source: `metal_infer/cache_pread_bench.c`
+- build target: `make cachebench`
+- doc: `docs/cache-pread-microbench.md`
+
+Purpose:
+
+- measure maximum effective cached expert-load bandwidth on this box
+- separate pure warm-page-cache `pread()` scaling from end-to-end inference timing
+
+Tool behavior:
+
+- reads one packed layer file directly with `pread()`
+- supports the same routed-expert trees:
+  - `packed_experts/`
+  - `packed_experts_2bit/`
+  - `packed_experts_Q3/`
+- supports page-aligned split fanout, matching the same idea as `--cache-io-split`
+
+Important implementation note:
+
+- `split=1` means one task per expert
+- `split>1` means each expert is divided into page-aligned chunks
+- workers read different experts or different chunks; they are not intentionally duplicating the same chunk reads
+
+Measured on this machine:
+
+- MacBook Pro, Apple M5 Max, 128 GB
+- `layer_00.bin`
+- `128` shuffled experts
+- `2` warmup passes
+- `5` timed passes
+
+Q3 routed experts:
+
+| Threads | Split | Avg GB/s | Avg GiB/s | Avg us/expert |
+|---|---:|---:|---:|---:|
+| `1` | `1` | `19.49` | `18.15` | `279.1` |
+| `2` | `1` | `33.91` | `31.58` | `160.4` |
+| `4` | `1` | `44.95` | `41.86` | `121.0` |
+| `8` | `1` | `62.46` | `58.17` | `87.1` |
+| `8` | `4` | `72.07` | `67.12` | `75.5` |
+
+Additional headline points:
+
+| Layout | Threads | Split | Avg GB/s | Avg GiB/s |
+|---|---:|---:|---:|---:|
+| `4-bit` | `8` | `4` | `71.08` | `66.20` |
+| `2-bit` | `8` | `4` | `76.92` | `71.64` |
+
+Takeaway:
+
+- this M5 Max reaches about `72 GB/s` effective cached `pread()` bandwidth on the Q3 routed expert tree with `8` workers and `split=4`
+- that confirms the box can service routed-expert page-cache reads much faster than raw SSD bandwidth, which is exactly why `iostat` and effective cached bandwidth do not match

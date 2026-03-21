@@ -25,7 +25,7 @@ What the flag does:
 
 - only affects the async routed-expert load path
 - splits each routed expert blob into `N` page-aligned chunks
-- dispatches those chunk reads concurrently through the existing async `pread()` path
+- dispatches those chunk reads concurrently through a persistent worker-pool async `pread()` path
 - keeps the current storage layout, OS page cache policy, and Metal expert kernels unchanged
 
 Current implementation details:
@@ -34,6 +34,7 @@ Current implementation details:
 - split count is clamped to `[1, 8]`
 - active only when `--cache-io-split N` is passed with `N > 1`
 - default behavior remains `1`, which is equivalent to the old one-`pread`-per-expert path
+- the current routed-expert async pool uses `8` persistent I/O workers
 - when active, startup prints:
   - `[tiered-io] Experimental cache fanout: split routed expert preads into N page-aligned chunks`
 
@@ -104,18 +105,20 @@ Warm-cache sequential sweep, `200` generated tokens, same prompt, `--q3-experts`
 
 | Split | Decode tok/s | Expert I/O ms/token | Expert compute ms/token | Total ms/token | TTFT ms |
 |---|---:|---:|---:|---:|---:|
-| `1` | `11.04` | `36.1` | `1.5` | `89.9` | `2617` |
-| `2` | `12.07` | `29.0` | `1.5` | `82.2` | `1709` |
-| `4` | `13.33` | `25.6` | `1.3` | `74.4` | `1531` |
-| `8` | `12.04` | `27.3` | `1.6` | `82.3` | `1541` |
+| `1` | `11.71` | `32.9` | `1.5` | `84.7` | `1567` |
+| `2` | `12.46` | `27.6` | `1.5` | `79.5` | `1550` |
+| `4` | `12.52` | `27.5` | `1.5` | `79.2` | `1505` |
+| `8` | `12.02` | `27.7` | `1.6` | `82.5` | `1518` |
 
 Takeaway:
 
 - `4` is the best point in this sweep
 - compared with split `1`, split `4` improved:
-  - decode throughput by about `20.7%`
-  - expert I/O time by about `29.1%`
-  - total decode time per token by about `17.2%`
+  - decode throughput by about `6.9%`
+  - expert I/O time by about `16.4%`
+  - total decode time per token by about `6.5%`
+- compared with the earlier GCD-based split prototype, the persistent pool notably improved the `split=1` baseline too
+- the current implementation is therefore better described as a lower-overhead async expert I/O path plus optional extra fanout
 
 ### All currently implemented GGUF files
 
@@ -123,14 +126,14 @@ Warm-cache sequential comparison, `200` generated tokens:
 
 | Split | Decode tok/s | Expert I/O ms/token | Expert compute ms/token | Total ms/token | TTFT ms |
 |---|---:|---:|---:|---:|---:|
-| `1` | `7.39` | `40.5` | `23.9` | `134.1` | `2323` |
-| `4` | `7.95` | `31.2` | `23.2` | `124.5` | `2660` |
+| `1` | `8.79` | `36.6` | `18.6` | `112.8` | `2109` |
+| `4` | `9.41` | `27.5` | `19.0` | `105.3` | `2154` |
 
 Takeaway:
 
 - the full current GGUF stack also benefits
-- split `4` reduced routed expert I/O stall by about `22.9%`
-- decode improved by about `7.6%`
+- split `4` reduced routed expert I/O stall by about `24.9%`
+- decode improved by about `7.1%`
 
 ### Plain 4-bit routed experts
 
@@ -138,17 +141,17 @@ Warm-cache sequential comparison, `200` generated tokens:
 
 | Split | Decode tok/s | Expert I/O ms/token | Expert compute ms/token | Total ms/token | TTFT ms |
 |---|---:|---:|---:|---:|---:|
-| `1` | `9.34` | `46.8` | `1.6` | `106.3` | `1365` |
-| `4` | `10.93` | `32.9` | `1.7` | `90.7` | `1477` |
+| `1` | `9.81` | `46.8` | `1.5` | `101.2` | `1364` |
+| `4` | `10.95` | `34.8` | `1.6` | `90.6` | `1471` |
 
 Takeaway:
 
 - this is not only a Q3/GGUF effect
 - plain 4-bit also benefits strongly from split `4`
 - compared with split `1`, split `4` improved:
-  - decode throughput by about `17.0%`
-  - expert I/O time by about `29.7%`
-  - total decode time per token by about `14.7%`
+  - decode throughput by about `11.6%`
+  - expert I/O time by about `25.6%`
+  - total decode time per token by about `10.5%`
 
 ## Interpretation
 
@@ -156,13 +159,15 @@ The current evidence supports three conclusions:
 
 1. More page-cache-backed read fanout does help on this machine.
 2. The best tested setting is `4`, not `8`.
-3. The improvement is showing up in end-to-end inference, not only in a microbenchmark.
+3. Replacing per-chunk GCD launches with a persistent worker pool improved the baseline path too.
+4. The improvement is showing up in end-to-end inference, not only in a microbenchmark.
 
 This experiment does not prove raw SSD bandwidth is higher. It shows that the current pipeline sees lower routed-expert load stall when each expert read is split into a few concurrent page-aligned chunk reads.
 
 Most likely explanation:
 
 - more concurrent cache-backed reads let the OS service warm expert pages at higher effective bandwidth
+- lower per-read scheduling overhead helps even at `split=1`
 - the benefit saturates around `4`
 - pushing to `8` starts adding queueing/scheduling overhead with less additional gain
 
@@ -171,3 +176,34 @@ Most likely explanation:
 - flag is implemented and buildable
 - recommended experimental value is `--cache-io-split 4`
 - this should still be treated as experimental until it is repeated across more prompts and longer runs
+
+## Repeated old-vs-new check
+
+To validate that the persistent-pool version did not regress throughput, the `Q3-GGUF` routed-expert path was rerun `3` times each on:
+
+- old split implementation at commit `ec53c39`
+- current persistent-pool implementation
+
+For both:
+
+- `split=1`
+- `split=4`
+- with warmup before each measured run
+- same prompt
+- `200` generated tokens
+- alternating old/new order
+
+Average results:
+
+| Impl | Split | Decode tok/s | Expert I/O ms | Total ms/token | TTFT ms |
+|---|---:|---:|---:|---:|---:|
+| old | `1` | `11.33` | `33.7` | `87.6` | `1513` |
+| old | `4` | `11.61` | `26.7` | `85.7` | `1547` |
+| new | `1` | `11.80` | `32.6` | `84.1` | `1546` |
+| new | `4` | `12.17` | `27.9` | `81.5` | `1543` |
+
+Conclusion:
+
+- the persistent-pool implementation is faster on average
+- the new path improved both `split=1` and `split=4`
+- the reason the split gain looks smaller now is that the baseline path got healthier too
