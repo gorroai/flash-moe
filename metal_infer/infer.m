@@ -65,6 +65,8 @@
 #include <sys/wait.h>
 #include <compression.h>
 
+#include "gguf_iq_shared.h"
+
 // ============================================================================
 // Model constants
 // ============================================================================
@@ -115,6 +117,32 @@
 #define DOWN_W_OFF_2  2621440
 #define DOWN_S_OFF_2  3670016
 #define DOWN_B_OFF_2  3801088
+
+// Streamed Q3 expert layout for normal layers:
+//   gate/up   = exact GGUF IQ3_XXS bytes
+//   down      = exact GGUF IQ4_XS bytes
+// This preserves GGUF block size/grouping one-to-one for all three routed
+// expert projections on the non-outlier layers.
+#define Q3_OUTLIER_LAYER 27
+#define IQ3_XXS_EXPERT_PROJ_SIZE 1605632
+#define EXPERT_SIZE_Q3_HYBRID    5439488
+#define GATE_W_OFF_Q3  0
+#define UP_W_OFF_Q3    (GATE_W_OFF_Q3 + IQ3_XXS_EXPERT_PROJ_SIZE)
+#define DOWN_W_OFF_Q3  (UP_W_OFF_Q3   + IQ3_XXS_EXPERT_PROJ_SIZE)
+#define DOWN_S_OFF_Q3  DOWN_W_OFF_Q3
+#define DOWN_B_OFF_Q3  DOWN_W_OFF_Q3
+
+// Layer-27 streamed Q3 outlier:
+//   gate/up   = exact GGUF IQ4_XS bytes
+//   down      = exact GGUF Q5_K bytes
+#define IQ4_XS_EXPERT_PROJ_SIZE              2228224
+#define Q5_K_EXPERT_PROJ_SIZE                2883584
+#define EXPERT_SIZE_Q3_OUTLIER               7340032
+#define GATE_W_OFF_Q3_OUTLIER  0
+#define UP_W_OFF_Q3_OUTLIER    (GATE_W_OFF_Q3_OUTLIER + IQ4_XS_EXPERT_PROJ_SIZE)
+#define DOWN_W_OFF_Q3_OUTLIER  (UP_W_OFF_Q3_OUTLIER   + IQ4_XS_EXPERT_PROJ_SIZE)
+#define DOWN_S_OFF_Q3_OUTLIER  DOWN_W_OFF_Q3_OUTLIER
+#define DOWN_B_OFF_Q3_OUTLIER  DOWN_W_OFF_Q3_OUTLIER
 
 // KV cache maximum context length
 #define MAX_SEQ_LEN 1048576  // 1M context — only 15 full-attn layers need KV cache, ~15GB at max
@@ -231,6 +259,10 @@ static int g_expert_freq[NUM_LAYERS][NUM_EXPERTS];  // activation count per (lay
 static int g_freq_tracking = 0;  // enabled by --freq flag
 static int g_use_2bit = 0;       // enabled by --2bit flag: use packed_experts_2bit/ + 2-bit kernel
 static int g_layer_is_2bit[NUM_LAYERS];  // per-layer quant: 1=2-bit, 0=4-bit (for mixed quant)
+static int g_use_q3_experts = 0;         // enabled by --q3-experts flag: use packed_experts_Q3/ with exact GGUF routed experts
+static int g_layer_is_q3_hybrid[NUM_LAYERS];  // per-layer quant: 1=Q3 hybrid, 0=4-bit
+static int g_use_q3_outlier = 0;  // active layer override: exact layer-27 IQ4_XS gate/up + Q5_K down
+static int g_layer_is_q3_outlier[NUM_LAYERS];
 static int g_cache_telemetry_enabled = 0;  // enabled by --cache-telemetry flag
 static int g_think_budget = 2048; // max thinking tokens before force-emitting </think>
 static int g_stream_mode = 0;    // --stream: clean output only, no progress/stats
@@ -256,13 +288,117 @@ static inline int expert_pick_fd(int layer, int expert, int warm_fd) {
     return warm_fd;
 }
 
-// Active expert size based on quantization mode
+typedef enum {
+    EXPERT_QUANT_4BIT = 0,
+    EXPERT_QUANT_2BIT = 1,
+    EXPERT_QUANT_Q3_HYBRID = 2,
+    EXPERT_QUANT_Q3_OUTLIER = 3,
+} ExpertQuantKind;
+
+typedef enum {
+    EXPERT_PROJ_AFFINE = 0,
+    EXPERT_PROJ_IQ3_XXS = 1,
+    EXPERT_PROJ_IQ4_XS = 2,
+    EXPERT_PROJ_Q5_K = 3,
+} ExpertProjectionKind;
+
+typedef struct {
+    size_t expert_size;
+    NSUInteger gate_w_off, gate_s_off, gate_b_off;
+    NSUInteger up_w_off, up_s_off, up_b_off;
+    NSUInteger down_w_off, down_s_off, down_b_off;
+    ExpertProjectionKind gate_kind;
+    ExpertProjectionKind up_kind;
+    ExpertProjectionKind down_kind;
+} ExpertLayout;
+
+static inline ExpertQuantKind active_expert_quant_kind(void) {
+    if (g_use_q3_outlier) return EXPERT_QUANT_Q3_OUTLIER;
+    if (g_use_q3_experts) return EXPERT_QUANT_Q3_HYBRID;
+    if (g_use_2bit) return EXPERT_QUANT_2BIT;
+    return EXPERT_QUANT_4BIT;
+}
+
+static inline ExpertQuantKind layer_expert_quant_kind(int layer) {
+    if (g_layer_is_q3_outlier[layer]) return EXPERT_QUANT_Q3_OUTLIER;
+    if (g_layer_is_q3_hybrid[layer]) return EXPERT_QUANT_Q3_HYBRID;
+    if (g_layer_is_2bit[layer]) return EXPERT_QUANT_2BIT;
+    return EXPERT_QUANT_4BIT;
+}
+
+static inline ExpertLayout expert_layout_for_kind(ExpertQuantKind kind) {
+    switch (kind) {
+        case EXPERT_QUANT_2BIT:
+            return (ExpertLayout) {
+                .expert_size = EXPERT_SIZE_2BIT,
+                .gate_w_off = GATE_W_OFF_2, .gate_s_off = GATE_S_OFF_2, .gate_b_off = GATE_B_OFF_2,
+                .up_w_off   = UP_W_OFF_2,   .up_s_off   = UP_S_OFF_2,   .up_b_off   = UP_B_OFF_2,
+                .down_w_off = DOWN_W_OFF_2, .down_s_off = DOWN_S_OFF_2, .down_b_off = DOWN_B_OFF_2,
+                .gate_kind = EXPERT_PROJ_AFFINE,
+                .up_kind = EXPERT_PROJ_AFFINE,
+                .down_kind = EXPERT_PROJ_AFFINE,
+            };
+        case EXPERT_QUANT_Q3_HYBRID:
+            return (ExpertLayout) {
+                .expert_size = EXPERT_SIZE_Q3_HYBRID,
+                .gate_w_off = GATE_W_OFF_Q3, .gate_s_off = GATE_W_OFF_Q3, .gate_b_off = GATE_W_OFF_Q3,
+                .up_w_off   = UP_W_OFF_Q3,   .up_s_off   = UP_W_OFF_Q3,   .up_b_off   = UP_W_OFF_Q3,
+                .down_w_off = DOWN_W_OFF_Q3, .down_s_off = DOWN_S_OFF_Q3, .down_b_off = DOWN_B_OFF_Q3,
+                .gate_kind = EXPERT_PROJ_IQ3_XXS,
+                .up_kind = EXPERT_PROJ_IQ3_XXS,
+                .down_kind = EXPERT_PROJ_IQ4_XS,
+            };
+        case EXPERT_QUANT_Q3_OUTLIER:
+            return (ExpertLayout) {
+                .expert_size = EXPERT_SIZE_Q3_OUTLIER,
+                .gate_w_off = GATE_W_OFF_Q3_OUTLIER, .gate_s_off = GATE_W_OFF_Q3_OUTLIER, .gate_b_off = GATE_W_OFF_Q3_OUTLIER,
+                .up_w_off   = UP_W_OFF_Q3_OUTLIER,   .up_s_off   = UP_W_OFF_Q3_OUTLIER,   .up_b_off   = UP_W_OFF_Q3_OUTLIER,
+                .down_w_off = DOWN_W_OFF_Q3_OUTLIER, .down_s_off = DOWN_S_OFF_Q3_OUTLIER, .down_b_off = DOWN_B_OFF_Q3_OUTLIER,
+                .gate_kind = EXPERT_PROJ_IQ4_XS,
+                .up_kind = EXPERT_PROJ_IQ4_XS,
+                .down_kind = EXPERT_PROJ_Q5_K,
+            };
+        case EXPERT_QUANT_4BIT:
+        default:
+            return (ExpertLayout) {
+                .expert_size = EXPERT_SIZE,
+                .gate_w_off = 0,        .gate_s_off = 2097152, .gate_b_off = 2228224,
+                .up_w_off   = 2359296,  .up_s_off   = 4456448, .up_b_off   = 4587520,
+                .down_w_off = 4718592,  .down_s_off = 6815744, .down_b_off = 6946816,
+                .gate_kind = EXPERT_PROJ_AFFINE,
+                .up_kind = EXPERT_PROJ_AFFINE,
+                .down_kind = EXPERT_PROJ_AFFINE,
+            };
+    }
+}
+
+static inline const char *expert_quant_label(ExpertQuantKind kind) {
+    switch (kind) {
+        case EXPERT_QUANT_2BIT: return "2-bit";
+        case EXPERT_QUANT_Q3_HYBRID: return "Q3-GGUF";
+        case EXPERT_QUANT_Q3_OUTLIER: return "Q3-outlier";
+        case EXPERT_QUANT_4BIT:
+        default: return "4-bit";
+    }
+}
+
+static inline const char *requested_expert_quant_label(void) {
+    if (g_use_q3_experts) return "Q3-GGUF";
+    if (g_use_2bit) return "2-bit";
+    return "4-bit";
+}
+
 static inline size_t active_expert_size(void) {
-    return g_use_2bit ? EXPERT_SIZE_2BIT : EXPERT_SIZE;
+    return expert_layout_for_kind(active_expert_quant_kind()).expert_size;
 }
 
 static inline size_t layer_expert_size(int layer) {
-    return g_layer_is_2bit[layer] ? EXPERT_SIZE_2BIT : EXPERT_SIZE;
+    return expert_layout_for_kind(layer_expert_quant_kind(layer)).expert_size;
+}
+
+static inline size_t max_expert_size_for_current_config(void) {
+    if (g_use_q3_experts) return EXPERT_SIZE_Q3_OUTLIER;
+    return EXPERT_SIZE;
 }
 static int g_freq_total_tokens = 0;  // total tokens processed while tracking
 
@@ -1376,6 +1512,258 @@ static void cpu_q8_0_matvec(
     }
 }
 
+static void cpu_iq3_xxs_matvec(
+    const GGUFBlockIQ3XXS *W,
+    const float *x, float *out,
+    int out_dim, int in_dim
+) {
+    if (in_dim % GGUF_QK_K != 0) {
+        fprintf(stderr, "ERROR: IQ3_XXS matvec expected in_dim multiple of %d, got %d\n",
+                GGUF_QK_K, in_dim);
+        return;
+    }
+
+    const int blocks_per_row = in_dim / GGUF_QK_K;
+    for (int row = 0; row < out_dim; row++) {
+        float acc = 0.0f;
+        const GGUFBlockIQ3XXS *row_blocks = W + (size_t)row * blocks_per_row;
+
+        for (int bi = 0; bi < blocks_per_row; bi++) {
+            const GGUFBlockIQ3XXS *blk = &row_blocks[bi];
+            const float d = f16_to_f32(blk->d);
+            const uint8_t *qs = blk->qs;
+            const uint8_t *scales_and_signs = qs + GGUF_QK_K / 4;
+            const float *x_block = x + bi * GGUF_QK_K;
+
+            for (int ib32 = 0; ib32 < GGUF_QK_K / 32; ++ib32) {
+                uint32_t aux32;
+                memcpy(&aux32, scales_and_signs + 4 * ib32, sizeof(aux32));
+                const float db = d * (0.5f + (float)(aux32 >> 28)) * 0.5f;
+                const uint8_t *q3 = qs + 8 * ib32;
+
+                for (int l = 0; l < 4; ++l) {
+                    const uint8_t signs = flash_moe_ksigns_iq2xs[(aux32 >> (7 * l)) & 127];
+                    const uint8_t *grid1 = (const uint8_t *)(const void *)&flash_moe_iq3xxs_grid[q3[2 * l + 0]];
+                    const uint8_t *grid2 = (const uint8_t *)(const void *)&flash_moe_iq3xxs_grid[q3[2 * l + 1]];
+                    const int base = ib32 * 32 + 8 * l;
+
+                    for (int j = 0; j < 4; ++j) {
+                        const float s1 = (signs & flash_moe_kmask_iq2xs[j + 0]) ? -1.0f : 1.0f;
+                        const float s2 = (signs & flash_moe_kmask_iq2xs[j + 4]) ? -1.0f : 1.0f;
+                        acc += db * (float)grid1[j] * s1 * x_block[base + j + 0];
+                        acc += db * (float)grid2[j] * s2 * x_block[base + j + 4];
+                    }
+                }
+            }
+        }
+        out[row] = acc;
+    }
+}
+
+static void cpu_iq4_xs_matvec(
+    const GGUFBlockIQ4XS *W,
+    const float *x, float *out,
+    int out_dim, int in_dim
+) {
+    if (in_dim % GGUF_QK_K != 0) {
+        fprintf(stderr, "ERROR: IQ4_XS matvec expected in_dim multiple of %d, got %d\n",
+                GGUF_QK_K, in_dim);
+        return;
+    }
+
+    const int blocks_per_row = in_dim / GGUF_QK_K;
+    for (int row = 0; row < out_dim; row++) {
+        float acc = 0.0f;
+        const GGUFBlockIQ4XS *row_blocks = W + (size_t)row * blocks_per_row;
+
+        for (int bi = 0; bi < blocks_per_row; bi++) {
+            const GGUFBlockIQ4XS *blk = &row_blocks[bi];
+            const float d = f16_to_f32(blk->d);
+            const float *x_block = x + bi * GGUF_QK_K;
+            const uint8_t *qs = blk->qs;
+
+            for (int ib = 0; ib < GGUF_QK_K / 32; ++ib) {
+                const int ls = ((blk->scales_l[ib / 2] >> (4 * (ib % 2))) & 0xF) |
+                               (((blk->scales_h >> (2 * ib)) & 0x3) << 4);
+                const float dl = d * (float)(ls - 32);
+                const int base = ib * 32;
+                const uint8_t *q = qs + ib * 16;
+
+                for (int j = 0; j < 16; ++j) {
+                    acc += dl * flash_moe_kvalues_iq4nl_f[q[j] & 0xF] * x_block[base + j + 0];
+                    acc += dl * flash_moe_kvalues_iq4nl_f[q[j] >> 4]  * x_block[base + j + 16];
+                }
+            }
+        }
+        out[row] = acc;
+    }
+}
+
+static inline void flash_moe_get_scale_min_k4(
+    int j,
+    const uint8_t *q,
+    uint8_t *d,
+    uint8_t *m
+) {
+    if (j < 4) {
+        *d = q[j] & 63;
+        *m = q[j + 4] & 63;
+    } else {
+        *d = (q[j + 4] & 0xF) | ((q[j - 4] >> 6) << 4);
+        *m = (q[j + 4] >> 4) | ((q[j - 0] >> 6) << 4);
+    }
+}
+
+static void cpu_q5_k_matvec(
+    const GGUFBlockQ5K *W,
+    const float *x, float *out,
+    int out_dim, int in_dim
+) {
+    if (in_dim % GGUF_QK_K != 0) {
+        fprintf(stderr, "ERROR: Q5_K matvec expected in_dim multiple of %d, got %d\n",
+                GGUF_QK_K, in_dim);
+        return;
+    }
+
+    const int blocks_per_row = in_dim / GGUF_QK_K;
+    for (int row = 0; row < out_dim; row++) {
+        float acc = 0.0f;
+        const GGUFBlockQ5K *row_blocks = W + (size_t)row * blocks_per_row;
+
+        for (int bi = 0; bi < blocks_per_row; bi++) {
+            const GGUFBlockQ5K *blk = &row_blocks[bi];
+            const uint8_t *ql = blk->qs;
+            const uint8_t *qh = blk->qh;
+            const float d = f16_to_f32(blk->d);
+            const float minv = f16_to_f32(blk->dmin);
+            const float *x_block = x + bi * GGUF_QK_K;
+
+            int is = 0;
+            uint8_t u1 = 1;
+            uint8_t u2 = 2;
+            for (int j = 0; j < GGUF_QK_K; j += 64) {
+                uint8_t sc1, m1, sc2, m2;
+                flash_moe_get_scale_min_k4(is + 0, blk->scales, &sc1, &m1);
+                flash_moe_get_scale_min_k4(is + 1, blk->scales, &sc2, &m2);
+                const float d1 = d * (float)sc1;
+                const float d2 = d * (float)sc2;
+                const float min1 = minv * (float)m1;
+                const float min2 = minv * (float)m2;
+
+                for (int l = 0; l < 32; ++l) {
+                    acc += (d1 * (float)((ql[l] & 0xF) + ((qh[l] & u1) ? 16 : 0)) - min1) * x_block[j + l];
+                    acc += (d2 * (float)((ql[l] >> 4) + ((qh[l] & u2) ? 16 : 0)) - min2) * x_block[j + l + 32];
+                }
+
+                ql += 32;
+                is += 2;
+                u1 <<= 2;
+                u2 <<= 2;
+            }
+        }
+
+        out[row] = acc;
+    }
+}
+
+static int q3_outlier_debug_enabled(void) {
+    static int init = 0;
+    static int enabled = 0;
+    if (!init) {
+        const char *env = getenv("FLASH_MOE_DEBUG_Q3_OUTLIER");
+        enabled = (env && atoi(env) != 0);
+        init = 1;
+    }
+    return enabled;
+}
+
+static float vec_rms_local(const float *v, int n) {
+    double sum = 0.0;
+    for (int i = 0; i < n; i++) sum += (double)v[i] * (double)v[i];
+    return (float)sqrt(sum / n);
+}
+
+static int vec_nonfinite_count(const float *v, int n) {
+    int count = 0;
+    for (int i = 0; i < n; i++) {
+        if (!isfinite(v[i])) count++;
+    }
+    return count;
+}
+
+static void cpu_swiglu(const float *gate, const float *up, float *out, int dim);
+
+static void cpu_forward_expert_blob(
+    const void *expert_data,
+    const float *input,
+    float *expert_out
+) {
+    const ExpertLayout layout = expert_layout_for_kind(active_expert_quant_kind());
+    const void *gate_w = (const char *)expert_data + layout.gate_w_off;
+    const void *up_w = (const char *)expert_data + layout.up_w_off;
+    const uint32_t *down_w = (const uint32_t *)((const char *)expert_data + layout.down_w_off);
+    const uint16_t *down_s = (const uint16_t *)((const char *)expert_data + layout.down_s_off);
+    const uint16_t *down_b = (const uint16_t *)((const char *)expert_data + layout.down_b_off);
+
+    float *gate_proj_out = malloc(MOE_INTERMEDIATE * sizeof(float));
+    float *up_proj_out = malloc(MOE_INTERMEDIATE * sizeof(float));
+    float *act_out = malloc(MOE_INTERMEDIATE * sizeof(float));
+
+    if (layout.gate_kind == EXPERT_PROJ_IQ3_XXS) {
+        cpu_iq3_xxs_matvec((const GGUFBlockIQ3XXS *)gate_w, input, gate_proj_out,
+                           MOE_INTERMEDIATE, HIDDEN_DIM);
+    } else if (layout.gate_kind == EXPERT_PROJ_IQ4_XS) {
+        cpu_iq4_xs_matvec((const GGUFBlockIQ4XS *)gate_w, input, gate_proj_out,
+                          MOE_INTERMEDIATE, HIDDEN_DIM);
+    } else {
+        cpu_dequant_matvec((const uint32_t *)gate_w,
+                           (const uint16_t *)((const char *)expert_data + layout.gate_s_off),
+                           (const uint16_t *)((const char *)expert_data + layout.gate_b_off),
+                           input, gate_proj_out, MOE_INTERMEDIATE, HIDDEN_DIM, GROUP_SIZE);
+    }
+
+    if (layout.up_kind == EXPERT_PROJ_IQ3_XXS) {
+        cpu_iq3_xxs_matvec((const GGUFBlockIQ3XXS *)up_w, input, up_proj_out,
+                           MOE_INTERMEDIATE, HIDDEN_DIM);
+    } else if (layout.up_kind == EXPERT_PROJ_IQ4_XS) {
+        cpu_iq4_xs_matvec((const GGUFBlockIQ4XS *)up_w, input, up_proj_out,
+                          MOE_INTERMEDIATE, HIDDEN_DIM);
+    } else {
+        cpu_dequant_matvec((const uint32_t *)up_w,
+                           (const uint16_t *)((const char *)expert_data + layout.up_s_off),
+                           (const uint16_t *)((const char *)expert_data + layout.up_b_off),
+                           input, up_proj_out, MOE_INTERMEDIATE, HIDDEN_DIM, GROUP_SIZE);
+    }
+
+    cpu_swiglu(gate_proj_out, up_proj_out, act_out, MOE_INTERMEDIATE);
+    if (layout.down_kind == EXPERT_PROJ_Q5_K) {
+        cpu_q5_k_matvec((const GGUFBlockQ5K *)((const char *)expert_data + layout.down_w_off),
+                        act_out, expert_out, HIDDEN_DIM, MOE_INTERMEDIATE);
+    } else {
+        cpu_dequant_matvec(down_w, down_s, down_b, act_out, expert_out,
+                           HIDDEN_DIM, MOE_INTERMEDIATE, GROUP_SIZE);
+    }
+
+    if (layout.down_kind == EXPERT_PROJ_Q5_K && q3_outlier_debug_enabled()) {
+        static int printed = 0;
+        if (!printed) {
+            const GGUFBlockQ5K *blk = (const GGUFBlockQ5K *)((const char *)expert_data + layout.down_w_off);
+            fprintf(stderr,
+                    "[Q3-OUTLIER-DBG] gate rms=%.6f nonfinite=%d | up rms=%.6f nonfinite=%d | act rms=%.6f nonfinite=%d | down rms=%.6f nonfinite=%d | q5 d=%.6f dmin=%.6f\n",
+                    vec_rms_local(gate_proj_out, MOE_INTERMEDIATE), vec_nonfinite_count(gate_proj_out, MOE_INTERMEDIATE),
+                    vec_rms_local(up_proj_out, MOE_INTERMEDIATE), vec_nonfinite_count(up_proj_out, MOE_INTERMEDIATE),
+                    vec_rms_local(act_out, MOE_INTERMEDIATE), vec_nonfinite_count(act_out, MOE_INTERMEDIATE),
+                    vec_rms_local(expert_out, HIDDEN_DIM), vec_nonfinite_count(expert_out, HIDDEN_DIM),
+                    f16_to_f32(blk->d), f16_to_f32(blk->dmin));
+            printed = 1;
+        }
+    }
+
+    free(gate_proj_out);
+    free(up_proj_out);
+    free(act_out);
+}
+
 // RMS normalization: out = x * w / rms(x)
 static void cpu_rms_norm(const float *x, const uint16_t *w_bf16, float *out, int dim, float eps) {
     float sum_sq = 0.0f;
@@ -1563,6 +1951,9 @@ typedef struct {
     id<MTLComputePipelineState> matvec_v5;  // LUT dequant variant
     id<MTLComputePipelineState> matvec_fast;  // for in_dim > 4096
     id<MTLComputePipelineState> matvec_2bit;  // 2-bit expert dequant kernel
+    id<MTLComputePipelineState> matvec_iq3_xxs; // GGUF IQ3_XXS streamed expert kernel
+    id<MTLComputePipelineState> matvec_iq4_xs; // GGUF IQ4_XS streamed expert kernel
+    id<MTLComputePipelineState> matvec_q5_k; // GGUF Q5_K streamed expert kernel
     id<MTLComputePipelineState> matvec_q8_0;  // GGUF Q8_0 resident tensor path
     id<MTLComputePipelineState> matvec_q6_k;  // GGUF Q6_K resident tensor path
     // NAX (Metal 4 / M5+) pipelines
@@ -1719,6 +2110,9 @@ static MetalCtx *metal_setup(void) {
     ctx->matvec_v5     = makePipe(@"dequant_matvec_4bit_v5");  // LUT variant (no uint→float conversions)
     ctx->matvec_fast   = makePipe(@"dequant_matvec_4bit_fast");
     ctx->matvec_2bit   = makePipe(@"dequant_matvec_2bit");
+    ctx->matvec_iq3_xxs = makePipe(@"dequant_matvec_iq3_xxs");
+    ctx->matvec_iq4_xs = makePipe(@"dequant_matvec_iq4_xs");
+    ctx->matvec_q5_k   = makePipe(@"dequant_matvec_q5_k");
     ctx->matvec_q8_0   = makePipe(@"dequant_matvec_q8_0");
     ctx->matvec_q6_k   = makePipe(@"dequant_matvec_q6_k");
     ctx->rms_norm_sum  = makePipe(@"rms_norm_sum_sq");
@@ -1820,7 +2214,8 @@ static MetalCtx *metal_setup(void) {
     }
 
     // Expert computation buffers (reused across all experts and layers)
-    ctx->buf_expert_data  = [ctx->device newBufferWithLength:EXPERT_SIZE
+    size_t max_expert_size = max_expert_size_for_current_config();
+    ctx->buf_expert_data  = [ctx->device newBufferWithLength:max_expert_size
                                                      options:MTLResourceStorageModeShared];
     ctx->buf_expert_input = [ctx->device newBufferWithLength:HIDDEN_DIM * sizeof(float)
                                                      options:MTLResourceStorageModeShared];
@@ -1838,7 +2233,7 @@ static MetalCtx *metal_setup(void) {
     // The pread DMA controller transfers 3.6x faster with 2MB alignment vs 16KB.
     ctx->buf_multi_expert_input = [ctx->device newBufferWithLength:HIDDEN_DIM * sizeof(float)
                                                            options:MTLResourceStorageModeShared];
-    size_t expert_alloc_size = (EXPERT_SIZE + 2*1024*1024 - 1) & ~(2*1024*1024 - 1);  // round up to 2MB
+    size_t expert_alloc_size = (max_expert_size + 2*1024*1024 - 1) & ~(2*1024*1024 - 1);  // round up to 2MB
     for (int k = 0; k < MAX_K; k++) {
         // 2MB-aligned allocation for optimal DMA throughput
         void *aligned_data = NULL, *aligned_data_b = NULL;
@@ -2587,6 +2982,59 @@ static void gpu_encode_dequant_matvec_with_io_bufs(
     [enc endEncoding];
 }
 
+static inline id<MTLComputePipelineState> expert_pipe_for_projection(
+    MetalCtx *ctx,
+    ExpertQuantKind kind,
+    ExpertProjectionKind proj_kind
+) {
+    if (proj_kind == EXPERT_PROJ_IQ3_XXS) return ctx->matvec_iq3_xxs;
+    if (proj_kind == EXPERT_PROJ_IQ4_XS) return ctx->matvec_iq4_xs;
+    if (proj_kind == EXPERT_PROJ_Q5_K) return ctx->matvec_q5_k;
+    if (kind == EXPERT_QUANT_2BIT) return ctx->matvec_2bit;
+    return ctx->matvec_v3;
+}
+
+static inline MTLSize expert_threads_per_threadgroup(ExpertProjectionKind proj_kind) {
+    if (proj_kind == EXPERT_PROJ_IQ3_XXS ||
+        proj_kind == EXPERT_PROJ_IQ4_XS ||
+        proj_kind == EXPERT_PROJ_Q5_K) {
+        return MTLSizeMake(64, 1, 1);
+    }
+    return MTLSizeMake(256, 1, 1);
+}
+
+static inline uint32_t expert_rows_per_threadgroup(ExpertProjectionKind proj_kind) {
+    if (proj_kind == EXPERT_PROJ_IQ3_XXS) return 8;
+    if (proj_kind == EXPERT_PROJ_IQ4_XS) return 4;
+    if (proj_kind == EXPERT_PROJ_Q5_K)   return 2;
+    return 8;
+}
+
+static inline NSUInteger expert_threadgroup_memory_length(ExpertProjectionKind proj_kind) {
+    if (proj_kind == EXPERT_PROJ_IQ3_XXS) {
+        return 256 * sizeof(uint32_t) + 128 * sizeof(uint8_t);
+    }
+    if (proj_kind == EXPERT_PROJ_IQ4_XS) {
+        return 64 * sizeof(float);
+    }
+    return 0;
+}
+
+static inline void expert_dispatch_matvec(
+    id<MTLComputeCommandEncoder> enc,
+    ExpertProjectionKind proj_kind,
+    uint32_t out_dim
+) {
+    uint32_t rows_per_tg = expert_rows_per_threadgroup(proj_kind);
+    uint32_t num_threadgroups = (out_dim + rows_per_tg - 1) / rows_per_tg;
+    NSUInteger tg_mem = expert_threadgroup_memory_length(proj_kind);
+    if (tg_mem > 0) {
+        [enc setThreadgroupMemoryLength:tg_mem atIndex:0];
+    }
+    [enc dispatchThreadgroups:MTLSizeMake(num_threadgroups, 1, 1)
+        threadsPerThreadgroup:expert_threads_per_threadgroup(proj_kind)];
+}
+
 // Encode one expert forward using multi-expert slot k.
 // Expert data must already be in buf_multi_expert_data[k].
 // Input must already be in buf_multi_expert_input.
@@ -2595,19 +3043,11 @@ static void gpu_encode_expert_forward_slot(
     id<MTLCommandBuffer> cmdbuf,
     int k  // slot index
 ) {
-    NSUInteger gate_w_off, gate_s_off, gate_b_off;
-    NSUInteger up_w_off, up_s_off, up_b_off;
-    NSUInteger down_w_off, down_s_off, down_b_off;
-    if (g_use_2bit) {
-        gate_w_off = GATE_W_OFF_2; gate_s_off = GATE_S_OFF_2; gate_b_off = GATE_B_OFF_2;
-        up_w_off   = UP_W_OFF_2;   up_s_off   = UP_S_OFF_2;   up_b_off   = UP_B_OFF_2;
-        down_w_off = DOWN_W_OFF_2; down_s_off = DOWN_S_OFF_2; down_b_off = DOWN_B_OFF_2;
-    } else {
-        gate_w_off = 0;        gate_s_off = 2097152;  gate_b_off = 2228224;
-        up_w_off   = 2359296;  up_s_off   = 4456448;  up_b_off   = 4587520;
-        down_w_off = 4718592;  down_s_off = 6815744;  down_b_off = 6946816;
-    }
-    id<MTLComputePipelineState> expert_pipe = g_use_2bit ? ctx->matvec_2bit : ctx->matvec_v3;
+    ExpertQuantKind quant_kind = active_expert_quant_kind();
+    ExpertLayout layout = expert_layout_for_kind(quant_kind);
+    id<MTLComputePipelineState> gate_pipe = expert_pipe_for_projection(ctx, quant_kind, layout.gate_kind);
+    id<MTLComputePipelineState> up_pipe = expert_pipe_for_projection(ctx, quant_kind, layout.up_kind);
+    id<MTLComputePipelineState> down_pipe = expert_pipe_for_projection(ctx, quant_kind, layout.down_kind);
 
     uint32_t gate_up_out = MOE_INTERMEDIATE;
     uint32_t gate_up_in  = HIDDEN_DIM;
@@ -2618,35 +3058,31 @@ static void gpu_encode_expert_forward_slot(
     // gate_proj: data[k] -> gate[k]
     {
         id<MTLComputeCommandEncoder> enc = [cmdbuf computeCommandEncoder];
-        [enc setComputePipelineState:expert_pipe];
-        [enc setBuffer:ctx->buf_multi_expert_data[k]  offset:gate_w_off  atIndex:0];
-        [enc setBuffer:ctx->buf_multi_expert_data[k]  offset:gate_s_off  atIndex:1];
-        [enc setBuffer:ctx->buf_multi_expert_data[k]  offset:gate_b_off  atIndex:2];
+        [enc setComputePipelineState:gate_pipe];
+        [enc setBuffer:ctx->buf_multi_expert_data[k]  offset:layout.gate_w_off  atIndex:0];
+        [enc setBuffer:ctx->buf_multi_expert_data[k]  offset:layout.gate_s_off  atIndex:1];
+        [enc setBuffer:ctx->buf_multi_expert_data[k]  offset:layout.gate_b_off  atIndex:2];
         [enc setBuffer:ctx->buf_multi_expert_input     offset:0           atIndex:3];
         [enc setBuffer:ctx->buf_multi_expert_gate[k]   offset:0           atIndex:4];
         [enc setBytes:&gate_up_out length:4 atIndex:5];
         [enc setBytes:&gate_up_in  length:4 atIndex:6];
         [enc setBytes:&gs          length:4 atIndex:7];
-        uint32_t num_tgs = (gate_up_out + 7) / 8;
-        [enc dispatchThreadgroups:MTLSizeMake(num_tgs, 1, 1)
-            threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        expert_dispatch_matvec(enc, layout.gate_kind, gate_up_out);
         [enc endEncoding];
     }
     // up_proj: data[k] -> up[k]
     {
         id<MTLComputeCommandEncoder> enc = [cmdbuf computeCommandEncoder];
-        [enc setComputePipelineState:expert_pipe];
-        [enc setBuffer:ctx->buf_multi_expert_data[k]  offset:up_w_off  atIndex:0];
-        [enc setBuffer:ctx->buf_multi_expert_data[k]  offset:up_s_off  atIndex:1];
-        [enc setBuffer:ctx->buf_multi_expert_data[k]  offset:up_b_off  atIndex:2];
+        [enc setComputePipelineState:up_pipe];
+        [enc setBuffer:ctx->buf_multi_expert_data[k]  offset:layout.up_w_off  atIndex:0];
+        [enc setBuffer:ctx->buf_multi_expert_data[k]  offset:layout.up_s_off  atIndex:1];
+        [enc setBuffer:ctx->buf_multi_expert_data[k]  offset:layout.up_b_off  atIndex:2];
         [enc setBuffer:ctx->buf_multi_expert_input     offset:0          atIndex:3];
         [enc setBuffer:ctx->buf_multi_expert_up[k]     offset:0          atIndex:4];
         [enc setBytes:&gate_up_out length:4 atIndex:5];
         [enc setBytes:&gate_up_in  length:4 atIndex:6];
         [enc setBytes:&gs          length:4 atIndex:7];
-        uint32_t num_tgs = (gate_up_out + 7) / 8;
-        [enc dispatchThreadgroups:MTLSizeMake(num_tgs, 1, 1)
-            threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        expert_dispatch_matvec(enc, layout.up_kind, gate_up_out);
         [enc endEncoding];
     }
     // SwiGLU: gate[k], up[k] -> act[k]
@@ -2665,18 +3101,16 @@ static void gpu_encode_expert_forward_slot(
     // down_proj: act[k] -> out[k]
     {
         id<MTLComputeCommandEncoder> enc = [cmdbuf computeCommandEncoder];
-        [enc setComputePipelineState:expert_pipe];
-        [enc setBuffer:ctx->buf_multi_expert_data[k] offset:down_w_off  atIndex:0];
-        [enc setBuffer:ctx->buf_multi_expert_data[k] offset:down_s_off  atIndex:1];
-        [enc setBuffer:ctx->buf_multi_expert_data[k] offset:down_b_off  atIndex:2];
+        [enc setComputePipelineState:down_pipe];
+        [enc setBuffer:ctx->buf_multi_expert_data[k] offset:layout.down_w_off  atIndex:0];
+        [enc setBuffer:ctx->buf_multi_expert_data[k] offset:layout.down_s_off  atIndex:1];
+        [enc setBuffer:ctx->buf_multi_expert_data[k] offset:layout.down_b_off  atIndex:2];
         [enc setBuffer:ctx->buf_multi_expert_act[k]  offset:0           atIndex:3];
         [enc setBuffer:ctx->buf_multi_expert_out[k]  offset:0           atIndex:4];
         [enc setBytes:&down_out length:4 atIndex:5];
         [enc setBytes:&down_in  length:4 atIndex:6];
         [enc setBytes:&gs       length:4 atIndex:7];
-        uint32_t num_tgs = (down_out + 7) / 8;
-        [enc dispatchThreadgroups:MTLSizeMake(num_tgs, 1, 1)
-            threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        expert_dispatch_matvec(enc, layout.down_kind, down_out);
         [enc endEncoding];
     }
 }
@@ -2691,19 +3125,11 @@ static void gpu_encode_expert_forward_slot_buf(
     int k,                  // slot index (for gate/up/act/out scratch)
     id<MTLBuffer> data_buf  // expert weight data buffer (from either set A or B)
 ) {
-    NSUInteger gate_w_off, gate_s_off, gate_b_off;
-    NSUInteger up_w_off, up_s_off, up_b_off;
-    NSUInteger down_w_off, down_s_off, down_b_off;
-    if (g_use_2bit) {
-        gate_w_off = GATE_W_OFF_2; gate_s_off = GATE_S_OFF_2; gate_b_off = GATE_B_OFF_2;
-        up_w_off   = UP_W_OFF_2;   up_s_off   = UP_S_OFF_2;   up_b_off   = UP_B_OFF_2;
-        down_w_off = DOWN_W_OFF_2; down_s_off = DOWN_S_OFF_2; down_b_off = DOWN_B_OFF_2;
-    } else {
-        gate_w_off = 0;        gate_s_off = 2097152;  gate_b_off = 2228224;
-        up_w_off   = 2359296;  up_s_off   = 4456448;  up_b_off   = 4587520;
-        down_w_off = 4718592;  down_s_off = 6815744;  down_b_off = 6946816;
-    }
-    id<MTLComputePipelineState> expert_pipe = g_use_2bit ? ctx->matvec_2bit : ctx->matvec_v3;
+    ExpertQuantKind quant_kind = active_expert_quant_kind();
+    ExpertLayout layout = expert_layout_for_kind(quant_kind);
+    id<MTLComputePipelineState> gate_pipe = expert_pipe_for_projection(ctx, quant_kind, layout.gate_kind);
+    id<MTLComputePipelineState> up_pipe = expert_pipe_for_projection(ctx, quant_kind, layout.up_kind);
+    id<MTLComputePipelineState> down_pipe = expert_pipe_for_projection(ctx, quant_kind, layout.down_kind);
 
     uint32_t gate_up_out = MOE_INTERMEDIATE;
     uint32_t gate_up_in  = HIDDEN_DIM;
@@ -2714,35 +3140,31 @@ static void gpu_encode_expert_forward_slot_buf(
     // gate_proj
     {
         id<MTLComputeCommandEncoder> enc = [cmdbuf computeCommandEncoder];
-        [enc setComputePipelineState:expert_pipe];
-        [enc setBuffer:data_buf                        offset:gate_w_off  atIndex:0];
-        [enc setBuffer:data_buf                        offset:gate_s_off  atIndex:1];
-        [enc setBuffer:data_buf                        offset:gate_b_off  atIndex:2];
+        [enc setComputePipelineState:gate_pipe];
+        [enc setBuffer:data_buf                        offset:layout.gate_w_off  atIndex:0];
+        [enc setBuffer:data_buf                        offset:layout.gate_s_off  atIndex:1];
+        [enc setBuffer:data_buf                        offset:layout.gate_b_off  atIndex:2];
         [enc setBuffer:ctx->buf_multi_expert_input     offset:0           atIndex:3];
         [enc setBuffer:ctx->buf_multi_expert_gate[k]   offset:0           atIndex:4];
         [enc setBytes:&gate_up_out length:4 atIndex:5];
         [enc setBytes:&gate_up_in  length:4 atIndex:6];
         [enc setBytes:&gs          length:4 atIndex:7];
-        uint32_t num_tgs = (gate_up_out + 7) / 8;
-        [enc dispatchThreadgroups:MTLSizeMake(num_tgs, 1, 1)
-            threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        expert_dispatch_matvec(enc, layout.gate_kind, gate_up_out);
         [enc endEncoding];
     }
     // up_proj
     {
         id<MTLComputeCommandEncoder> enc = [cmdbuf computeCommandEncoder];
-        [enc setComputePipelineState:expert_pipe];
-        [enc setBuffer:data_buf                        offset:up_w_off  atIndex:0];
-        [enc setBuffer:data_buf                        offset:up_s_off  atIndex:1];
-        [enc setBuffer:data_buf                        offset:up_b_off  atIndex:2];
+        [enc setComputePipelineState:up_pipe];
+        [enc setBuffer:data_buf                        offset:layout.up_w_off  atIndex:0];
+        [enc setBuffer:data_buf                        offset:layout.up_s_off  atIndex:1];
+        [enc setBuffer:data_buf                        offset:layout.up_b_off  atIndex:2];
         [enc setBuffer:ctx->buf_multi_expert_input     offset:0          atIndex:3];
         [enc setBuffer:ctx->buf_multi_expert_up[k]     offset:0          atIndex:4];
         [enc setBytes:&gate_up_out length:4 atIndex:5];
         [enc setBytes:&gate_up_in  length:4 atIndex:6];
         [enc setBytes:&gs          length:4 atIndex:7];
-        uint32_t num_tgs = (gate_up_out + 7) / 8;
-        [enc dispatchThreadgroups:MTLSizeMake(num_tgs, 1, 1)
-            threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        expert_dispatch_matvec(enc, layout.up_kind, gate_up_out);
         [enc endEncoding];
     }
     // SwiGLU
@@ -2761,18 +3183,16 @@ static void gpu_encode_expert_forward_slot_buf(
     // down_proj
     {
         id<MTLComputeCommandEncoder> enc = [cmdbuf computeCommandEncoder];
-        [enc setComputePipelineState:expert_pipe];
-        [enc setBuffer:data_buf                        offset:down_w_off  atIndex:0];
-        [enc setBuffer:data_buf                        offset:down_s_off  atIndex:1];
-        [enc setBuffer:data_buf                        offset:down_b_off  atIndex:2];
+        [enc setComputePipelineState:down_pipe];
+        [enc setBuffer:data_buf                        offset:layout.down_w_off  atIndex:0];
+        [enc setBuffer:data_buf                        offset:layout.down_s_off  atIndex:1];
+        [enc setBuffer:data_buf                        offset:layout.down_b_off  atIndex:2];
         [enc setBuffer:ctx->buf_multi_expert_act[k]    offset:0           atIndex:3];
         [enc setBuffer:ctx->buf_multi_expert_out[k]    offset:0           atIndex:4];
         [enc setBytes:&down_out length:4 atIndex:5];
         [enc setBytes:&down_in  length:4 atIndex:6];
         [enc setBytes:&gs       length:4 atIndex:7];
-        uint32_t num_tgs = (down_out + 7) / 8;
-        [enc dispatchThreadgroups:MTLSizeMake(num_tgs, 1, 1)
-            threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        expert_dispatch_matvec(enc, layout.down_kind, down_out);
         [enc endEncoding];
     }
 }
@@ -2790,31 +3210,17 @@ static void gpu_encode_experts_batched(
     const int *valid,            // which experts are valid [MAX_K]
     id<MTLBuffer> __strong *expert_bufs   // per-expert weight data buffers [MAX_K]
 ) {
-    // Select offsets and pipeline based on quantization mode
-    NSUInteger gate_w_off, gate_s_off, gate_b_off;
-    NSUInteger up_w_off, up_s_off, up_b_off;
-    NSUInteger down_w_off, down_s_off, down_b_off;
-    if (g_use_2bit) {
-        gate_w_off = GATE_W_OFF_2; gate_s_off = GATE_S_OFF_2; gate_b_off = GATE_B_OFF_2;
-        up_w_off   = UP_W_OFF_2;   up_s_off   = UP_S_OFF_2;   up_b_off   = UP_B_OFF_2;
-        down_w_off = DOWN_W_OFF_2; down_s_off = DOWN_S_OFF_2; down_b_off = DOWN_B_OFF_2;
-    } else {
-        gate_w_off = 0;        gate_s_off = 2097152;  gate_b_off = 2228224;
-        up_w_off   = 2359296;  up_s_off   = 4456448;  up_b_off   = 4587520;
-        down_w_off = 4718592;  down_s_off = 6815744;  down_b_off = 6946816;
-    }
-    id<MTLComputePipelineState> expert_pipe = g_use_2bit ? ctx->matvec_2bit : ctx->matvec_v3;
+    ExpertQuantKind quant_kind = active_expert_quant_kind();
+    ExpertLayout layout = expert_layout_for_kind(quant_kind);
+    id<MTLComputePipelineState> gate_pipe = expert_pipe_for_projection(ctx, quant_kind, layout.gate_kind);
+    id<MTLComputePipelineState> up_pipe = expert_pipe_for_projection(ctx, quant_kind, layout.up_kind);
+    id<MTLComputePipelineState> down_pipe = expert_pipe_for_projection(ctx, quant_kind, layout.down_kind);
 
     uint32_t gate_up_out = MOE_INTERMEDIATE;
     uint32_t gate_up_in  = HIDDEN_DIM;
     uint32_t down_out    = HIDDEN_DIM;
     uint32_t down_in     = MOE_INTERMEDIATE;
     uint32_t gs          = GROUP_SIZE;
-    // 2-bit: packed_cols = in_dim/16, threadgroups = out_dim/8
-    // 4-bit: packed_cols = in_dim/8,  threadgroups = out_dim/8
-    // Threadgroup count is the same (based on out_dim), kernel handles packed_cols internally.
-    uint32_t gate_up_tgs = (gate_up_out + 7) / 8;
-    uint32_t down_tgs    = (down_out + 7) / 8;
     uint32_t swiglu_tgs  = (gate_up_out + 255) / 256;
 
     // Per-expert: Encoder A (gate+up), Encoder B (SwiGLU+down)
@@ -2827,24 +3233,23 @@ static void gpu_encode_experts_batched(
         {
             id<MTLComputeCommandEncoder> enc = [cmdbuf computeCommandEncoder];
             // gate_proj
-            [enc setComputePipelineState:expert_pipe];
-            [enc setBuffer:expert_bufs[k]                  offset:gate_w_off  atIndex:0];
-            [enc setBuffer:expert_bufs[k]                  offset:gate_s_off  atIndex:1];
-            [enc setBuffer:expert_bufs[k]                  offset:gate_b_off  atIndex:2];
+            [enc setComputePipelineState:gate_pipe];
+            [enc setBuffer:expert_bufs[k]                  offset:layout.gate_w_off  atIndex:0];
+            [enc setBuffer:expert_bufs[k]                  offset:layout.gate_s_off  atIndex:1];
+            [enc setBuffer:expert_bufs[k]                  offset:layout.gate_b_off  atIndex:2];
             [enc setBuffer:ctx->buf_multi_expert_input     offset:0           atIndex:3];
             [enc setBuffer:ctx->buf_multi_expert_gate[k]   offset:0           atIndex:4];
             [enc setBytes:&gate_up_out length:4 atIndex:5];
             [enc setBytes:&gate_up_in  length:4 atIndex:6];
             [enc setBytes:&gs          length:4 atIndex:7];
-            [enc dispatchThreadgroups:MTLSizeMake(gate_up_tgs, 1, 1)
-                threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+            expert_dispatch_matvec(enc, layout.gate_kind, gate_up_out);
             // up_proj (same encoder, serialized after gate — shares encoder overhead)
-            [enc setBuffer:expert_bufs[k]                  offset:up_w_off  atIndex:0];
-            [enc setBuffer:expert_bufs[k]                  offset:up_s_off  atIndex:1];
-            [enc setBuffer:expert_bufs[k]                  offset:up_b_off  atIndex:2];
+            [enc setComputePipelineState:up_pipe];
+            [enc setBuffer:expert_bufs[k]                  offset:layout.up_w_off  atIndex:0];
+            [enc setBuffer:expert_bufs[k]                  offset:layout.up_s_off  atIndex:1];
+            [enc setBuffer:expert_bufs[k]                  offset:layout.up_b_off  atIndex:2];
             [enc setBuffer:ctx->buf_multi_expert_up[k]     offset:0          atIndex:4];
-            [enc dispatchThreadgroups:MTLSizeMake(gate_up_tgs, 1, 1)
-                threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+            expert_dispatch_matvec(enc, layout.up_kind, gate_up_out);
             [enc endEncoding];
         }
 
@@ -2860,17 +3265,16 @@ static void gpu_encode_experts_batched(
             [enc dispatchThreadgroups:MTLSizeMake(swiglu_tgs, 1, 1)
                 threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
             // down_proj (same encoder, serialized after SwiGLU)
-            [enc setComputePipelineState:expert_pipe];
-            [enc setBuffer:expert_bufs[k]                  offset:down_w_off  atIndex:0];
-            [enc setBuffer:expert_bufs[k]                  offset:down_s_off  atIndex:1];
-            [enc setBuffer:expert_bufs[k]                  offset:down_b_off  atIndex:2];
+            [enc setComputePipelineState:down_pipe];
+            [enc setBuffer:expert_bufs[k]                  offset:layout.down_w_off  atIndex:0];
+            [enc setBuffer:expert_bufs[k]                  offset:layout.down_s_off  atIndex:1];
+            [enc setBuffer:expert_bufs[k]                  offset:layout.down_b_off  atIndex:2];
             [enc setBuffer:ctx->buf_multi_expert_act[k]    offset:0           atIndex:3];
             [enc setBuffer:ctx->buf_multi_expert_out[k]    offset:0           atIndex:4];
             [enc setBytes:&down_out length:4 atIndex:5];
             [enc setBytes:&down_in  length:4 atIndex:6];
             [enc setBytes:&gs       length:4 atIndex:7];
-            [enc dispatchThreadgroups:MTLSizeMake(down_tgs, 1, 1)
-                threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+            expert_dispatch_matvec(enc, layout.down_kind, down_out);
             [enc endEncoding];
         }
     }
@@ -2884,15 +3288,11 @@ static void gpu_encode_expert_forward(
     MetalCtx *ctx,
     id<MTLCommandBuffer> cmdbuf
 ) {
-    NSUInteger gate_w_off = 0;
-    NSUInteger gate_s_off = 2097152;
-    NSUInteger gate_b_off = 2228224;
-    NSUInteger up_w_off   = 2359296;
-    NSUInteger up_s_off   = 4456448;
-    NSUInteger up_b_off   = 4587520;
-    NSUInteger down_w_off = 4718592;
-    NSUInteger down_s_off = 6815744;
-    NSUInteger down_b_off = 6946816;
+    ExpertQuantKind quant_kind = active_expert_quant_kind();
+    ExpertLayout layout = expert_layout_for_kind(quant_kind);
+    id<MTLComputePipelineState> gate_pipe = expert_pipe_for_projection(ctx, quant_kind, layout.gate_kind);
+    id<MTLComputePipelineState> up_pipe = expert_pipe_for_projection(ctx, quant_kind, layout.up_kind);
+    id<MTLComputePipelineState> down_pipe = expert_pipe_for_projection(ctx, quant_kind, layout.down_kind);
 
     uint32_t gate_up_out = MOE_INTERMEDIATE;
     uint32_t gate_up_in  = HIDDEN_DIM;
@@ -2903,35 +3303,31 @@ static void gpu_encode_expert_forward(
     // gate_proj
     {
         id<MTLComputeCommandEncoder> enc = [cmdbuf computeCommandEncoder];
-        [enc setComputePipelineState:ctx->matvec_v3];
-        [enc setBuffer:ctx->buf_expert_data  offset:gate_w_off  atIndex:0];
-        [enc setBuffer:ctx->buf_expert_data  offset:gate_s_off  atIndex:1];
-        [enc setBuffer:ctx->buf_expert_data  offset:gate_b_off  atIndex:2];
+        [enc setComputePipelineState:gate_pipe];
+        [enc setBuffer:ctx->buf_expert_data  offset:layout.gate_w_off  atIndex:0];
+        [enc setBuffer:ctx->buf_expert_data  offset:layout.gate_s_off  atIndex:1];
+        [enc setBuffer:ctx->buf_expert_data  offset:layout.gate_b_off  atIndex:2];
         [enc setBuffer:ctx->buf_expert_input offset:0           atIndex:3];
         [enc setBuffer:ctx->buf_expert_gate  offset:0           atIndex:4];
         [enc setBytes:&gate_up_out length:4 atIndex:5];
         [enc setBytes:&gate_up_in  length:4 atIndex:6];
         [enc setBytes:&gs          length:4 atIndex:7];
-        uint32_t num_tgs = (gate_up_out + 7) / 8;
-        [enc dispatchThreadgroups:MTLSizeMake(num_tgs, 1, 1)
-            threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        expert_dispatch_matvec(enc, layout.gate_kind, gate_up_out);
         [enc endEncoding];
     }
     // up_proj
     {
         id<MTLComputeCommandEncoder> enc = [cmdbuf computeCommandEncoder];
-        [enc setComputePipelineState:ctx->matvec_v3];
-        [enc setBuffer:ctx->buf_expert_data  offset:up_w_off  atIndex:0];
-        [enc setBuffer:ctx->buf_expert_data  offset:up_s_off  atIndex:1];
-        [enc setBuffer:ctx->buf_expert_data  offset:up_b_off  atIndex:2];
+        [enc setComputePipelineState:up_pipe];
+        [enc setBuffer:ctx->buf_expert_data  offset:layout.up_w_off  atIndex:0];
+        [enc setBuffer:ctx->buf_expert_data  offset:layout.up_s_off  atIndex:1];
+        [enc setBuffer:ctx->buf_expert_data  offset:layout.up_b_off  atIndex:2];
         [enc setBuffer:ctx->buf_expert_input offset:0          atIndex:3];
         [enc setBuffer:ctx->buf_expert_up    offset:0          atIndex:4];
         [enc setBytes:&gate_up_out length:4 atIndex:5];
         [enc setBytes:&gate_up_in  length:4 atIndex:6];
         [enc setBytes:&gs          length:4 atIndex:7];
-        uint32_t num_tgs = (gate_up_out + 7) / 8;
-        [enc dispatchThreadgroups:MTLSizeMake(num_tgs, 1, 1)
-            threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        expert_dispatch_matvec(enc, layout.up_kind, gate_up_out);
         [enc endEncoding];
     }
     // SwiGLU
@@ -2950,18 +3346,16 @@ static void gpu_encode_expert_forward(
     // down_proj
     {
         id<MTLComputeCommandEncoder> enc = [cmdbuf computeCommandEncoder];
-        [enc setComputePipelineState:ctx->matvec_v3];
-        [enc setBuffer:ctx->buf_expert_data offset:down_w_off  atIndex:0];
-        [enc setBuffer:ctx->buf_expert_data offset:down_s_off  atIndex:1];
-        [enc setBuffer:ctx->buf_expert_data offset:down_b_off  atIndex:2];
+        [enc setComputePipelineState:down_pipe];
+        [enc setBuffer:ctx->buf_expert_data offset:layout.down_w_off  atIndex:0];
+        [enc setBuffer:ctx->buf_expert_data offset:layout.down_s_off  atIndex:1];
+        [enc setBuffer:ctx->buf_expert_data offset:layout.down_b_off  atIndex:2];
         [enc setBuffer:ctx->buf_expert_act  offset:0           atIndex:3];
         [enc setBuffer:ctx->buf_expert_out  offset:0           atIndex:4];
         [enc setBytes:&down_out length:4 atIndex:5];
         [enc setBytes:&down_in  length:4 atIndex:6];
         [enc setBytes:&gs       length:4 atIndex:7];
-        uint32_t num_tgs = (down_out + 7) / 8;
-        [enc dispatchThreadgroups:MTLSizeMake(num_tgs, 1, 1)
-            threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        expert_dispatch_matvec(enc, layout.down_kind, down_out);
         [enc endEncoding];
     }
 }
@@ -3020,20 +3414,11 @@ static void gpu_expert_forward(
     float *expert_out,           // [HIDDEN_DIM] output
     int expert_data_already_in_buffer
 ) {
-    // Expert layout offsets — select based on quantization mode
-    NSUInteger gate_w_off, gate_s_off, gate_b_off;
-    NSUInteger up_w_off, up_s_off, up_b_off;
-    NSUInteger down_w_off, down_s_off, down_b_off;
-    if (g_use_2bit) {
-        gate_w_off = GATE_W_OFF_2; gate_s_off = GATE_S_OFF_2; gate_b_off = GATE_B_OFF_2;
-        up_w_off   = UP_W_OFF_2;   up_s_off   = UP_S_OFF_2;   up_b_off   = UP_B_OFF_2;
-        down_w_off = DOWN_W_OFF_2; down_s_off = DOWN_S_OFF_2; down_b_off = DOWN_B_OFF_2;
-    } else {
-        gate_w_off = 0;        gate_s_off = 2097152;  gate_b_off = 2228224;
-        up_w_off   = 2359296;  up_s_off   = 4456448;  up_b_off   = 4587520;
-        down_w_off = 4718592;  down_s_off = 6815744;  down_b_off = 6946816;
-    }
-    id<MTLComputePipelineState> expert_pipe = g_use_2bit ? ctx->matvec_2bit : ctx->matvec_v3;
+    ExpertQuantKind quant_kind = active_expert_quant_kind();
+    ExpertLayout layout = expert_layout_for_kind(quant_kind);
+    id<MTLComputePipelineState> gate_pipe = expert_pipe_for_projection(ctx, quant_kind, layout.gate_kind);
+    id<MTLComputePipelineState> up_pipe = expert_pipe_for_projection(ctx, quant_kind, layout.up_kind);
+    id<MTLComputePipelineState> down_pipe = expert_pipe_for_projection(ctx, quant_kind, layout.down_kind);
 
     // Copy expert weights into Metal buffer only if not already there
     if (!expert_data_already_in_buffer) {
@@ -3058,10 +3443,10 @@ static void gpu_expert_forward(
     // --- Dispatch 1: gate_proj [4096] -> [1024] ---
     {
         id<MTLComputeCommandEncoder> enc = [cmdbuf computeCommandEncoder];
-        [enc setComputePipelineState:expert_pipe];
-        [enc setBuffer:ctx->buf_expert_data  offset:gate_w_off  atIndex:0];
-        [enc setBuffer:ctx->buf_expert_data  offset:gate_s_off  atIndex:1];
-        [enc setBuffer:ctx->buf_expert_data  offset:gate_b_off  atIndex:2];
+        [enc setComputePipelineState:gate_pipe];
+        [enc setBuffer:ctx->buf_expert_data  offset:layout.gate_w_off  atIndex:0];
+        [enc setBuffer:ctx->buf_expert_data  offset:layout.gate_s_off  atIndex:1];
+        [enc setBuffer:ctx->buf_expert_data  offset:layout.gate_b_off  atIndex:2];
         [enc setBuffer:ctx->buf_expert_input offset:0           atIndex:3];
         [enc setBuffer:ctx->buf_expert_gate  offset:0           atIndex:4];
         [enc setBytes:&gate_up_out length:4 atIndex:5];
@@ -3076,10 +3461,10 @@ static void gpu_expert_forward(
     // --- Dispatch 2: up_proj [4096] -> [1024] ---
     {
         id<MTLComputeCommandEncoder> enc = [cmdbuf computeCommandEncoder];
-        [enc setComputePipelineState:expert_pipe];
-        [enc setBuffer:ctx->buf_expert_data  offset:up_w_off  atIndex:0];
-        [enc setBuffer:ctx->buf_expert_data  offset:up_s_off  atIndex:1];
-        [enc setBuffer:ctx->buf_expert_data  offset:up_b_off  atIndex:2];
+        [enc setComputePipelineState:up_pipe];
+        [enc setBuffer:ctx->buf_expert_data  offset:layout.up_w_off  atIndex:0];
+        [enc setBuffer:ctx->buf_expert_data  offset:layout.up_s_off  atIndex:1];
+        [enc setBuffer:ctx->buf_expert_data  offset:layout.up_b_off  atIndex:2];
         [enc setBuffer:ctx->buf_expert_input offset:0          atIndex:3];
         [enc setBuffer:ctx->buf_expert_up    offset:0          atIndex:4];
         [enc setBytes:&gate_up_out length:4 atIndex:5];
@@ -3108,10 +3493,10 @@ static void gpu_expert_forward(
     // --- Dispatch 4: down_proj [1024] -> [4096] ---
     {
         id<MTLComputeCommandEncoder> enc = [cmdbuf computeCommandEncoder];
-        [enc setComputePipelineState:expert_pipe];
-        [enc setBuffer:ctx->buf_expert_data offset:down_w_off  atIndex:0];
-        [enc setBuffer:ctx->buf_expert_data offset:down_s_off  atIndex:1];
-        [enc setBuffer:ctx->buf_expert_data offset:down_b_off  atIndex:2];
+        [enc setComputePipelineState:down_pipe];
+        [enc setBuffer:ctx->buf_expert_data offset:layout.down_w_off  atIndex:0];
+        [enc setBuffer:ctx->buf_expert_data offset:layout.down_s_off  atIndex:1];
+        [enc setBuffer:ctx->buf_expert_data offset:layout.down_b_off  atIndex:2];
         [enc setBuffer:ctx->buf_expert_act  offset:0           atIndex:3];
         [enc setBuffer:ctx->buf_expert_out  offset:0           atIndex:4];
         [enc setBytes:&down_out length:4 atIndex:5];
@@ -4006,31 +4391,7 @@ static void moe_forward(
                     continue;
                 }
 
-                uint32_t *gw = (uint32_t *)expert_data;
-                uint16_t *gs_p = (uint16_t *)((char *)expert_data + (g_use_2bit ? GATE_S_OFF_2 : 2097152));
-                uint16_t *gb_p = (uint16_t *)((char *)expert_data + (g_use_2bit ? GATE_B_OFF_2 : 2228224));
-                uint32_t *uw = (uint32_t *)((char *)expert_data + (g_use_2bit ? UP_W_OFF_2 : 2359296));
-                uint16_t *us_p = (uint16_t *)((char *)expert_data + (g_use_2bit ? UP_S_OFF_2 : 4456448));
-                uint16_t *ub_p = (uint16_t *)((char *)expert_data + (g_use_2bit ? UP_B_OFF_2 : 4587520));
-                uint32_t *dw = (uint32_t *)((char *)expert_data + (g_use_2bit ? DOWN_W_OFF_2 : 4718592));
-                uint16_t *ds_p = (uint16_t *)((char *)expert_data + (g_use_2bit ? DOWN_S_OFF_2 : 6815744));
-                uint16_t *db_p = (uint16_t *)((char *)expert_data + (g_use_2bit ? DOWN_B_OFF_2 : 6946816));
-
-                float *gate_proj_out = malloc(MOE_INTERMEDIATE * sizeof(float));
-                float *up_proj_out = malloc(MOE_INTERMEDIATE * sizeof(float));
-                float *act_out = malloc(MOE_INTERMEDIATE * sizeof(float));
-
-                cpu_dequant_matvec(gw, gs_p, gb_p, h_post, gate_proj_out,
-                                   MOE_INTERMEDIATE, HIDDEN_DIM, GROUP_SIZE);
-                cpu_dequant_matvec(uw, us_p, ub_p, h_post, up_proj_out,
-                                   MOE_INTERMEDIATE, HIDDEN_DIM, GROUP_SIZE);
-                cpu_swiglu(gate_proj_out, up_proj_out, act_out, MOE_INTERMEDIATE);
-                cpu_dequant_matvec(dw, ds_p, db_p, act_out, expert_out,
-                                   HIDDEN_DIM, MOE_INTERMEDIATE, GROUP_SIZE);
-
-                free(gate_proj_out);
-                free(up_proj_out);
-                free(act_out);
+                cpu_forward_expert_blob(expert_data, h_post, expert_out);
                 free(expert_data);
             }
 
@@ -5327,9 +5688,15 @@ static void fused_layer_forward(
     int K,                   // number of active experts
     int packed_fd            // fd for packed expert file
 ) {
-    // Per-layer quant: temporarily set g_use_2bit for this layer (mixed quant support)
+    // Per-layer quant: temporarily switch to the per-layer expert format
     int saved_use_2bit = g_use_2bit;
-    if (g_use_2bit) g_use_2bit = g_layer_is_2bit[layer_idx];
+    int saved_use_q3_experts = g_use_q3_experts;
+    int saved_use_q3_outlier = g_use_q3_outlier;
+    if (saved_use_2bit) g_use_2bit = g_layer_is_2bit[layer_idx];
+    if (saved_use_q3_experts) {
+        g_use_q3_outlier = g_layer_is_q3_outlier[layer_idx];
+        g_use_q3_experts = g_layer_is_q3_hybrid[layer_idx] || g_layer_is_q3_outlier[layer_idx];
+    }
 
     double t_layer_start = 0, t0 = 0, t1 = 0;
     if (g_timing_enabled) { t_layer_start = now_ms(); }
@@ -6838,7 +7205,9 @@ static void fused_layer_forward(
         // Return immediately — GPU experts are running async.
         // The next call to fused_layer_forward() or complete_deferred_experts()
         // will wait for the GPU and apply the final combine.
-        g_use_2bit = saved_use_2bit;  // restore (mixed quant)
+        g_use_2bit = saved_use_2bit;
+        g_use_q3_outlier = saved_use_q3_outlier;
+        g_use_q3_experts = saved_use_q3_experts;
         return;
 
     } else if (packed_fd >= 0) {
@@ -6856,33 +7225,7 @@ static void fused_layer_forward(
                 free(expert_data);
                 continue;
             }
-
-            // CPU fallback offsets — use 4-bit layout (2-bit CPU path not yet implemented)
-            uint32_t *gw = (uint32_t *)expert_data;
-            uint16_t *gs_p = (uint16_t *)((char *)expert_data + (g_use_2bit ? GATE_S_OFF_2 : 2097152));
-            uint16_t *gb_p = (uint16_t *)((char *)expert_data + (g_use_2bit ? GATE_B_OFF_2 : 2228224));
-            uint32_t *uw = (uint32_t *)((char *)expert_data + (g_use_2bit ? UP_W_OFF_2 : 2359296));
-            uint16_t *us_p = (uint16_t *)((char *)expert_data + (g_use_2bit ? UP_S_OFF_2 : 4456448));
-            uint16_t *ub_p = (uint16_t *)((char *)expert_data + (g_use_2bit ? UP_B_OFF_2 : 4587520));
-            uint32_t *dw = (uint32_t *)((char *)expert_data + (g_use_2bit ? DOWN_W_OFF_2 : 4718592));
-            uint16_t *ds_p = (uint16_t *)((char *)expert_data + (g_use_2bit ? DOWN_S_OFF_2 : 6815744));
-            uint16_t *db_p = (uint16_t *)((char *)expert_data + (g_use_2bit ? DOWN_B_OFF_2 : 6946816));
-
-            float *gate_proj_out = malloc(MOE_INTERMEDIATE * sizeof(float));
-            float *up_proj_out = malloc(MOE_INTERMEDIATE * sizeof(float));
-            float *act_out = malloc(MOE_INTERMEDIATE * sizeof(float));
-
-            cpu_dequant_matvec(gw, gs_p, gb_p, h_post, gate_proj_out,
-                               MOE_INTERMEDIATE, HIDDEN_DIM, GROUP_SIZE);
-            cpu_dequant_matvec(uw, us_p, ub_p, h_post, up_proj_out,
-                               MOE_INTERMEDIATE, HIDDEN_DIM, GROUP_SIZE);
-            cpu_swiglu(gate_proj_out, up_proj_out, act_out, MOE_INTERMEDIATE);
-            cpu_dequant_matvec(dw, ds_p, db_p, act_out, expert_out_cpu,
-                               HIDDEN_DIM, MOE_INTERMEDIATE, GROUP_SIZE);
-
-            free(gate_proj_out);
-            free(up_proj_out);
-            free(act_out);
+            cpu_forward_expert_blob(expert_data, h_post, expert_out_cpu);
             free(expert_data);
 
             cpu_vec_madd(moe_out, expert_out_cpu, expert_weights[k], HIDDEN_DIM);
@@ -6932,8 +7275,10 @@ static void fused_layer_forward(
     // h_post, h_mid, gate_scores, moe_out, shared_out, shared_gate, shared_up
     // are all static scratch buffers — no free needed.
 
-    // Restore global 2-bit flag (mixed quant)
+    // Restore global expert quant flag(s)
     g_use_2bit = saved_use_2bit;
+    g_use_q3_outlier = saved_use_q3_outlier;
+    g_use_q3_experts = saved_use_q3_experts;
 }
 
 // ============================================================================
@@ -7906,6 +8251,7 @@ static void print_usage(const char *prog) {
     printf("  --freq               Enable expert frequency tracking + analysis\n");
     printf("  --cache-telemetry    Report cold vs eviction misses and reuse distance\n");
     printf("  --2bit               Use 2-bit quantized experts (packed_experts_2bit/)\n");
+    printf("  --q3-experts         Use hybrid Q3 streamed experts (packed_experts_Q3/)\n");
     printf("  --gpu-linear         Alias for the fused GPU delta-net path (default)\n");
     printf("  --predict            Enable temporal expert prediction (prefetch during CMD1_wait)\n");
     printf("  --collect-routing F  Log routing data to binary file F (for predictor training)\n");
@@ -7967,6 +8313,7 @@ int main(int argc, char **argv) {
             {"freq",          no_argument,       0, 'F'},
             {"cache-telemetry", no_argument,     0, 'E'},
             {"2bit",          no_argument,       0, '2'},
+            {"q3-experts",    no_argument,       0, '3'},
             {"gpu-linear",    no_argument,       0, 'G'},
             {"think-budget",  required_argument, 0, 'B'},
             {"serve",         required_argument, 0, 'R'},
@@ -7981,7 +8328,7 @@ int main(int argc, char **argv) {
         };
 
         int c;
-        while ((c = getopt_long(argc, argv, "m:w:j:I:A:N:J:K:U:V:Y:v:p:P:t:k:C:M:R:B:LSTFE2Gh", long_options, NULL)) != -1) {
+        while ((c = getopt_long(argc, argv, "m:w:j:I:A:N:J:K:U:V:Y:v:p:P:t:k:C:M:R:B:LSTFE23Gh", long_options, NULL)) != -1) {
             switch (c) {
                 case 'm': model_path = optarg; break;
                 case 'w': weights_path = optarg; break;
@@ -8007,6 +8354,7 @@ int main(int argc, char **argv) {
                 case 'F': g_freq_tracking = 1; break;
                 case 'E': g_cache_telemetry_enabled = 1; break;
                 case '2': g_use_2bit = 1; break;
+                case '3': g_use_q3_experts = 1; break;
                 case 'G': gpu_linear_attn_enabled = 1; break;
                 case 'D': g_pred_enabled = 1; break;
                 case 'Z':
@@ -8025,6 +8373,11 @@ int main(int argc, char **argv) {
                 case 'h': print_usage(argv[0]); return 0;
                 default:  print_usage(argv[0]); return 1;
             }
+        }
+
+        if (g_use_2bit && g_use_q3_experts) {
+            fprintf(stderr, "ERROR: --2bit and --q3-experts are mutually exclusive for now\n");
+            return 1;
         }
 
         // Build default paths — check <model_path>/ first, then legacy locations
@@ -8115,7 +8468,13 @@ int main(int argc, char **argv) {
             }
             printf("Vocab:    %s\n", vocab_path);
             printf("K:        %d experts/layer\n", K);
-            printf("Quant:    %s experts (%zu bytes each)\n", g_use_2bit ? "2-bit" : "4-bit", active_expert_size());
+            if (g_use_q3_experts) {
+                printf("Quant:    %s experts (59 GGUF IQ3/IQ4 layers + 1 GGUF outlier layer)\n",
+                       requested_expert_quant_label());
+            } else {
+                printf("Quant:    %s experts (%zu bytes each)\n",
+                       requested_expert_quant_label(), active_expert_size());
+            }
             printf("Linear:   %s\n", gpu_linear_attn_enabled ? "fused GPU delta-net" : "CPU/hybrid fallback");
             printf("Tokens:   %d\n", max_tokens);
             if (g_malloc_cache) {
@@ -8219,7 +8578,7 @@ int main(int argc, char **argv) {
         }
 
         // ---- Auto-detect 2-bit experts ----
-        if (!g_use_2bit) {
+        if (!g_use_2bit && !g_use_q3_experts) {
             char probe[1024];
             snprintf(probe, sizeof(probe), "%s/packed_experts_2bit/layer_00.bin", model_path);
             int pfd = open(probe, O_RDONLY);
@@ -8252,14 +8611,35 @@ int main(int argc, char **argv) {
         // Reset the global seen-expert bitset
         memset(g_expert_seen, 0, sizeof(g_expert_seen));
 
-        int layers_2bit = 0, layers_4bit = 0;
+        int layers_2bit = 0, layers_q3 = 0, layers_q3_outlier = 0, layers_4bit = 0;
         memset(g_layer_is_2bit, 0, sizeof(g_layer_is_2bit));
+        memset(g_layer_is_q3_hybrid, 0, sizeof(g_layer_is_q3_hybrid));
+        memset(g_layer_is_q3_outlier, 0, sizeof(g_layer_is_q3_outlier));
 
         for (int i = 0; i < NUM_LAYERS; i++) {
             char path[1024];
             layer_fds[i] = -1;
 
-            if (g_use_2bit) {
+            if (g_use_q3_experts) {
+                snprintf(path, sizeof(path), "%s/packed_experts_Q3/layer_%02d.bin", model_path, i);
+                layer_fds[i] = open(path, O_RDONLY);
+                if (layer_fds[i] >= 0) {
+                    if (i == Q3_OUTLIER_LAYER) {
+                        g_layer_is_q3_outlier[i] = 1;
+                        layers_q3_outlier++;
+                    } else {
+                        g_layer_is_q3_hybrid[i] = 1;
+                        layers_q3++;
+                    }
+                } else {
+                    snprintf(path, sizeof(path), "%s/packed_experts/layer_%02d.bin", model_path, i);
+                    layer_fds[i] = open(path, O_RDONLY);
+                    if (layer_fds[i] >= 0) {
+                        g_layer_is_q3_hybrid[i] = 0;
+                        layers_4bit++;
+                    }
+                }
+            } else if (g_use_2bit) {
                 // Try 2-bit first
                 snprintf(path, sizeof(path), "%s/packed_experts_2bit/layer_%02d.bin", model_path, i);
                 layer_fds[i] = open(path, O_RDONLY);
@@ -8303,7 +8683,17 @@ int main(int argc, char **argv) {
             }
         }
         printf("[experts] %d/%d packed layer files available (mmap'd)\n", expert_layers_available, NUM_LAYERS);
-        if (g_use_2bit && layers_4bit > 0) {
+        if (g_use_q3_experts && layers_4bit > 0) {
+            if (layers_q3_outlier > 0) {
+                printf("[mixed-quant] %d layers at Q3-GGUF, %d layers at Q3-outlier, %d layers at 4-bit\n",
+                       layers_q3, layers_q3_outlier, layers_4bit);
+            } else {
+                printf("[mixed-quant] %d layers at Q3-GGUF, %d layers at 4-bit\n", layers_q3, layers_4bit);
+            }
+        } else if (g_use_q3_experts && layers_q3_outlier > 0) {
+            printf("[mixed-quant] %d layers at Q3-GGUF, %d layers at Q3-outlier\n",
+                   layers_q3, layers_q3_outlier);
+        } else if (g_use_2bit && layers_4bit > 0) {
             printf("[mixed-quant] %d layers at 2-bit, %d layers at 4-bit\n", layers_2bit, layers_4bit);
         }
 
@@ -8311,7 +8701,7 @@ int main(int argc, char **argv) {
         {
             char lz4_probe[1024];
             snprintf(lz4_probe, sizeof(lz4_probe), "%s/packed_experts_lz4/layer_00.bin", model_path);
-            if (!g_use_2bit && access(lz4_probe, R_OK) == 0) {
+            if (!g_use_2bit && !g_use_q3_experts && access(lz4_probe, R_OK) == 0) {
                 int lz4_layers = 0;
                 for (int i = 0; i < NUM_LAYERS; i++) {
                     char lz4_path[1024];
@@ -8408,7 +8798,7 @@ int main(int argc, char **argv) {
             int num_eval = gt->count - 1;
             printf("=== Perplexity Evaluation ===\n");
             printf("Tokens: %d (scoring %d predictions)\n", gt->count, num_eval);
-            printf("Quant:  %s\n", g_use_2bit ? "2-bit" : "4-bit");
+            printf("Quant:  %s\n", requested_expert_quant_label());
 
             reset_delta_net_state();
             if (g_cache_telemetry_enabled) cache_telemetry_reset();
@@ -8473,7 +8863,7 @@ int main(int argc, char **argv) {
             printf("Perplexity:       %.2f\n", ppl);
             printf("Time:             %.1f s (%.2f tok/s)\n", elapsed_s,
                    tokens_scored / elapsed_s);
-            printf("Quant:            %s\n", g_use_2bit ? "2-bit" : "4-bit");
+            printf("Quant:            %s\n", requested_expert_quant_label());
 
             free(gt->ids); free(gt);
             free(hidden); free(logits);

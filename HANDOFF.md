@@ -4,7 +4,7 @@
 
 Made the inference engine self-contained — all model files can live in a single `--model` directory, and added a clean `--stream` output mode.
 
-For a user-facing setup guide, see [docs/model-download-and-convert.md](docs/model-download-and-convert.md).
+For the current user-facing setup guide, including base MLX export plus optional hybrid GGUF conversion and run commands, see [docs/model-download-and-convert.md](docs/model-download-and-convert.md).
 
 ## Changes
 

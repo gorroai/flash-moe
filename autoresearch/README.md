@@ -59,9 +59,12 @@ The current research mode is incremental hybridization:
 - preserve the original GGUF block size exactly
 - mirror the existing 2-bit mixed-quant workflow
 - use `packed_experts_Q3/` for new Q3 expert artifacts
+- keep extracted GGUF resident artifacts under `$FLASH_MOE_MODEL/gguf/`
 - start with always-resident tensors such as the LM head or persistent dense layers before streamed experts
 
 Use the local `llama.cpp` checkout only for metadata inspection and debugging. Do not load the full GGUF model into memory.
+
+Shared-expert GGUF conversion is not scripted yet. The implemented GGUF paths today are resident overlays plus routed streamed experts.
 
 Keep the bring-up notebook current in [docs/gguf-hybrid-bringup-log.md](/Users/anemll/SourceRelease/GITHUB/ML_playground/flash-moe-org/docs/gguf-hybrid-bringup-log.md), especially when the set of supported tensor types or the migration plan changes.
 
@@ -169,9 +172,9 @@ python3 autoresearch/extract_gguf_full_attn_overlay.py --roles q,k,v
 python3 autoresearch/extract_gguf_linear_overlay.py
 python3 autoresearch/extract_gguf_lm_head.py
 python3 autoresearch/extract_gguf_qkv_overlay.py
-python3 autoresearch/run_experiment.py --json --gguf-embedding autoresearch/gguf/embedding_q8_0.bin
-python3 autoresearch/run_experiment.py --json --gguf-embedding '' --gguf-lm-head '' --gguf-qkv-bin '' --gguf-qkv-json '' --gguf-full-attn-bin autoresearch/gguf/full_attn_qkv_only_q8_0.bin --gguf-full-attn-json autoresearch/gguf/full_attn_qkv_only_q8_0.json
-python3 autoresearch/run_experiment.py --json --gguf-embedding '' --gguf-lm-head '' --gguf-qkv-bin autoresearch/gguf/attn_qkv_q8_0.bin --gguf-qkv-json autoresearch/gguf/attn_qkv_q8_0.json
+python3 autoresearch/run_experiment.py --json --gguf-embedding "$FLASH_MOE_MODEL/gguf/embedding_q8_0.bin"
+python3 autoresearch/run_experiment.py --json --gguf-embedding '' --gguf-lm-head '' --gguf-qkv-bin '' --gguf-qkv-json '' --gguf-full-attn-bin "$FLASH_MOE_MODEL/gguf/full_attn_qkv_only_q8_0.bin" --gguf-full-attn-json "$FLASH_MOE_MODEL/gguf/full_attn_qkv_only_q8_0.json"
+python3 autoresearch/run_experiment.py --json --gguf-embedding '' --gguf-lm-head '' --gguf-qkv-bin "$FLASH_MOE_MODEL/gguf/attn_qkv_q8_0.bin" --gguf-qkv-json "$FLASH_MOE_MODEL/gguf/attn_qkv_q8_0.json"
 python3 autoresearch/sweep_gguf_tensors.py --tensor output.weight
 python3 autoresearch/sweep_gguf_tensors.py --tensor token_embd.weight
 python3 autoresearch/sweep_gguf_tensors.py --tensor blk.0.attn_qkv.weight

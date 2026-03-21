@@ -27,6 +27,7 @@
 
 #include <metal_stdlib>
 using namespace metal;
+#include "gguf_iq_shared.h"
 
 // ============================================================================
 // BFloat16 helpers
@@ -45,7 +46,7 @@ inline float f16_to_f32(ushort fp16_bits) {
 }
 
 #define GGUF_QK8_0 32
-#define GGUF_QK_K 256
+#define GGUF_QK_K FLASH_MOE_GGUF_QK_K
 #define GGUF_Q8_MAX_IN_DIM 8192
 
 struct GGUFBlockQ8_0 {
@@ -59,6 +60,296 @@ struct GGUFBlockQ6K {
     char  scales[GGUF_QK_K/16];
     ushort d;
 };
+
+static inline uchar2 flash_moe_get_scale_min_k4(uint j, device const uchar *q) {
+    return j < 4 ? uchar2{uchar(q[j] & 63), uchar(q[j + 4] & 63)}
+                 : uchar2{uchar((q[j + 4] & 0xF) | ((q[j - 4] >> 6) << 4)),
+                          uchar((q[j + 4] >> 4) | ((q[j - 0] >> 6) << 4))};
+}
+
+kernel void dequant_matvec_iq3_xxs(
+    device const GGUFBlockIQ3XXS* W [[buffer(0)]],
+    device const uint16_t*        unused_scales [[buffer(1)]],
+    device const uint16_t*        unused_biases [[buffer(2)]],
+    device const float*           x [[buffer(3)]],
+    device float*                 out [[buffer(4)]],
+    constant uint&                out_dim [[buffer(5)]],
+    constant uint&                in_dim [[buffer(6)]],
+    constant uint&                unused_group_size [[buffer(7)]],
+    threadgroup char*             shmem [[threadgroup(0)]],
+    uint                          tgid [[threadgroup_position_in_grid]],
+    ushort                        tiisg [[thread_index_in_simdgroup]],
+    ushort                        sgitg [[simdgroup_index_in_threadgroup]]
+) {
+    (void)unused_scales;
+    (void)unused_biases;
+    (void)unused_group_size;
+
+    constexpr ushort NR0 = 4;
+    constexpr ushort NSG = 2;
+
+    const uint first_row = (tgid * NSG + sgitg) * NR0;
+    if (first_row >= out_dim) return;
+
+    const uint blocks_per_row = in_dim / GGUF_QK_K;
+    const uint nb32_total = blocks_per_row * (GGUF_QK_K / 32);
+    device const GGUFBlockIQ3XXS* row_blocks = W + first_row * blocks_per_row;
+
+    threadgroup uint*  svalues = reinterpret_cast<threadgroup uint*>(shmem);
+    threadgroup uchar* ssigns  = reinterpret_cast<threadgroup uchar*>(svalues + 256);
+
+    const uint grid_pos = (32u * sgitg + tiisg) * 4u;
+    for (uint i = 0; i < 4; ++i) {
+        svalues[grid_pos + i] = flash_moe_iq3xxs_grid[grid_pos + i];
+    }
+    const uint sign_pos = (32u * sgitg + tiisg) * 2u;
+    for (uint i = 0; i < 2; ++i) {
+        ssigns[sign_pos + i] = flash_moe_ksigns_iq2xs[sign_pos + i];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float yl[32];
+    float sumf[NR0] = {0.0f, 0.0f, 0.0f, 0.0f};
+
+    device const float* x_block = x + 32 * tiisg;
+
+    for (uint ib32 = tiisg; ib32 < nb32_total; ib32 += 32) {
+        for (uint i = 0; i < 32; ++i) {
+            yl[i] = x_block[i];
+        }
+
+        const uint bi = ib32 / (GGUF_QK_K / 32);
+        const uint sub = ib32 % (GGUF_QK_K / 32);
+
+        device const GGUFBlockIQ3XXS* xr = row_blocks + bi;
+        for (ushort row = 0; row < NR0 && first_row + row < out_dim; ++row) {
+            device const GGUFBlockIQ3XXS& blk = xr[row * blocks_per_row];
+            device const uchar* q3 = blk.qs + 8 * sub;
+            device const ushort* gas = reinterpret_cast<device const ushort*>(blk.qs + GGUF_QK_K / 4) + 2 * sub;
+            const uint aux32 = uint(gas[0]) | (uint(gas[1]) << 16);
+            const float d = f16_to_f32(blk.d) * (0.5f + float(aux32 >> 28));
+
+            float2 sum = float2(0.0f);
+            for (uint l = 0; l < 4; ++l) {
+                const threadgroup uchar* grid1 = reinterpret_cast<threadgroup uchar*>(svalues + q3[2 * l + 0]);
+                const threadgroup uchar* grid2 = reinterpret_cast<threadgroup uchar*>(svalues + q3[2 * l + 1]);
+                const uchar signs = ssigns[(aux32 >> (7 * l)) & 127];
+
+                for (uint j = 0; j < 4; ++j) {
+                    sum[0] += yl[8 * l + j + 0] * float(grid1[j]) * ((signs & flash_moe_kmask_iq2xs[j + 0]) ? -1.0f : 1.0f);
+                    sum[1] += yl[8 * l + j + 4] * float(grid2[j]) * ((signs & flash_moe_kmask_iq2xs[j + 4]) ? -1.0f : 1.0f);
+                }
+            }
+            sumf[row] += d * (sum[0] + sum[1]);
+        }
+
+        x_block += 32 * 32;
+    }
+
+    for (ushort row = 0; row < NR0 && first_row + row < out_dim; ++row) {
+        const float sum = simd_sum(sumf[row]);
+        if (tiisg == 0) {
+            out[first_row + row] = sum * 0.5f;
+        }
+    }
+}
+
+kernel void dequant_matvec_iq4_xs(
+    device const GGUFBlockIQ4XS* W [[buffer(0)]],
+    device const uint16_t*       unused_scales [[buffer(1)]],
+    device const uint16_t*       unused_biases [[buffer(2)]],
+    device const float*          x [[buffer(3)]],
+    device float*                out [[buffer(4)]],
+    constant uint&               out_dim [[buffer(5)]],
+    constant uint&               in_dim [[buffer(6)]],
+    constant uint&               unused_group_size [[buffer(7)]],
+    threadgroup char*            shmem [[threadgroup(0)]],
+    uint                         tgid [[threadgroup_position_in_grid]],
+    ushort                       tiisg [[thread_index_in_simdgroup]],
+    ushort                       sgitg [[simdgroup_index_in_threadgroup]]
+) {
+    (void)unused_scales;
+    (void)unused_biases;
+    (void)unused_group_size;
+
+    constexpr ushort NR0 = 2;
+    constexpr ushort NSG = 2;
+
+    const uint first_row = (tgid * NSG + sgitg) * NR0;
+    if (first_row >= out_dim) return;
+
+    threadgroup float * shmem_f32 = reinterpret_cast<threadgroup float *>(shmem);
+    const uint blocks_per_row = in_dim / GGUF_QK_K;
+
+    const ushort ix = tiisg / 16;  // 0 or 1
+    const ushort it = tiisg % 16;  // 0..15
+    const ushort ib = it / 2;
+    const ushort il = it % 2;
+
+    shmem_f32[tiisg] = flash_moe_kvalues_iq4nl_f[tiisg % 16];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float4 yl[4];
+    float sumf[NR0] = {0.0f, 0.0f};
+    device const float * yb = x + ix * GGUF_QK_K + ib * 32 + il * 8;
+
+    uint2 aux32;
+    thread const uchar * q8 = reinterpret_cast<thread const uchar *>(&aux32);
+
+    for (uint bi = ix; bi < blocks_per_row; bi += 2) {
+        device const float4 * y4 = reinterpret_cast<device const float4 *>(yb);
+        yl[0] = y4[0];
+        yl[1] = y4[4];
+        yl[2] = y4[1];
+        yl[3] = y4[5];
+
+        for (ushort row = 0; row < NR0 && first_row + row < out_dim; ++row) {
+            device const GGUFBlockIQ4XS & blk = W[(first_row + row) * blocks_per_row + bi];
+            device const uint * q4 = reinterpret_cast<device const uint *>(blk.qs + 16 * ib + 8 * il);
+
+            float4 acc1 = float4(0.0f);
+            float4 acc2 = float4(0.0f);
+
+            aux32[0] = q4[0] & 0x0f0f0f0f;
+            aux32[1] = (q4[0] >> 4) & 0x0f0f0f0f;
+            float4 qf1 = float4(shmem_f32[q8[0]], shmem_f32[q8[1]], shmem_f32[q8[2]], shmem_f32[q8[3]]);
+            float4 qf2 = float4(shmem_f32[q8[4]], shmem_f32[q8[5]], shmem_f32[q8[6]], shmem_f32[q8[7]]);
+            acc1 += yl[0] * qf1;
+            acc2 += yl[1] * qf2;
+
+            aux32[0] = q4[1] & 0x0f0f0f0f;
+            aux32[1] = (q4[1] >> 4) & 0x0f0f0f0f;
+            qf1 = float4(shmem_f32[q8[0]], shmem_f32[q8[1]], shmem_f32[q8[2]], shmem_f32[q8[3]]);
+            qf2 = float4(shmem_f32[q8[4]], shmem_f32[q8[5]], shmem_f32[q8[6]], shmem_f32[q8[7]]);
+            acc1 += yl[2] * qf1;
+            acc2 += yl[3] * qf2;
+
+            acc1 += acc2;
+
+            const int ls = int((blk.scales_l[ib / 2] >> (4 * (ib % 2))) & 0xF) |
+                           (int((blk.scales_h >> (2 * ib)) & 0x3) << 4);
+            sumf[row] += f16_to_f32(blk.d) * float(ls - 32) *
+                         (acc1[0] + acc1[1] + acc1[2] + acc1[3]);
+        }
+
+        yb += 2 * GGUF_QK_K;
+    }
+
+    for (ushort row = 0; row < NR0 && first_row + row < out_dim; ++row) {
+        const float sum = simd_sum(sumf[row]);
+        if (tiisg == 0) {
+            out[first_row + row] = sum;
+        }
+    }
+}
+
+static inline uchar2 flash_moe_get_scale_min_k4_just2(uint j, device const uchar *q) {
+    if (j < 4) {
+        return uchar2{uchar(q[j + 0] & 63), uchar(q[j + 4] & 63)};
+    }
+    return uchar2{
+        uchar((q[j + 4] & 0xF) | ((q[j - 4] & 0xC0) >> 2)),
+        uchar((q[j + 4] >> 4) | ((q[j - 0] & 0xC0) >> 2))
+    };
+}
+
+kernel void dequant_matvec_q5_k(
+    device const GGUFBlockQ5K* W [[buffer(0)]],
+    device const uint16_t*     unused_scales [[buffer(1)]],
+    device const uint16_t*     unused_biases [[buffer(2)]],
+    device const float*        x [[buffer(3)]],
+    device float*              out [[buffer(4)]],
+    constant uint&             out_dim [[buffer(5)]],
+    constant uint&             in_dim [[buffer(6)]],
+    constant uint&             unused_group_size [[buffer(7)]],
+    uint                       tgid [[threadgroup_position_in_grid]],
+    ushort                     tiisg [[thread_index_in_simdgroup]],
+    ushort                     sgitg [[simdgroup_index_in_threadgroup]]
+) {
+    (void)unused_scales;
+    (void)unused_biases;
+    (void)unused_group_size;
+
+    constexpr ushort NSG = 2;
+
+    const uint row = tgid * NSG + sgitg;
+    if (row >= out_dim) return;
+
+    const uint blocks_per_row = in_dim / GGUF_QK_K;
+    device const GGUFBlockQ5K * row_blocks = W + row * blocks_per_row;
+
+    const short tid = tiisg / 4;
+    const short ix  = tiisg % 4;
+    const short iq  = tid / 4;
+    const short ir  = tid % 4;
+    const short l0  = 8 * ir;
+    const short q_offset = 32 * iq + l0;
+    const short y_offset = 64 * iq + l0;
+
+    const uchar hm1 = uchar(1u << (2 * iq));
+    const uchar hm2 = uchar(hm1 << 1);
+    const uchar hm3 = uchar(hm1 << 4);
+    const uchar hm4 = uchar(hm2 << 4);
+
+    uint16_t sc16[4];
+    thread const uchar * sc8 = reinterpret_cast<thread const uchar *>(sc16);
+    float sumf = 0.0f;
+    device const float * y1 = x + ix * GGUF_QK_K + y_offset;
+
+    for (uint bi = ix; bi < blocks_per_row; bi += 4) {
+        device const GGUFBlockQ5K &blk = row_blocks[bi];
+        device const uchar * q1 = blk.qs + q_offset;
+        device const uchar * qh = blk.qh + l0;
+        device const ushort * a = reinterpret_cast<device const ushort *>(blk.scales) + iq;
+
+        device const float * y2 = y1 + 128;
+        float4 sumy = float4(0.0f);
+        float yl[16];
+        float yh[16];
+        for (short l = 0; l < 8; ++l) {
+            yl[l + 0] = y1[l + 0];  sumy[0] += yl[l + 0];
+            yl[l + 8] = y1[l + 32]; sumy[1] += yl[l + 8];
+            yh[l + 0] = y2[l + 0];  sumy[2] += yh[l + 0];
+            yh[l + 8] = y2[l + 32]; sumy[3] += yh[l + 8];
+        }
+
+        sc16[0] = a[0] & 0x3f3f;
+        sc16[1] = a[2] & 0x3f3f;
+        sc16[2] = ((a[4] >> 0) & 0x0f0f) | ((a[0] & 0xc0c0) >> 2);
+        sc16[3] = ((a[4] >> 4) & 0x0f0f) | ((a[2] & 0xc0c0) >> 2);
+
+        float4 acc1 = {0.0f};
+        float4 acc2 = {0.0f};
+        device const uchar * q2 = q1 + 64;
+        for (short l = 0; l < 8; ++l) {
+            const uchar h = qh[l];
+            acc1[0] += yl[l + 0] * float(q1[l] & 0x0F);
+            acc1[1] += yl[l + 8] * float(q1[l] & 0xF0);
+            acc1[2] += yh[l + 0] * float(q2[l] & 0x0F);
+            acc1[3] += yh[l + 8] * float(q2[l] & 0xF0);
+            acc2[0] += (h & hm1) ? yl[l + 0] : 0.0f;
+            acc2[1] += (h & hm2) ? yl[l + 8] : 0.0f;
+            acc2[2] += (h & hm3) ? yh[l + 0] : 0.0f;
+            acc2[3] += (h & hm4) ? yh[l + 8] : 0.0f;
+        }
+
+        const float d = f16_to_f32(blk.d);
+        const float minv = f16_to_f32(blk.dmin);
+        sumf += d * (float(sc8[0]) * (acc1[0]         + 16.0f * acc2[0]) +
+                     float(sc8[1]) * (acc1[1] / 16.0f + 16.0f * acc2[1]) +
+                     float(sc8[4]) * (acc1[2]         + 16.0f * acc2[2]) +
+                     float(sc8[5]) * (acc1[3] / 16.0f + 16.0f * acc2[3])) -
+                minv * (sumy[0] * float(sc8[2]) + sumy[1] * float(sc8[3]) +
+                        sumy[2] * float(sc8[6]) + sumy[3] * float(sc8[7]));
+
+        y1 += 4 * GGUF_QK_K;
+    }
+
+    const float sum = simd_sum(sumf);
+    if (tiisg == 0) {
+        out[row] = sum;
+    }
+}
 
 
 // ============================================================================

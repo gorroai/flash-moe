@@ -19,16 +19,16 @@ The project notebook for this effort is:
 
 Update it whenever the GGUF plan, supported tensor types, or validation status changes in a meaningful way.
 
-## Hard Stop
+## Shared Experts
 
-Do not move to shared experts unless the human explicitly says to do so.
+The human has explicitly re-opened shared-expert optimization.
 
-- Do not attempt shared-expert overlays.
-- Do not prototype shared-expert kernels.
-- Do not switch the current experiment family toward shared experts.
-- Do not suggest or start shared-expert work just because other tasks are blocked or agents are idle.
-- Reason: shared experts involve multiple cache-related issues that must be addressed first.
-- Treat this as blocked work until the human explicitly re-opens it.
+- Shared-expert overlays are now allowed.
+- Shared-expert kernel work is now allowed.
+- Treat shared experts as their own experiment family and validate them separately from routed streamed experts.
+- Keep cache sensitivity in mind: shared-expert work can still interact with resident memory pressure and page-cache behavior.
+- Prefer small, isolated shared-expert experiments before broad rollouts.
+- Streamed routed experts are still a later step unless the human explicitly changes priorities again.
 
 ## Setup
 
@@ -92,6 +92,7 @@ Prefer changing only:
 - `metal_infer/shaders.metal`
 - `metal_infer/main.m`
 - `packed_experts_Q3/` layout tooling
+- shared-expert resident overlay or kernel tooling
 - new GGUF support files that directly serve hybrid quantization experiments
 
 Avoid editing the autoresearch harness itself unless the human explicitly asks for harness work.

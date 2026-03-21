@@ -706,3 +706,685 @@ Notes:
 - the chart uses measured checkpoints only
 - the embedding row is recorded as `embedding + LM head` because that is the checkpoint we actually measured
 - the stack rows are separated from the single-change rows so the per-change view stays honest
+
+### 2026-03-20 - Re-opened shared-expert optimization in the program
+
+Status: keep
+
+What changed:
+
+- `program.md` now explicitly allows shared-expert overlays and shared-expert kernel work
+- the old hard stop has been removed
+
+Constraints that still remain:
+
+- shared experts should be treated as their own experiment family
+- they should be validated separately from routed streamed experts
+- cache sensitivity still matters, so start with small isolated experiments instead of broad rollouts
+- streamed routed experts remain a later step unless the human changes priorities again
+
+### 2026-03-20 - First streamed Q3 hybrid expert bring-up
+
+Status: keep
+
+Scope:
+
+- routed expert `gate/up` only
+- exact GGUF `IQ3_XXS` bytes preserved for streamed `ffn_gate_exps` and `ffn_up_exps`
+- existing native 4-bit `down` bytes kept unchanged
+- layer `27` intentionally left on the 4-bit fallback path for now
+
+Implementation:
+
+- added `metal_infer/gguf_iq_shared.h` with vendored `IQ3_XXS` tables and block definitions from local `llama.cpp`
+- added GPU `IQ3_XXS` expert matvec support in `metal_infer/shaders.metal`
+- extended mixed-quant expert plumbing in `metal_infer/infer.m` with explicit `--q3-experts`
+- added `autoresearch/repack_experts_q3.py` to write `packed_experts_Q3/`
+
+Hybrid format:
+
+- `gate`: `IQ3_XXS`, `1,605,632` bytes per expert
+- `up`: `IQ3_XXS`, `1,605,632` bytes per expert
+- `down`: existing native 4-bit blob, `2,359,296` bytes per expert
+- total: `5,570,560` bytes per expert
+- versus current 4-bit expert blob `7,077,888` bytes:
+  - `21.3%` less streamed data per expert
+
+First artifact test:
+
+- command:
+  - `python3 autoresearch/repack_experts_q3.py --layer 0`
+- result:
+  - wrote `packed_experts_Q3/layer_00.bin`
+  - spot-check verification passed for experts `0`, `1`, `255`, and `511`
+
+First decode test:
+
+- command:
+  - `./metal_infer/infer --model /Users/anemll/Models/flash_mlx_4bit --q3-experts --prompt "What is Apple Neural Engine?" --tokens 24 --stream`
+- runtime state:
+  - `1` layer at `Q3-hybrid`, `59` layers at `4-bit`
+- output:
+  - sane answer
+  - decode `8.30 tok/s`
+  - prefill `3.57 tok/s`
+
+First short PPL:
+
+- command:
+  - `./metal_infer/infer --model /Users/anemll/Models/flash_mlx_4bit --q3-experts --ppl ppl_tokens.bin`
+- result with only `layer 00` in Q3-hybrid:
+  - cross-entropy `1.6907`
+  - PPL `5.42`
+  - throughput `8.09 tok/s`
+
+Five-layer widen check:
+
+- command:
+  - `python3 autoresearch/repack_experts_q3.py --layers 0-4`
+- decode result:
+  - `5` layers at `Q3-hybrid`, `55` layers at `4-bit`
+  - sane answer
+  - decode `6.85 tok/s`
+  - prefill `2.97 tok/s`
+- short PPL result:
+  - cross-entropy `1.6749`
+  - PPL `5.34`
+  - throughput `6.59 tok/s`
+
+Takeaway:
+
+- the first streamed `IQ3_XXS` hybrid path is decoding correctly
+- per-layer fallback is working as intended
+- next widening step should be more non-outlier layers, not new format work
+
+### 2026-03-20 - Streamed Q3 widen to 59 hybrid layers
+
+Status: keep
+
+Scope:
+
+- widened the streamed routed-expert path to all non-outlier layers
+- `59` layers use exact GGUF `IQ3_XXS` for `gate/up`
+- `1` layer (`27`) still falls back to the existing `4-bit` packed file
+
+Artifact state:
+
+- command:
+  - `python3 autoresearch/repack_experts_q3.py --layers 5-26,28-59`
+- result:
+  - `packed_experts_Q3/` now contains `59` streamed Q3-hybrid layer files
+  - `layer_27.bin` is intentionally absent in this checkpoint
+
+Validation:
+
+- smoke decode:
+  - command:
+    - `./metal_infer/infer --model /Users/anemll/Models/flash_mlx_4bit --q3-experts --prompt "What is Apple Neural Engine?" --tokens 24 --stream`
+  - runtime state:
+    - `59` layers at `Q3-hybrid`, `1` layer at `4-bit`
+  - result:
+    - sane answer
+    - decode `7.87 tok/s`
+    - prefill `3.24 tok/s`
+
+- short PPL:
+  - command:
+    - `./metal_infer/infer --model /Users/anemll/Models/flash_mlx_4bit --q3-experts --ppl ppl_tokens.bin`
+  - result:
+    - cross-entropy `1.7328`
+    - PPL `5.66`
+    - throughput `9.44 tok/s`
+
+- full 2k-token PPL:
+  - command:
+    - `./metal_infer/infer --model /Users/anemll/Models/flash_mlx_4bit --q3-experts --ppl ppl_tokens_2k.bin`
+  - result:
+    - cross-entropy `1.3253`
+    - PPL `3.76`
+    - throughput `8.96 tok/s`
+
+Takeaway:
+
+- the widened `59`-layer streamed hybrid path stays very close to the plain `4-bit` baseline on quality
+- the remaining missing piece is the `blk.27` outlier, not the main `IQ3_XXS` family
+
+### 2026-03-20 - Layer 27 streamed outlier support
+
+Status: keep
+
+Scope:
+
+- added explicit streamed outlier support for `blk.27`
+- preserved exact GGUF `IQ4_XS` bytes for streamed `ffn_gate_exps` and `ffn_up_exps`
+- kept `blk.27` `down` on the existing native `4-bit` bytes for this checkpoint
+- no caching model changes; still one packed file per layer and one expert read per selected expert
+
+Implementation:
+
+- extended `metal_infer/gguf_iq_shared.h` with exact `IQ4_XS` block definitions and lookup tables
+- added GPU `IQ4_XS` expert matvec support in `metal_infer/shaders.metal`
+- aligned the streamed outlier runtime path in `metal_infer/infer.m`
+- extended `autoresearch/repack_experts_q3.py` with `--include-outlier-layer`
+
+Artifact state:
+
+- command:
+  - `python3 autoresearch/repack_experts_q3.py --layer 27 --include-outlier-layer`
+- result:
+  - wrote `packed_experts_Q3/layer_27.bin`
+  - size `3.25 GiB`
+  - `packed_experts_Q3/` now covers all `60` layers
+
+Validation:
+
+- smoke decode:
+  - command:
+    - `./metal_infer/infer --model /Users/anemll/Models/flash_mlx_4bit --q3-experts --prompt "What is Apple Neural Engine?" --tokens 24 --stream`
+  - runtime state:
+    - `59` layers at `Q3-hybrid`, `1` layer at `Q3-outlier`
+  - result:
+    - sane answer
+    - decode `9.62 tok/s`
+    - prefill `3.27 tok/s`
+
+- short PPL:
+  - command:
+    - `./metal_infer/infer --model /Users/anemll/Models/flash_mlx_4bit --q3-experts --ppl ppl_tokens.bin`
+  - result:
+    - cross-entropy `1.7379`
+    - PPL `5.69`
+    - throughput `10.40 tok/s`
+
+- full 2k-token PPL:
+  - command:
+    - `./metal_infer/infer --model /Users/anemll/Models/flash_mlx_4bit --q3-experts --ppl ppl_tokens_2k.bin`
+  - result:
+    - cross-entropy `1.3313`
+    - PPL `3.79`
+    - throughput `10.01 tok/s`
+
+Comparison versus the previous `59`-layer checkpoint:
+
+- quality moved slightly worse:
+  - full PPL `3.76 -> 3.79`
+- throughput improved:
+  - full-PPL speed `8.96 -> 10.01 tok/s`
+
+Takeaway:
+
+- the full `60`-layer streamed Q3 path is decoding correctly
+- the `IQ4_XS` outlier does not break output quality or correctness
+- the next meaningful streamed step is `GGUF Q5_K` down support for `blk.27`, not more `IQ3_XXS` plumbing
+
+### 2026-03-20 - Layer 27 outlier revalidation and GPU-path check
+
+Status: keep CPU fallback, discard GPU outlier dispatch
+
+Corrections to the earlier layer-27 note:
+
+- `packed_experts_Q3/layer_27.bin` now stores exact GGUF bytes for all three routed projections:
+  - `ffn_gate_exps.weight` = `IQ4_XS`
+  - `ffn_up_exps.weight` = `IQ4_XS`
+  - `ffn_down_exps.weight` = `Q5_K`
+- the stable runtime configuration still keeps `layer 27` on the CPU expert path
+- the first attempt to run the outlier layer through the generic GPU multi-expert path was reverted after measurement
+
+Byte verification:
+
+- re-checked `layer_27.bin` directly against the GGUF source tensors for experts `0`, `1`, `2`, `255`, and `511`
+- all three stored projections matched exactly for every sampled expert
+- this ruled out repack/layout corruption and narrowed the question to runtime execution choices
+
+Kept validation (`--q3-experts`, CPU fallback for the outlier layer):
+
+- smoke decode:
+  - command:
+    - `./metal_infer/infer --model /Users/anemll/Models/flash_mlx_4bit --q3-experts --prompt "What is Apple Neural Engine?" --tokens 24 --stream`
+  - result:
+    - sane answer
+    - representative decode `6.11 tok/s`
+    - representative prefill `2.67 tok/s`
+
+- short PPL:
+  - command:
+    - `./metal_infer/infer --model /Users/anemll/Models/flash_mlx_4bit --q3-experts --ppl ppl_tokens.bin`
+  - result:
+    - cross-entropy `1.6888`
+    - PPL `5.41`
+    - throughput `6.52 tok/s`
+
+- full 2k-token PPL:
+  - command:
+    - `./metal_infer/infer --model /Users/anemll/Models/flash_mlx_4bit --q3-experts --ppl ppl_tokens_2k.bin`
+  - result:
+    - cross-entropy `1.3077`
+    - PPL `3.70`
+    - throughput `3.84 tok/s`
+
+Discarded follow-up:
+
+- change:
+  - removed the `!g_use_q3_outlier` guard in `metal_infer/infer.m` so `layer 27` would use the generic GPU multi-expert path
+- outcome:
+  - quality stayed the same on short PPL:
+    - cross-entropy `1.6888`
+    - PPL `5.41`
+  - speed got much worse:
+    - smoke decode `2.46 tok/s`
+    - smoke prefill `1.34 tok/s`
+    - short-PPL throughput `3.53 tok/s`
+- decision:
+  - reverted immediately
+
+Takeaway:
+
+- the on-disk `IQ4_XS/Q5_K` outlier format is correct
+- the current GPU outlier expert kernels are correctness-ready but not performance-ready for this streamed workload
+- keep the CPU fallback for `layer 27` until a faster GPU outlier path is proven
+
+### 2026-03-20 - IQ3 streamed expert launch tuning
+
+Status: keep
+
+Change:
+
+- switched the streamed expert `IQ3_XXS` path to a llama.cpp-style launch shape
+- kernel now uses:
+  - `64` threads per threadgroup
+  - `2` simdgroups per threadgroup
+  - `4` output rows per simdgroup
+  - threadgroup staging for the `iq3xxs_grid` and `ksigns` tables
+- runtime dispatch now applies the tuned launch only to streamed expert projections whose kind is `IQ3_XXS`
+- non-expert matvec paths and other quant types stayed on their previous launch geometry
+
+Implementation points:
+
+- `metal_infer/shaders.metal`
+  - `dequant_matvec_iq3_xxs`
+- `metal_infer/infer.m`
+  - `expert_threads_per_threadgroup`
+  - `expert_threadgroup_memory_length`
+  - `expert_dispatch_matvec`
+
+Validation:
+
+- smoke decode:
+  - command:
+    - `./metal_infer/infer --model /Users/anemll/Models/flash_mlx_4bit --q3-experts --prompt "What is Apple Neural Engine?" --tokens 24 --stream`
+  - result:
+    - sane answer
+    - decode `5.95 tok/s`
+    - prefill `2.06 tok/s`
+
+- short PPL:
+  - command:
+    - `./metal_infer/infer --model /Users/anemll/Models/flash_mlx_4bit --q3-experts --ppl ppl_tokens.bin`
+  - result:
+    - cross-entropy `1.6888`
+    - PPL `5.41`
+    - throughput `5.43 tok/s`
+
+- 200-token timing:
+  - command:
+    - `./metal_infer/infer --model /Users/anemll/Models/flash_mlx_4bit --q3-experts --prompt "What is Apple Neural Engine?" --tokens 200 --timing`
+  - result:
+    - generation `5.93 tok/s`
+    - dense/attn `44.2 ms/token`
+    - `o_proj+shared` `26.9 ms/token`
+    - expert I/O `42.4 ms/token`
+    - expert compute `51.7 ms/token`
+
+Comparison versus the previous streamed-Q3 timing checkpoint:
+
+- decode improved:
+  - `4.86 -> 5.93 tok/s`
+- expert I/O improved slightly:
+  - `47.0 -> 42.4 ms/token`
+- expert compute improved materially:
+  - `72.8 -> 51.7 ms/token`
+- short-PPL quality stayed unchanged:
+  - `5.41 -> 5.41`
+
+Reference 4-bit timing on the same 200-token prompt:
+
+- command:
+  - `./metal_infer/infer --model /Users/anemll/Models/flash_mlx_4bit --prompt "What is Apple Neural Engine?" --tokens 200 --timing`
+- result:
+  - generation `7.43 tok/s`
+  - expert I/O `53.3 ms/token`
+  - expert compute `2.4 ms/token`
+
+Takeaway:
+
+- the streamed `IQ3_XXS` path is now materially faster without changing quality
+- the remaining gap versus native `4-bit` is no longer primarily SSD I/O
+- the next likely speed limiter is the non-optimized outlier/runtime mix, especially the `layer 27` `IQ4_XS/Q5_K` path that still avoids the GPU fast path
+
+### 2026-03-20 - Layer-27 outlier GPU path (IQ4_XS gate/up + Q5_K down)
+
+Status: keep
+
+Change:
+
+- ported the layer-27 outlier kernels to a llama.cpp-style launch shape
+- `IQ4_XS` now runs with:
+  - `64` threads per threadgroup
+  - `2` simdgroups per threadgroup
+  - `2` output rows per simdgroup
+  - threadgroup lookup staging for the nonlinear value table
+- `Q5_K` now runs with:
+  - `64` threads per threadgroup
+  - `2` simdgroups per threadgroup
+  - `1` output row per simdgroup
+  - packed scale/min unpacking adapted from ggml
+- runtime dispatch now computes threadgroups by projection kind:
+  - `IQ3_XXS`: `8` rows per threadgroup
+  - `IQ4_XS`: `4` rows per threadgroup
+  - `Q5_K`: `2` rows per threadgroup
+- removed the `layer 27` GPU exclusion, so the outlier layer now runs through the normal GPU expert path
+
+Implementation points:
+
+- `metal_infer/shaders.metal`
+  - `dequant_matvec_iq4_xs`
+  - `dequant_matvec_q5_k`
+- `metal_infer/infer.m`
+  - `expert_threads_per_threadgroup`
+  - `expert_rows_per_threadgroup`
+  - `expert_threadgroup_memory_length`
+  - `expert_dispatch_matvec`
+  - routed expert GPU-path guard in the streamed expert path
+
+Validation:
+
+- smoke decode:
+  - command:
+    - `./metal_infer/infer --model /Users/anemll/Models/flash_mlx_4bit --q3-experts --prompt "What is Apple Neural Engine?" --tokens 24 --stream`
+  - result:
+    - sane answer
+    - decode `6.88 tok/s`
+    - prefill `3.74 tok/s`
+
+- short PPL:
+  - command:
+    - `./metal_infer/infer --model /Users/anemll/Models/flash_mlx_4bit --q3-experts --ppl ppl_tokens.bin`
+  - result:
+    - cross-entropy `1.6888`
+    - PPL `5.41`
+    - throughput `9.45 tok/s`
+
+- 200-token timing:
+  - command:
+    - `./metal_infer/infer --model /Users/anemll/Models/flash_mlx_4bit --q3-experts --prompt "What is Apple Neural Engine?" --tokens 200 --timing`
+  - result:
+    - generation `11.25 tok/s`
+    - dense/attn `31.3 ms/token`
+    - `o_proj+shared` `20.3 ms/token`
+    - expert I/O `33.6 ms/token`
+    - expert compute `1.3 ms/token`
+
+Comparison versus the previous streamed-Q3 checkpoint:
+
+- smoke decode improved:
+  - `5.34 -> 6.88 tok/s`
+- short-PPL throughput improved:
+  - `5.66 -> 9.45 tok/s`
+- 200-token generation improved:
+  - `5.87 -> 11.25 tok/s`
+- expert I/O improved:
+  - `43.2 -> 33.6 ms/token`
+- expert compute collapsed:
+  - `51.7 -> 1.3 ms/token`
+- short-PPL quality stayed unchanged:
+  - `5.41 -> 5.41`
+
+Takeaway:
+
+- the outlier layer was the main remaining performance drag in the streamed-Q3 path
+- once `IQ4_XS` and `Q5_K` moved onto the tuned GPU path, streamed Q3 became clearly faster than the current plain 4-bit baseline on this prompt family
+- the current Q3 path is now in a good place for longer-context and full-PPL follow-up measurements
+
+## 2026-03-20 21: Exact GGUF routed-expert migration completed
+
+Change:
+
+- finished the remaining routed expert repack so `packed_experts_Q3/` now contains all `60` layers in the new exact-GGUF layout
+- normal layers now use:
+  - `gate_proj.weight` = `IQ3_XXS`
+  - `up_proj.weight` = `IQ3_XXS`
+  - `down_proj.weight` = `IQ4_XS`
+- outlier layer `27` remains:
+  - `gate/up` = `IQ4_XS`
+  - `down` = `Q5_K`
+- updated the runtime label from `Q3-mixed` to `Q3-GGUF` so the output matches the actual finished layout
+
+Validation:
+
+- directory state:
+  - `packed_experts_Q3/` contains `60` layer files
+  - runtime reports:
+    - `59 layers at Q3-GGUF`
+    - `1 layer at Q3-outlier`
+    - `0 layers at 4-bit`
+
+- smoke decode:
+  - command:
+    - `./metal_infer/infer --model /Users/anemll/Models/flash_mlx_4bit --q3-experts --prompt "What is Apple Neural Engine?" --tokens 24 --stream`
+  - result:
+    - sane answer
+    - decode `7.02 tok/s`
+    - prefill `2.00 tok/s`
+
+- short PPL:
+  - command:
+    - `./metal_infer/infer --model /Users/anemll/Models/flash_mlx_4bit --q3-experts --ppl ppl_tokens.bin`
+  - result:
+    - cross-entropy `1.7227`
+    - PPL `5.60`
+    - throughput `10.21 tok/s`
+
+Comparison versus the prior partially migrated state:
+
+- partial state (`21` Q3-GGUF layers, `39` 4-bit fallback layers):
+  - short PPL `5.25`
+  - throughput `9.81 tok/s`
+- full exact-GGUF routed state:
+  - short PPL `5.60`
+  - throughput `10.21 tok/s`
+
+Takeaway:
+
+- the temporary native-4bit `down_proj` fallback is now fully gone from the routed expert path
+- full exact-GGUF routed experts are slightly faster on the short PPL pass than the partial rollout
+- quality moved back near the original 4-bit baseline (`5.51`), which means the exact-GGUF conversion is now the honest apples-to-apples streamed-expert measurement
+
+- full 2k-token PPL:
+  - command:
+    - `./metal_infer/infer --model /Users/anemll/Models/flash_mlx_4bit --q3-experts --ppl ppl_tokens_2k.bin`
+  - result:
+    - cross-entropy `1.3372`
+    - PPL `3.81`
+    - throughput `10.11 tok/s`
+
+Comparison versus the recorded plain 4-bit baseline:
+
+- full 2k PPL moved from `3.64` to `3.81`
+- full-PPL throughput improved from `8.58 tok/s` to `10.11 tok/s`
+
+## 2026-03-20 23: Artifact location and repack hygiene
+
+Decision:
+
+- GGUF-derived generated artifacts should live under the model directory:
+  - `/Users/anemll/Models/flash_mlx_4bit/gguf/`
+- repo-local `autoresearch/gguf` is now treated as a compatibility path, not the canonical storage location
+
+Notes:
+
+- `autoresearch/config.json` now points GGUF artifact outputs at the model-local directory by default
+- existing commands that still use `autoresearch/gguf/...` can keep working through a compatibility symlink
+
+Repack rule for `packed_experts_Q3/`:
+
+- if the on-disk Q3 layout has **not** changed and you are just regenerating the same format, you do **not** need to delete the old directory first
+- if the on-disk Q3 layout **has** changed, you should rebuild into an empty directory or delete/rename the old `packed_experts_Q3/` first
+- reason:
+  - stale layer files with the old layout keep the same names
+  - the runtime will still open them
+  - mixing old-format and new-format layer files is unsafe unless the fallback is intentionally to plain `packed_experts/`
+
+Current example of when cleanup was required:
+
+- moving from the temporary hybrid layout:
+  - `gate/up = IQ3_XXS`
+  - `down = native 4-bit`
+- to the final exact-GGUF layout:
+  - `gate = IQ3_XXS`
+  - `up = IQ3_XXS`
+  - `down = IQ4_XS`
+
+In that case, old `packed_experts_Q3/layer_XX.bin` files were incompatible and had to be replaced.
+
+## 2026-03-20 22: Clean serial timing rerun supersedes earlier noisy I/O read
+
+Context:
+
+- an earlier timing comparison suggested `Q3-GGUF` had higher expert I/O than plain `4-bit`
+- that comparison was contaminated by concurrent local testing on the same machine
+- reran the comparison cleanly, one inference at a time, alternating order:
+  - `4bit_a -> q3_a -> q3_b -> 4bit_b`
+
+Commands:
+
+- `./metal_infer/infer --model /Users/anemll/Models/flash_mlx_4bit --prompt "What is Apple Neural Engine?" --tokens 200 --timing`
+- `./metal_infer/infer --model /Users/anemll/Models/flash_mlx_4bit --q3-experts --prompt "What is Apple Neural Engine?" --tokens 200 --timing`
+
+Per-run results:
+
+- `4bit_a`
+  - expert I/O `49.0 ms`
+  - total/token `104.1 ms`
+  - generation `9.55 tok/s`
+  - TTFT `1569 ms`
+- `4bit_b`
+  - expert I/O `52.2 ms`
+  - total/token `106.2 ms`
+  - generation `9.36 tok/s`
+  - TTFT `1652 ms`
+- `q3_a`
+  - expert I/O `43.1 ms`
+  - total/token `95.5 ms`
+  - generation `10.39 tok/s`
+  - TTFT `1401 ms`
+- `q3_b`
+  - expert I/O `31.2 ms`
+  - total/token `83.2 ms`
+  - generation `11.91 tok/s`
+  - TTFT `2337 ms`
+
+Averages:
+
+- plain `4-bit`
+  - expert I/O `50.6 ms`
+  - total/token `105.15 ms`
+  - generation `9.46 tok/s`
+  - TTFT `1610.5 ms`
+- `Q3-GGUF`
+  - expert I/O `37.15 ms`
+  - total/token `89.35 ms`
+  - generation `11.15 tok/s`
+  - TTFT `1869.0 ms`
+
+Takeaway:
+
+- the earlier “Q3 has worse expert I/O” reading should be treated as invalid
+- on clean serial reruns, `Q3-GGUF` is faster on expert I/O and faster overall decode than plain `4-bit` for this prompt family
+- the main remaining caveat is TTFT variance, which still swings noticeably run to run
+- the working interpretation is now:
+  - `Q3-GGUF` improves steady-state decode throughput
+  - `Q3-GGUF` slightly worsens full 2k PPL versus plain `4-bit`
+  - TTFT remains noisy and should not be over-interpreted from one or two runs
+
+## 2026-03-20 24: Streamed Q3 and shared-expert SVG checkpoint
+
+Added a dedicated streamed-side snapshot:
+
+- `docs/gguf-q3-streamed-shared-checkpoint.svg`
+
+What it summarizes:
+
+- plain `4-bit` baseline
+- final routed `Q3-GGUF` expert path
+- `Q3-GGUF` experts plus GGUF `Q6_K` LM head
+- clean serial timing rerun averages for `4-bit` vs `Q3-GGUF`
+- current shared-expert status
+
+Key numbers captured in the SVG:
+
+- plain `4-bit`
+  - full 2k PPL `3.64`
+  - full-PPL throughput `8.58 tok/s`
+  - clean serial decode average `9.46 tok/s`
+  - clean serial expert I/O average `50.6 ms`
+- `Q3-GGUF` routed experts
+  - full 2k PPL `3.81`
+  - full-PPL throughput `10.11 tok/s`
+  - clean serial decode average `11.15 tok/s`
+  - clean serial expert I/O average `37.15 ms`
+- `Q3-GGUF` routed experts plus GGUF LM head
+  - full 2k PPL `3.79`
+  - full-PPL throughput `10.14 tok/s`
+
+Shared-expert status captured in the same SVG:
+
+- `blk.*.ffn_gate_shexp.weight`: `Q8_0 x59`, `BF16 x1`
+- `blk.*.ffn_up_shexp.weight`: `Q8_0 x59`, `BF16 x1`
+- `blk.*.ffn_down_shexp.weight`: `Q8_0 x59`, `BF16 x1`
+- status:
+  - not scripted yet
+  - should be handled as a separate experiment family from routed experts
+
+## 2026-03-20 25: Full PPL for the complete implemented GGUF stack
+
+Measured the full currently implemented GGUF stack in one run:
+
+- routed experts:
+  - `--q3-experts`
+- resident overlays:
+  - `--gguf-embedding`
+  - `--gguf-lm-head`
+  - `--gguf-qkv-bin/json`
+  - `--gguf-full-attn-bin/json`
+  - `--gguf-linear-bin/json`
+
+Command:
+
+- `./metal_infer/infer --model /Users/anemll/Models/flash_mlx_4bit --q3-experts --gguf-embedding /Users/anemll/Models/flash_mlx_4bit/gguf/embedding_q8_0.bin --gguf-lm-head /Users/anemll/Models/flash_mlx_4bit/gguf/lm_head_q6.bin --gguf-qkv-bin /Users/anemll/Models/flash_mlx_4bit/gguf/attn_qkv_q8_0.bin --gguf-qkv-json /Users/anemll/Models/flash_mlx_4bit/gguf/attn_qkv_q8_0.json --gguf-full-attn-bin /Users/anemll/Models/flash_mlx_4bit/gguf/full_attn_q8_0.bin --gguf-full-attn-json /Users/anemll/Models/flash_mlx_4bit/gguf/full_attn_q8_0.json --gguf-linear-bin /Users/anemll/Models/flash_mlx_4bit/gguf/linear_q8_0.bin --gguf-linear-json /Users/anemll/Models/flash_mlx_4bit/gguf/linear_q8_0.json --ppl /Users/anemll/SourceRelease/GITHUB/ML_playground/flash-moe-org/ppl_tokens_2k.bin`
+
+Result:
+
+- cross-entropy `1.2828`
+- PPL `3.61`
+- throughput `6.19 tok/s`
+- time `322.7 s`
+
+Comparison versus the recorded plain MLX 4-bit baseline:
+
+- plain `4-bit`
+  - full 2k PPL `3.64`
+  - full-PPL throughput `8.58 tok/s`
+- full implemented GGUF stack
+  - full 2k PPL `3.61`
+  - full-PPL throughput `6.19 tok/s`
+
+Takeaway:
+
+- the full implemented GGUF stack is now slightly better than the plain MLX 4-bit baseline on full PPL
+- the quality gain is small:
+  - `3.64 -> 3.61`
+- the full-stack path is still materially slower on the long PPL run:
+  - `8.58 -> 6.19 tok/s`
+- so the current best reading is:
+  - routed `Q3-GGUF` alone is the throughput-oriented path
+  - the full stacked GGUF configuration is the quality-oriented path among the currently implemented options
