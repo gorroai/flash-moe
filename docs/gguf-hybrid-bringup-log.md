@@ -1388,3 +1388,80 @@ Takeaway:
 - so the current best reading is:
   - routed `Q3-GGUF` alone is the throughput-oriented path
   - the full stacked GGUF configuration is the quality-oriented path among the currently implemented options
+
+## 2026-03-20 26: Experimental cache fanout flag for routed expert I/O
+
+Added a new experimental inference flag:
+
+- `--cache-io-split N`
+
+Credit:
+
+- inspired by Daniel Pacary's "rustane" cached-read fanout experiments
+- reference repo: [ncdrone/rustane](https://github.com/ncdrone/rustane)
+- this Flash-MoE implementation keeps the existing Objective-C/C + Metal pipeline and only changes the routed expert async `pread()` fanout
+
+Purpose:
+
+- split each routed expert `pread()` into `N` page-aligned chunks
+- force higher cached-read fanout through the existing async routed-expert load path
+- test whether a more aggressive page-cache workflow improves end-to-end inference on Apple Silicon
+
+Measurement machine:
+
+- MacBook Pro, Apple M5 Max
+
+Important scope:
+
+- only affects the async routed-expert load path
+- does not change quantization
+- does not change expert file format
+- does not add a custom cache
+- keeps the current “trust the OS page cache” model
+
+Implementation notes:
+
+- split size is page-aligned on `16 KiB` boundaries
+- requested split is clamped to `[1, 8]`
+- default `1` preserves old behavior
+- active mode now prints:
+  - `[tiered-io] Experimental cache fanout: split routed expert preads into N page-aligned chunks`
+
+Clean warm-cache timing sweep, `Q3-GGUF` routed experts only, `200` tokens:
+
+| Split | Decode tok/s | Expert I/O ms | Expert compute ms | Total ms/token | TTFT ms |
+|---|---:|---:|---:|---:|---:|
+| `1` | `11.04` | `36.1` | `1.5` | `89.9` | `2617` |
+| `2` | `12.07` | `29.0` | `1.5` | `82.2` | `1709` |
+| `4` | `13.33` | `25.6` | `1.3` | `74.4` | `1531` |
+| `8` | `12.04` | `27.3` | `1.6` | `82.3` | `1541` |
+
+Best point in this sweep:
+
+- `--cache-io-split 4`
+
+Plain 4-bit comparison, `200` tokens:
+
+| Split | Decode tok/s | Expert I/O ms | Total ms/token |
+|---|---:|---:|---:|
+| `1` | `9.34` | `46.8` | `106.3` |
+| `4` | `10.93` | `32.9` | `90.7` |
+
+All currently implemented GGUF files, `200` tokens:
+
+| Split | Decode tok/s | Expert I/O ms | Expert compute ms | Total ms/token | TTFT ms |
+|---|---:|---:|---:|---:|---:|
+| `1` | `7.39` | `40.5` | `23.9` | `134.1` | `2323` |
+| `4` | `7.95` | `31.2` | `23.2` | `124.5` | `2660` |
+
+Takeaway:
+
+- the new fanout flag improves routed-expert load stall on this M5 Max
+- the best tested setting is `4`
+- the win is not limited to `Q3-GGUF`; plain `4-bit` also benefits
+- this is now worth keeping as an experimental tuning knob
+
+Dedicated report:
+
+- `docs/cache-io-split-experiment.md`
+- `docs/cache-io-split-results.md`

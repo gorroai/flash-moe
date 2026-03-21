@@ -264,6 +264,7 @@ static int g_layer_is_q3_hybrid[NUM_LAYERS];  // per-layer quant: 1=Q3 hybrid, 0
 static int g_use_q3_outlier = 0;  // active layer override: exact layer-27 IQ4_XS gate/up + Q5_K down
 static int g_layer_is_q3_outlier[NUM_LAYERS];
 static int g_cache_telemetry_enabled = 0;  // enabled by --cache-telemetry flag
+static int g_cache_io_split = 1;  // enabled by --cache-io-split N: split each routed expert pread into N page-aligned chunks
 static int g_think_budget = 2048; // max thinking tokens before force-emitting </think>
 static int g_stream_mode = 0;    // --stream: clean output only, no progress/stats
 static int g_nax_disabled = 1;   // NAX disabled by default (slower for M=1 decode); --nax to enable
@@ -4694,9 +4695,29 @@ static void io_pool_dispatch(InferPreadTask *tasks, int num_tasks) {
 // Starts pread on background GCD threads immediately after routing.
 // The pread overlaps with shared expert prep + next layer's CMD1+attn+CMD2.
 // Wait for completion right before CMD3 needs the expert data.
+#define MAX_CACHE_IO_SPLIT 8
+
+static inline int active_cache_io_split(size_t esz) {
+    int chunks = g_cache_io_split;
+    if (chunks < 1) chunks = 1;
+    if (chunks > MAX_CACHE_IO_SPLIT) chunks = MAX_CACHE_IO_SPLIT;
+
+    // Expert blobs are page-cache-backed. Keep chunk boundaries page aligned
+    // so the experimental fanout mode still matches the underlying VM layout.
+    const size_t page_bytes = 16 * 1024;
+    if (esz == 0 || (esz % page_bytes) != 0) return 1;
+
+    size_t pages = esz / page_bytes;
+    if ((size_t)chunks > pages) chunks = (int)pages;
+    if (chunks < 1) chunks = 1;
+    return chunks;
+}
+
 typedef struct {
-    InferPreadTask tasks[MAX_K];
+    InferPreadTask tasks[MAX_K * MAX_CACHE_IO_SPLIT];
     int num_tasks;
+    int num_experts;
+    int chunks_per_expert;
     int valid[MAX_K];
     dispatch_group_t group;
     int active;
@@ -4705,24 +4726,49 @@ static AsyncPreadState g_async_pread = {0};
 
 static void async_pread_start(int packed_fd, int *expert_indices, int K,
                                id<MTLBuffer> __strong *dst_bufs, const void *mmap_base) {
+    (void)mmap_base;
     size_t esz = active_expert_size();
-    g_async_pread.num_tasks = K;
+    int chunks = active_cache_io_split(esz);
+    const size_t page_bytes = 16 * 1024;
+    size_t total_pages = (chunks > 1) ? (esz / page_bytes) : 0;
+
+    g_async_pread.num_experts = K;
+    g_async_pread.chunks_per_expert = chunks;
+    g_async_pread.num_tasks = K * chunks;
     g_async_pread.active = 1;
     if (!g_async_pread.group) g_async_pread.group = dispatch_group_create();
 
     for (int k = 0; k < K; k++) {
-        g_async_pread.tasks[k].fd = packed_fd;
-        g_async_pread.tasks[k].dst = [dst_bufs[k] contents];
-        g_async_pread.tasks[k].offset = (off_t)expert_indices[k] * esz;
-        g_async_pread.tasks[k].size = esz;
-        g_async_pread.tasks[k].result = 0;
+        char *dst_base = (char *)[dst_bufs[k] contents];
+        size_t page_cursor = 0;
+        for (int c = 0; c < chunks; c++) {
+            size_t chunk_off = 0;
+            size_t chunk_sz = esz;
+            if (chunks > 1) {
+                size_t pages_this_chunk = total_pages / (size_t)chunks;
+                if ((size_t)c < (total_pages % (size_t)chunks)) pages_this_chunk++;
+                chunk_off = page_cursor * page_bytes;
+                chunk_sz = pages_this_chunk * page_bytes;
+                page_cursor += pages_this_chunk;
+            }
+
+            int task_idx = k * chunks + c;
+            g_async_pread.tasks[task_idx].fd = packed_fd;
+            g_async_pread.tasks[task_idx].dst = dst_base + chunk_off;
+            g_async_pread.tasks[task_idx].offset = (off_t)expert_indices[k] * esz + (off_t)chunk_off;
+            g_async_pread.tasks[task_idx].size = chunk_sz;
+            g_async_pread.tasks[task_idx].result = 0;
+            g_async_pread.tasks[task_idx].mmap_base = NULL;
+            g_async_pread.tasks[task_idx].lz4_comp_buf = NULL;
+            g_async_pread.tasks[task_idx].lz4_comp_size = 0;
+        }
     }
 
     // Fire off parallel preads on GCD — returns immediately
     static dispatch_queue_t io_q = NULL;
     if (!io_q) io_q = dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0);
-    for (int k = 0; k < K; k++) {
-        InferPreadTask *t = &g_async_pread.tasks[k];
+    for (int i = 0; i < g_async_pread.num_tasks; i++) {
+        InferPreadTask *t = &g_async_pread.tasks[i];
         dispatch_group_async(g_async_pread.group, io_q, ^{
             t->result = pread(t->fd, t->dst, t->size, t->offset);
         });
@@ -4732,8 +4778,16 @@ static void async_pread_start(int packed_fd, int *expert_indices, int K,
 static void async_pread_wait(void) {
     if (!g_async_pread.active) return;
     dispatch_group_wait(g_async_pread.group, DISPATCH_TIME_FOREVER);
-    for (int k = 0; k < g_async_pread.num_tasks; k++) {
-        g_async_pread.valid[k] = (g_async_pread.tasks[k].result == (ssize_t)active_expert_size());
+    size_t esz = active_expert_size();
+    for (int k = 0; k < g_async_pread.num_experts; k++) {
+        ssize_t total = 0;
+        for (int c = 0; c < g_async_pread.chunks_per_expert; c++) {
+            int task_idx = k * g_async_pread.chunks_per_expert + c;
+            if (g_async_pread.tasks[task_idx].result > 0) {
+                total += g_async_pread.tasks[task_idx].result;
+            }
+        }
+        g_async_pread.valid[k] = (total == (ssize_t)esz);
     }
     g_async_pread.active = 0;
 }
@@ -8250,6 +8304,7 @@ static void print_usage(const char *prog) {
     printf("  --timing             Enable per-layer timing breakdown\n");
     printf("  --freq               Enable expert frequency tracking + analysis\n");
     printf("  --cache-telemetry    Report cold vs eviction misses and reuse distance\n");
+    printf("  --cache-io-split N   Experimental: split each routed expert pread into N page-aligned chunks\n");
     printf("  --2bit               Use 2-bit quantized experts (packed_experts_2bit/)\n");
     printf("  --q3-experts         Use hybrid Q3 streamed experts (packed_experts_Q3/)\n");
     printf("  --gpu-linear         Alias for the fused GPU delta-net path (default)\n");
@@ -8312,6 +8367,7 @@ int main(int argc, char **argv) {
             {"timing",        no_argument,       0, 'T'},
             {"freq",          no_argument,       0, 'F'},
             {"cache-telemetry", no_argument,     0, 'E'},
+            {"cache-io-split", required_argument, 0, 'W'},
             {"2bit",          no_argument,       0, '2'},
             {"q3-experts",    no_argument,       0, '3'},
             {"gpu-linear",    no_argument,       0, 'G'},
@@ -8328,7 +8384,7 @@ int main(int argc, char **argv) {
         };
 
         int c;
-        while ((c = getopt_long(argc, argv, "m:w:j:I:A:N:J:K:U:V:Y:v:p:P:t:k:C:M:R:B:LSTFE23Gh", long_options, NULL)) != -1) {
+        while ((c = getopt_long(argc, argv, "m:w:j:I:A:N:J:K:U:V:Y:v:p:P:t:k:C:M:R:B:LSTFEW:23Gh", long_options, NULL)) != -1) {
             switch (c) {
                 case 'm': model_path = optarg; break;
                 case 'w': weights_path = optarg; break;
@@ -8353,6 +8409,7 @@ int main(int argc, char **argv) {
                 case 'T': g_timing_enabled = 1; break;
                 case 'F': g_freq_tracking = 1; break;
                 case 'E': g_cache_telemetry_enabled = 1; break;
+                case 'W': g_cache_io_split = atoi(optarg); break;
                 case '2': g_use_2bit = 1; break;
                 case '3': g_use_q3_experts = 1; break;
                 case 'G': gpu_linear_attn_enabled = 1; break;
@@ -8741,6 +8798,10 @@ int main(int argc, char **argv) {
         g_layer_fds_cold = layer_fds_cold;
         if (!g_use_lz4)
             printf("[tiered-io] Cold fds (F_NOCACHE) + warm fds (page cached) active\n");
+        if (g_cache_io_split > 1) {
+            printf("[tiered-io] Experimental cache fanout: split routed expert preads into %d page-aligned chunks\n",
+                   active_cache_io_split(active_expert_size()));
+        }
 
         // Warm page cache hint
         if (expert_layers_available > 0) {

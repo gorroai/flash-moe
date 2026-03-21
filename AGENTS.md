@@ -92,6 +92,9 @@ make
 
 # Per-layer timing breakdown
 ./infer --prompt "Hello" --tokens 20 --timing
+
+# Experimental: fan out routed expert preads across page-aligned chunks
+./infer --prompt "Hello" --tokens 200 --timing --cache-io-split 4
 ```
 
 ## Project Structure

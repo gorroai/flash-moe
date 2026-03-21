@@ -232,10 +232,31 @@ Timing:
 ./metal_infer/infer --model "$OUT" --prompt "What is Apple Neural Engine?" --tokens 200 --timing
 ```
 
+Experimental cached-read fanout:
+
+```bash
+./metal_infer/infer --model "$OUT" --prompt "What is Apple Neural Engine?" --tokens 200 --timing --cache-io-split 4
+```
+
+Notes:
+
+- `--cache-io-split N` is an experimental routed-expert I/O flag
+- best current tested value is `4`
+- the current measured win was on an `M5 Max`
+- it only changes how routed expert `pread()` work is fanned out; it does not change quantization or file format
+- this experiment was inspired by Daniel Pacary's "rustane" cached-read fanout work: [ncdrone/rustane](https://github.com/ncdrone/rustane)
+
 Full PPL:
 
 ```bash
 ./metal_infer/infer --model "$OUT" --ppl "$REPO/ppl_tokens_2k.bin"
+```
+
+The same flag works with expert variants too:
+
+```bash
+./metal_infer/infer --model "$OUT" --2bit --cache-io-split 4 --prompt "What is Apple Neural Engine?" --tokens 200 --timing
+./metal_infer/infer --model "$OUT" --q3-experts --cache-io-split 4 --prompt "What is Apple Neural Engine?" --tokens 200 --timing
 ```
 
 ## Step 9: Sweep The GGUF Metadata
