@@ -1,0 +1,53 @@
+{
+  "mode": "hybrid_gguf",
+  "model": "~/Models/flash_mlx_4bit",
+  "gguf_source": "/Users/anemll/Models/Qwen3.5/Qwen3.5-397B-A17B-GGUF-UD-Q3_K_XL/Qwen3.5-397B-A17B-UD-Q3_K_XL-00001-of-00005.gguf",
+  "llama_cpp_root": "/Users/anemll/SourceRelease/GITHUB/ML_playground/llama.cpp",
+  "gguf_metadata_only": true,
+  "gguf_embedding_bin": "autoresearch/gguf/embedding_q8_0.bin",
+  "gguf_embedding_meta": "autoresearch/gguf/embedding_q8_0.json",
+  "gguf_full_attn_bin": "autoresearch/gguf/full_attn_q8_0.bin",
+  "gguf_full_attn_json": "autoresearch/gguf/full_attn_q8_0.json",
+  "gguf_lm_head_bin": "autoresearch/gguf/lm_head_q6.bin",
+  "gguf_lm_head_meta": "autoresearch/gguf/lm_head_q6.json",
+  "gguf_full_attn_overlay_bin": "autoresearch/gguf/full_attn_q8_0.bin",
+  "gguf_full_attn_overlay_json": "autoresearch/gguf/full_attn_q8_0.json",
+  "gguf_qkv_overlay_bin": "autoresearch/gguf/attn_qkv_q8_0.bin",
+  "gguf_qkv_overlay_json": "autoresearch/gguf/attn_qkv_q8_0.json",
+  "gguf_linear_bin": "autoresearch/gguf/linear_q8_0.bin",
+  "gguf_linear_json": "autoresearch/gguf/linear_q8_0.json",
+  "packed_experts_q3_dir": "packed_experts_Q3",
+  "gguf_sweep_markdown": "docs/gguf-q3-tensor-sweep.md",
+  "gguf_sweep_json": "autoresearch/gguf/q3-tensor-inventory.json",
+  "test_pattern": "mirror_2bit_mixed_quant",
+  "baseline_result": "autoresearch/baselines/4bit-short.json",
+  "prompt": "Explain quantum computing in one concise paragraph.",
+  "gen_tokens": 64,
+  "short_ppl_tokens": "ppl_tokens.bin",
+  "full_ppl_tokens": "ppl_tokens_2k.bin",
+  "short_ppl_max": 5.75,
+  "full_ppl_max": 5.75,
+  "periodic_full_check_every_keeps": 5,
+  "priority_targets": [
+    "lm_head first",
+    "persistent dense tensors before streamed experts",
+    "shared or always-resident dense layers before routed experts",
+    "one tensor or one layer family at a time"
+  ],
+  "gguf_quant_types": {
+    "Q8_0": 32,
+    "Q6_K": 256,
+    "Q5_K": 256,
+    "IQ4_XS": 256,
+    "IQ3_XXS": 256
+  },
+  "rules": [
+    "preserve GGUF block size exactly",
+    "do not mass-convert many layers at once",
+    "treat hybrid testing like the existing 2-bit mixed-quant workflow",
+    "use packed_experts_Q3 for new Q3 expert artifacts",
+    "do not load the full GGUF model into memory",
+    "run short PPL and a generation smoke test on every experiment",
+    "run periodic full PPL checks against the 4-bit baseline"
+  ]
+}

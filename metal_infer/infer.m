@@ -83,6 +83,8 @@
 #define FULL_ATTN_INTERVAL  4
 #define GROUP_SIZE          64
 #define BITS                4
+#define GGUF_QK8_0          32
+#define GGUF_QK_K           256
 
 // Linear attention (GatedDeltaNet) constants
 #define LINEAR_NUM_V_HEADS  64
@@ -126,6 +128,22 @@
 
 #define MODEL_PATH_DEFAULT "/Users/danielwoods/.cache/huggingface/hub/models--mlx-community--Qwen3.5-397B-A17B-4bit/snapshots/39159bd8aa74f5c8446d2b2dc584f62bb51cb0d3"
 
+typedef struct {
+    uint16_t d;  // fp16
+    int8_t   qs[GGUF_QK8_0];
+} GGUFBlockQ8_0;
+
+_Static_assert(sizeof(GGUFBlockQ8_0) == 34, "GGUF Q8_0 block size must stay exact");
+
+typedef struct {
+    uint8_t  ql[GGUF_QK_K/2];
+    uint8_t  qh[GGUF_QK_K/4];
+    int8_t   scales[GGUF_QK_K/16];
+    uint16_t d;  // fp16
+} GGUFBlockQ6K;
+
+_Static_assert(sizeof(GGUFBlockQ6K) == 210, "GGUF Q6_K block size must stay exact");
+
 // ============================================================================
 // Timing helper
 // ============================================================================
@@ -134,6 +152,19 @@ static double now_ms(void) {
     struct timeval tv;
     gettimeofday(&tv, NULL);
     return tv.tv_sec * 1000.0 + tv.tv_usec / 1000.0;
+}
+
+static void format_eta(double eta_s, char *buf, size_t buf_size) {
+    if (eta_s < 0) eta_s = 0;
+    int total = (int)(eta_s + 0.5);
+    int hours = total / 3600;
+    int minutes = (total % 3600) / 60;
+    int seconds = total % 60;
+    if (hours > 0) {
+        snprintf(buf, buf_size, "%d:%02d:%02d", hours, minutes, seconds);
+    } else {
+        snprintf(buf, buf_size, "%02d:%02d", minutes, seconds);
+    }
 }
 
 // ============================================================================
@@ -437,6 +468,12 @@ static float bf16_to_f32(uint16_t bf16) {
     return f;
 }
 
+static float f16_to_f32(uint16_t fp16_bits) {
+    __fp16 h;
+    memcpy(&h, &fp16_bits, sizeof(h));
+    return (float)h;
+}
+
 __attribute__((unused))
 static uint16_t f32_to_bf16(float f) {
     uint32_t bits;
@@ -576,6 +613,28 @@ typedef struct {
     void *data;
     size_t size;
     TensorManifest *manifest;
+    void *gguf_embedding_data;
+    size_t gguf_embedding_size;
+    char *gguf_embedding_path;
+    void *gguf_full_attn_data;
+    size_t gguf_full_attn_size;
+    char *gguf_full_attn_path;
+    void *gguf_full_attn_q_layers[NUM_LAYERS];
+    void *gguf_full_attn_k_layers[NUM_LAYERS];
+    void *gguf_full_attn_v_layers[NUM_LAYERS];
+    void *gguf_full_attn_o_layers[NUM_LAYERS];
+    void *gguf_qkv_data;
+    size_t gguf_qkv_size;
+    char *gguf_qkv_path;
+    void *gguf_qkv_layers[NUM_LAYERS];
+    void *gguf_linear_data;
+    size_t gguf_linear_size;
+    char *gguf_linear_path;
+    void *gguf_linear_z_layers[NUM_LAYERS];
+    void *gguf_linear_out_layers[NUM_LAYERS];
+    void *gguf_lm_head_data;
+    size_t gguf_lm_head_size;
+    char *gguf_lm_head_path;
 } WeightFile;
 
 static WeightFile *open_weights(const char *bin_path, const char *json_path) {
@@ -626,6 +685,444 @@ static void *get_tensor_ptr(WeightFile *wf, const char *name) {
 
 static TensorInfo *get_tensor_info(WeightFile *wf, const char *name) {
     return find_tensor(wf->manifest, name);
+}
+
+static int attach_gguf_embedding(WeightFile *wf, const char *bin_path) {
+    if (!bin_path || !*bin_path) {
+        return 1;
+    }
+
+    int fd = open(bin_path, O_RDONLY);
+    if (fd < 0) {
+        fprintf(stderr, "ERROR: Cannot open GGUF embedding %s: %s\n", bin_path, strerror(errno));
+        return 0;
+    }
+
+    struct stat st;
+    if (fstat(fd, &st) != 0) {
+        fprintf(stderr, "ERROR: Cannot stat GGUF embedding %s: %s\n", bin_path, strerror(errno));
+        close(fd);
+        return 0;
+    }
+
+    const size_t expected_size = (size_t)VOCAB_SIZE * (HIDDEN_DIM / GGUF_QK8_0) * sizeof(GGUFBlockQ8_0);
+    if ((size_t)st.st_size != expected_size) {
+        fprintf(stderr,
+                "ERROR: GGUF embedding size mismatch for %s: got %zu bytes, expected %zu bytes\n",
+                bin_path, (size_t)st.st_size, expected_size);
+        close(fd);
+        return 0;
+    }
+
+    void *data = mmap(NULL, (size_t)st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
+    close(fd);
+    if (data == MAP_FAILED) {
+        fprintf(stderr, "ERROR: mmap failed for GGUF embedding %s: %s\n", bin_path, strerror(errno));
+        return 0;
+    }
+
+    madvise(data, (size_t)st.st_size, MADV_RANDOM);
+    wf->gguf_embedding_data = data;
+    wf->gguf_embedding_size = (size_t)st.st_size;
+    wf->gguf_embedding_path = strdup(bin_path);
+
+    printf("[embedding] Using GGUF Q8_0 embedding from %s (%.2f GB)\n",
+           bin_path, wf->gguf_embedding_size / 1e9);
+    return 1;
+}
+
+static int attach_gguf_full_attn_overlay(WeightFile *wf, const char *bin_path, const char *json_path) {
+    if (!bin_path || !*bin_path) {
+        return 1;
+    }
+    if (!json_path || !*json_path) {
+        fprintf(stderr, "ERROR: GGUF full-attn overlay requires both --gguf-full-attn-bin and --gguf-full-attn-json\n");
+        return 0;
+    }
+
+    int fd = open(bin_path, O_RDONLY);
+    if (fd < 0) {
+        fprintf(stderr, "ERROR: Cannot open GGUF full-attn overlay %s: %s\n", bin_path, strerror(errno));
+        return 0;
+    }
+
+    struct stat st;
+    if (fstat(fd, &st) != 0) {
+        fprintf(stderr, "ERROR: Cannot stat GGUF full-attn overlay %s: %s\n", bin_path, strerror(errno));
+        close(fd);
+        return 0;
+    }
+
+    void *data = mmap(NULL, (size_t)st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
+    close(fd);
+    if (data == MAP_FAILED) {
+        fprintf(stderr, "ERROR: mmap failed for GGUF full-attn overlay %s: %s\n", bin_path, strerror(errno));
+        return 0;
+    }
+
+    memset(wf->gguf_full_attn_q_layers, 0, sizeof(wf->gguf_full_attn_q_layers));
+    memset(wf->gguf_full_attn_k_layers, 0, sizeof(wf->gguf_full_attn_k_layers));
+    memset(wf->gguf_full_attn_v_layers, 0, sizeof(wf->gguf_full_attn_v_layers));
+    memset(wf->gguf_full_attn_o_layers, 0, sizeof(wf->gguf_full_attn_o_layers));
+
+    @autoreleasepool {
+        NSData *json_data = [NSData dataWithContentsOfFile:[NSString stringWithUTF8String:json_path]];
+        if (!json_data) {
+            fprintf(stderr, "ERROR: Cannot read GGUF full-attn overlay manifest %s\n", json_path);
+            munmap(data, (size_t)st.st_size);
+            return 0;
+        }
+
+        NSError *err = nil;
+        NSDictionary *root = [NSJSONSerialization JSONObjectWithData:json_data options:0 error:&err];
+        if (!root || err) {
+            fprintf(stderr, "ERROR: Cannot parse GGUF full-attn overlay manifest %s\n", json_path);
+            munmap(data, (size_t)st.st_size);
+            return 0;
+        }
+
+        NSArray *entries = root[@"entries"];
+        if (![entries isKindOfClass:[NSArray class]]) {
+            fprintf(stderr, "ERROR: GGUF full-attn overlay manifest missing 'entries': %s\n", json_path);
+            munmap(data, (size_t)st.st_size);
+            return 0;
+        }
+
+        for (NSDictionary *entry in entries) {
+            int layer = [entry[@"layer"] intValue];
+            NSString *role = entry[@"role"];
+            uint64_t offset = [entry[@"offset"] unsignedLongLongValue];
+            uint64_t size = [entry[@"size"] unsignedLongLongValue];
+            NSArray *shape = entry[@"shape"];
+            NSString *tensor_type = entry[@"tensor_type"];
+
+            if (layer < 0 || layer >= NUM_LAYERS) {
+                fprintf(stderr, "ERROR: GGUF full-attn overlay layer out of range in %s\n", json_path);
+                munmap(data, (size_t)st.st_size);
+                return 0;
+            }
+            if (offset + size > (uint64_t)st.st_size) {
+                fprintf(stderr, "ERROR: GGUF full-attn overlay entry out of bounds in %s\n", json_path);
+                munmap(data, (size_t)st.st_size);
+                return 0;
+            }
+            if (![tensor_type isEqualToString:@"Q8_0"]) {
+                fprintf(stderr, "ERROR: GGUF full-attn overlay expected Q8_0 entries in %s\n", json_path);
+                munmap(data, (size_t)st.st_size);
+                return 0;
+            }
+            if (![shape isKindOfClass:[NSArray class]] || [shape count] != 2) {
+                fprintf(stderr, "ERROR: GGUF full-attn overlay expected 2D shapes in %s\n", json_path);
+                munmap(data, (size_t)st.st_size);
+                return 0;
+            }
+
+            size_t in_dim = (size_t)[shape[0] unsignedLongLongValue];
+            size_t out_dim = (size_t)[shape[1] unsignedLongLongValue];
+            size_t expected_size = out_dim * (in_dim / GGUF_QK8_0) * sizeof(GGUFBlockQ8_0);
+            if ((size_t)size != expected_size) {
+                fprintf(stderr,
+                        "ERROR: GGUF full-attn overlay size mismatch for layer %d role %s: got %llu bytes, expected %zu\n",
+                        layer, [role UTF8String], size, expected_size);
+                munmap(data, (size_t)st.st_size);
+                return 0;
+            }
+
+            void **slot = NULL;
+            if ([role isEqualToString:@"q"]) {
+                slot = &wf->gguf_full_attn_q_layers[layer];
+            } else if ([role isEqualToString:@"k"]) {
+                slot = &wf->gguf_full_attn_k_layers[layer];
+            } else if ([role isEqualToString:@"v"]) {
+                slot = &wf->gguf_full_attn_v_layers[layer];
+            } else if ([role isEqualToString:@"o"]) {
+                slot = &wf->gguf_full_attn_o_layers[layer];
+            } else {
+                fprintf(stderr, "ERROR: GGUF full-attn overlay unknown role '%s' in %s\n",
+                        [role UTF8String], json_path);
+                munmap(data, (size_t)st.st_size);
+                return 0;
+            }
+            *slot = (char *)data + offset;
+        }
+    }
+
+    madvise(data, (size_t)st.st_size, MADV_RANDOM);
+    wf->gguf_full_attn_data = data;
+    wf->gguf_full_attn_size = (size_t)st.st_size;
+    wf->gguf_full_attn_path = strdup(bin_path);
+
+    printf("[full-attn] Using GGUF Q8_0 overlay from %s (%.2f GB)\n",
+           bin_path, wf->gguf_full_attn_size / 1e9);
+    return 1;
+}
+
+static int attach_gguf_qkv_overlay(WeightFile *wf, const char *bin_path, const char *json_path) {
+    if (!bin_path || !*bin_path) {
+        return 1;
+    }
+    if (!json_path || !*json_path) {
+        fprintf(stderr, "ERROR: GGUF qkv overlay requires both --gguf-qkv-bin and --gguf-qkv-json\n");
+        return 0;
+    }
+
+    int fd = open(bin_path, O_RDONLY);
+    if (fd < 0) {
+        fprintf(stderr, "ERROR: Cannot open GGUF qkv overlay %s: %s\n", bin_path, strerror(errno));
+        return 0;
+    }
+
+    struct stat st;
+    if (fstat(fd, &st) != 0) {
+        fprintf(stderr, "ERROR: Cannot stat GGUF qkv overlay %s: %s\n", bin_path, strerror(errno));
+        close(fd);
+        return 0;
+    }
+
+    void *data = mmap(NULL, (size_t)st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
+    close(fd);
+    if (data == MAP_FAILED) {
+        fprintf(stderr, "ERROR: mmap failed for GGUF qkv overlay %s: %s\n", bin_path, strerror(errno));
+        return 0;
+    }
+
+    memset(wf->gguf_qkv_layers, 0, sizeof(wf->gguf_qkv_layers));
+
+    @autoreleasepool {
+        NSData *json_data = [NSData dataWithContentsOfFile:[NSString stringWithUTF8String:json_path]];
+        if (!json_data) {
+            fprintf(stderr, "ERROR: Cannot read GGUF qkv overlay manifest %s\n", json_path);
+            munmap(data, (size_t)st.st_size);
+            return 0;
+        }
+
+        NSError *error = nil;
+        NSDictionary *root = [NSJSONSerialization JSONObjectWithData:json_data options:0 error:&error];
+        if (!root) {
+            fprintf(stderr, "ERROR: JSON parse failed for %s: %s\n",
+                    json_path, [[error localizedDescription] UTF8String]);
+            munmap(data, (size_t)st.st_size);
+            return 0;
+        }
+
+        NSArray *entries = root[@"entries"];
+        if (!entries) {
+            fprintf(stderr, "ERROR: GGUF qkv overlay manifest missing 'entries': %s\n", json_path);
+            munmap(data, (size_t)st.st_size);
+            return 0;
+        }
+
+        for (NSDictionary *entry in entries) {
+            int layer = [entry[@"layer"] intValue];
+            uint64_t offset = [entry[@"offset"] unsignedLongLongValue];
+            uint64_t size = [entry[@"size"] unsignedLongLongValue];
+            NSArray *shape = entry[@"shape"];
+            NSString *tensor_type = entry[@"tensor_type"];
+            if (layer < 0 || layer >= NUM_LAYERS) {
+                fprintf(stderr, "ERROR: GGUF qkv overlay layer out of range in %s\n", json_path);
+                munmap(data, (size_t)st.st_size);
+                return 0;
+            }
+            if (offset + size > (uint64_t)st.st_size) {
+                fprintf(stderr, "ERROR: GGUF qkv overlay entry out of bounds in %s\n", json_path);
+                munmap(data, (size_t)st.st_size);
+                return 0;
+            }
+            if (!tensor_type || strcmp([tensor_type UTF8String], "Q8_0") != 0) {
+                fprintf(stderr, "ERROR: GGUF qkv overlay expected Q8_0 entries in %s\n", json_path);
+                munmap(data, (size_t)st.st_size);
+                return 0;
+            }
+            if (!shape || [shape count] != 2) {
+                fprintf(stderr, "ERROR: GGUF qkv overlay expected 2D shapes in %s\n", json_path);
+                munmap(data, (size_t)st.st_size);
+                return 0;
+            }
+            int in_dim = [shape[0] intValue];
+            int out_dim = [shape[1] intValue];
+            size_t expected_size = (size_t)out_dim * (size_t)(in_dim / GGUF_QK8_0) * sizeof(GGUFBlockQ8_0);
+            if ((size_t)size != expected_size) {
+                fprintf(stderr,
+                        "ERROR: GGUF qkv overlay size mismatch for layer %d: got %llu bytes, expected %zu\n",
+                        layer, (unsigned long long)size, expected_size);
+                munmap(data, (size_t)st.st_size);
+                return 0;
+            }
+            wf->gguf_qkv_layers[layer] = (char *)data + offset;
+        }
+    }
+
+    madvise(data, (size_t)st.st_size, MADV_SEQUENTIAL);
+    wf->gguf_qkv_data = data;
+    wf->gguf_qkv_size = (size_t)st.st_size;
+    wf->gguf_qkv_path = strdup(bin_path);
+
+    printf("[qkv] Using GGUF Q8_0 qkv overlay from %s (%.2f GB)\n",
+           bin_path, wf->gguf_qkv_size / 1e9);
+    return 1;
+}
+
+static int attach_gguf_linear_overlay(WeightFile *wf, const char *bin_path, const char *json_path) {
+    if (!bin_path || !*bin_path) {
+        return 1;
+    }
+    if (!json_path || !*json_path) {
+        fprintf(stderr, "ERROR: GGUF linear overlay requires both --gguf-linear-bin and --gguf-linear-json\n");
+        return 0;
+    }
+
+    int fd = open(bin_path, O_RDONLY);
+    if (fd < 0) {
+        fprintf(stderr, "ERROR: Cannot open GGUF linear overlay %s: %s\n", bin_path, strerror(errno));
+        return 0;
+    }
+
+    struct stat st;
+    if (fstat(fd, &st) != 0) {
+        fprintf(stderr, "ERROR: Cannot stat GGUF linear overlay %s: %s\n", bin_path, strerror(errno));
+        close(fd);
+        return 0;
+    }
+
+    void *data = mmap(NULL, (size_t)st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
+    close(fd);
+    if (data == MAP_FAILED) {
+        fprintf(stderr, "ERROR: mmap failed for GGUF linear overlay %s: %s\n", bin_path, strerror(errno));
+        return 0;
+    }
+
+    memset(wf->gguf_linear_z_layers, 0, sizeof(wf->gguf_linear_z_layers));
+    memset(wf->gguf_linear_out_layers, 0, sizeof(wf->gguf_linear_out_layers));
+
+    @autoreleasepool {
+        NSData *json_data = [NSData dataWithContentsOfFile:[NSString stringWithUTF8String:json_path]];
+        if (!json_data) {
+            fprintf(stderr, "ERROR: Cannot read GGUF linear overlay manifest %s\n", json_path);
+            munmap(data, (size_t)st.st_size);
+            return 0;
+        }
+
+        NSError *error = nil;
+        NSDictionary *root = [NSJSONSerialization JSONObjectWithData:json_data options:0 error:&error];
+        if (!root) {
+            fprintf(stderr, "ERROR: JSON parse failed for %s: %s\n",
+                    json_path, [[error localizedDescription] UTF8String]);
+            munmap(data, (size_t)st.st_size);
+            return 0;
+        }
+
+        NSArray *entries = root[@"entries"];
+        if (!entries) {
+            fprintf(stderr, "ERROR: GGUF linear overlay manifest missing 'entries': %s\n", json_path);
+            munmap(data, (size_t)st.st_size);
+            return 0;
+        }
+
+        for (NSDictionary *entry in entries) {
+            int layer = [entry[@"layer"] intValue];
+            NSString *role = entry[@"role"];
+            uint64_t offset = [entry[@"offset"] unsignedLongLongValue];
+            uint64_t size = [entry[@"size"] unsignedLongLongValue];
+            NSArray *shape = entry[@"shape"];
+            NSString *tensor_type = entry[@"tensor_type"];
+            if (layer < 0 || layer >= NUM_LAYERS) {
+                fprintf(stderr, "ERROR: GGUF linear overlay layer out of range in %s\n", json_path);
+                munmap(data, (size_t)st.st_size);
+                return 0;
+            }
+            if (offset + size > (uint64_t)st.st_size) {
+                fprintf(stderr, "ERROR: GGUF linear overlay entry out of bounds in %s\n", json_path);
+                munmap(data, (size_t)st.st_size);
+                return 0;
+            }
+            if (!tensor_type || strcmp([tensor_type UTF8String], "Q8_0") != 0) {
+                fprintf(stderr, "ERROR: GGUF linear overlay expected Q8_0 entries in %s\n", json_path);
+                munmap(data, (size_t)st.st_size);
+                return 0;
+            }
+            if (!shape || [shape count] != 2) {
+                fprintf(stderr, "ERROR: GGUF linear overlay expected 2D shapes in %s\n", json_path);
+                munmap(data, (size_t)st.st_size);
+                return 0;
+            }
+            int in_dim = [shape[0] intValue];
+            int out_dim = [shape[1] intValue];
+            size_t expected_size = (size_t)out_dim * (size_t)(in_dim / GGUF_QK8_0) * sizeof(GGUFBlockQ8_0);
+            if ((size_t)size != expected_size) {
+                fprintf(stderr,
+                        "ERROR: GGUF linear overlay size mismatch for layer %d role %s: got %llu bytes, expected %zu\n",
+                        layer, [role UTF8String], (unsigned long long)size, expected_size);
+                munmap(data, (size_t)st.st_size);
+                return 0;
+            }
+
+            void **slot = NULL;
+            if ([role isEqualToString:@"gate"]) {
+                slot = &wf->gguf_linear_z_layers[layer];
+            } else if ([role isEqualToString:@"out"]) {
+                slot = &wf->gguf_linear_out_layers[layer];
+            } else {
+                fprintf(stderr, "ERROR: GGUF linear overlay unknown role '%s' in %s\n",
+                        [role UTF8String], json_path);
+                munmap(data, (size_t)st.st_size);
+                return 0;
+            }
+            *slot = (char *)data + offset;
+        }
+    }
+
+    madvise(data, (size_t)st.st_size, MADV_SEQUENTIAL);
+    wf->gguf_linear_data = data;
+    wf->gguf_linear_size = (size_t)st.st_size;
+    wf->gguf_linear_path = strdup(bin_path);
+
+    printf("[linear] Using GGUF Q8_0 linear overlay from %s (%.2f GB)\n",
+           bin_path, wf->gguf_linear_size / 1e9);
+    return 1;
+}
+
+static int attach_gguf_lm_head(WeightFile *wf, const char *bin_path) {
+    if (!bin_path || !*bin_path) {
+        return 1;
+    }
+
+    int fd = open(bin_path, O_RDONLY);
+    if (fd < 0) {
+        fprintf(stderr, "ERROR: Cannot open GGUF LM head %s: %s\n", bin_path, strerror(errno));
+        return 0;
+    }
+
+    struct stat st;
+    if (fstat(fd, &st) != 0) {
+        fprintf(stderr, "ERROR: Cannot stat GGUF LM head %s: %s\n", bin_path, strerror(errno));
+        close(fd);
+        return 0;
+    }
+
+    const size_t expected_size = (size_t)VOCAB_SIZE * (HIDDEN_DIM / GGUF_QK_K) * sizeof(GGUFBlockQ6K);
+    if ((size_t)st.st_size != expected_size) {
+        fprintf(stderr,
+                "ERROR: GGUF LM head size mismatch for %s: got %zu bytes, expected %zu bytes\n",
+                bin_path, (size_t)st.st_size, expected_size);
+        close(fd);
+        return 0;
+    }
+
+    void *data = mmap(NULL, (size_t)st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
+    close(fd);
+    if (data == MAP_FAILED) {
+        fprintf(stderr, "ERROR: mmap failed for GGUF LM head %s: %s\n", bin_path, strerror(errno));
+        return 0;
+    }
+
+    madvise(data, (size_t)st.st_size, MADV_SEQUENTIAL);
+    wf->gguf_lm_head_data = data;
+    wf->gguf_lm_head_size = (size_t)st.st_size;
+    wf->gguf_lm_head_path = strdup(bin_path);
+
+    printf("[lm_head] Using GGUF Q6_K LM head from %s (%.2f GB)\n",
+           bin_path, wf->gguf_lm_head_size / 1e9);
+    return 1;
 }
 
 // ============================================================================
@@ -797,6 +1294,82 @@ static void cpu_dequant_matvec(
                     uint32_t nibble = (packed >> (n * 4)) & 0xF;
                     acc += ((float)nibble * scale + bias) * x[x_base + n];
                 }
+            }
+        }
+        out[row] = acc;
+    }
+}
+
+// GGUF Q6_K dequant matvec: out[out_dim] = W_q6_k * x[in_dim]
+// Mirrors llama.cpp's exact block layout and starts with the LM head only.
+static void cpu_q6_k_matvec(
+    const GGUFBlockQ6K *W,
+    const float *x, float *out,
+    int out_dim, int in_dim
+) {
+    if (in_dim % GGUF_QK_K != 0) {
+        fprintf(stderr, "ERROR: Q6_K matvec expected in_dim multiple of %d, got %d\n",
+                GGUF_QK_K, in_dim);
+        return;
+    }
+
+    const int blocks_per_row = in_dim / GGUF_QK_K;
+    for (int row = 0; row < out_dim; row++) {
+        float acc = 0.0f;
+        const GGUFBlockQ6K *row_blocks = W + (size_t)row * blocks_per_row;
+
+        for (int bi = 0; bi < blocks_per_row; bi++) {
+            const GGUFBlockQ6K *blk = &row_blocks[bi];
+            const float d = f16_to_f32(blk->d);
+
+            const uint8_t *ql = blk->ql;
+            const uint8_t *qh = blk->qh;
+            const int8_t *sc = blk->scales;
+            const float *x_block = x + bi * GGUF_QK_K;
+
+            for (int part = 0; part < GGUF_QK_K; part += 128) {
+                for (int l = 0; l < 32; ++l) {
+                    const int is = l / 16;
+                    const int8_t q1 = (int8_t)((ql[l +  0] & 0xF) | (((qh[l] >> 0) & 3) << 4)) - 32;
+                    const int8_t q2 = (int8_t)((ql[l + 32] & 0xF) | (((qh[l] >> 2) & 3) << 4)) - 32;
+                    const int8_t q3 = (int8_t)((ql[l +  0] >> 4) | (((qh[l] >> 4) & 3) << 4)) - 32;
+                    const int8_t q4 = (int8_t)((ql[l + 32] >> 4) | (((qh[l] >> 6) & 3) << 4)) - 32;
+
+                    acc += d * (float)sc[is + 0] * (float)q1 * x_block[part + l +  0];
+                    acc += d * (float)sc[is + 2] * (float)q2 * x_block[part + l + 32];
+                    acc += d * (float)sc[is + 4] * (float)q3 * x_block[part + l + 64];
+                    acc += d * (float)sc[is + 6] * (float)q4 * x_block[part + l + 96];
+                }
+                ql += 64;
+                qh += 32;
+                sc += 8;
+            }
+        }
+        out[row] = acc;
+    }
+}
+
+static void cpu_q8_0_matvec(
+    const GGUFBlockQ8_0 *W,
+    const float *x, float *out,
+    int out_dim, int in_dim
+) {
+    if (in_dim % GGUF_QK8_0 != 0) {
+        fprintf(stderr, "ERROR: Q8_0 matvec expected in_dim multiple of %d, got %d\n",
+                GGUF_QK8_0, in_dim);
+        return;
+    }
+
+    const int blocks_per_row = in_dim / GGUF_QK8_0;
+    for (int row = 0; row < out_dim; row++) {
+        float acc = 0.0f;
+        const GGUFBlockQ8_0 *row_blocks = W + (size_t)row * blocks_per_row;
+        for (int bi = 0; bi < blocks_per_row; bi++) {
+            const GGUFBlockQ8_0 *blk = &row_blocks[bi];
+            const float d = f16_to_f32(blk->d);
+            const float *x_block = x + bi * GGUF_QK8_0;
+            for (int i = 0; i < GGUF_QK8_0; i++) {
+                acc += d * (float)blk->qs[i] * x_block[i];
             }
         }
         out[row] = acc;
@@ -990,6 +1563,8 @@ typedef struct {
     id<MTLComputePipelineState> matvec_v5;  // LUT dequant variant
     id<MTLComputePipelineState> matvec_fast;  // for in_dim > 4096
     id<MTLComputePipelineState> matvec_2bit;  // 2-bit expert dequant kernel
+    id<MTLComputePipelineState> matvec_q8_0;  // GGUF Q8_0 resident tensor path
+    id<MTLComputePipelineState> matvec_q6_k;  // GGUF Q6_K resident tensor path
     // NAX (Metal 4 / M5+) pipelines
     id<MTLLibrary>              nax_library;   // compiled with Metal 4.0 (NULL if not available)
     id<MTLComputePipelineState> nax_dequant;   // 4-bit → half dequant kernel
@@ -1014,6 +1589,10 @@ typedef struct {
     id<MTLBuffer> buf_input;     // input vector [HIDDEN_DIM or max projection input]
     id<MTLBuffer> buf_output;    // output vector [max projection output]
     id<MTLBuffer> wf_buf;        // the mmap'd weight file as a Metal buffer
+    id<MTLBuffer> gguf_qkv_buf;      // optional GGUF Q8_0 qkv overlay blob
+    id<MTLBuffer> gguf_full_attn_buf; // optional GGUF Q8_0 full-attention overlay blob
+    id<MTLBuffer> gguf_linear_buf;   // optional GGUF Q8_0 linear-attn gate/out overlay blob
+    id<MTLBuffer> gguf_lm_head_buf;  // optional GGUF Q6_K LM head blob
     // Batched matmul output slots (preallocated, reused across dispatches)
     id<MTLBuffer> batch_out[MAX_BATCH_SLOTS];
     // Reusable buffers for expert computation (avoids per-expert alloc)
@@ -1140,6 +1719,8 @@ static MetalCtx *metal_setup(void) {
     ctx->matvec_v5     = makePipe(@"dequant_matvec_4bit_v5");  // LUT variant (no uint→float conversions)
     ctx->matvec_fast   = makePipe(@"dequant_matvec_4bit_fast");
     ctx->matvec_2bit   = makePipe(@"dequant_matvec_2bit");
+    ctx->matvec_q8_0   = makePipe(@"dequant_matvec_q8_0");
+    ctx->matvec_q6_k   = makePipe(@"dequant_matvec_q6_k");
     ctx->rms_norm_sum  = makePipe(@"rms_norm_sum_sq");
     ctx->rms_norm_apply = makePipe(@"rms_norm_apply");
     ctx->rms_norm_apply_bf16 = makePipe(@"rms_norm_apply_bf16");
@@ -1399,6 +1980,74 @@ static void metal_set_weights(MetalCtx *ctx, void *data, size_t size) {
     }
 }
 
+static void metal_set_gguf_lm_head(MetalCtx *ctx, void *data, size_t size) {
+    size_t page_size = 16384;
+    size_t aligned_size = (size + page_size - 1) & ~(page_size - 1);
+
+    ctx->gguf_lm_head_buf = [ctx->device newBufferWithBytesNoCopy:data
+                                                           length:aligned_size
+                                                          options:MTLResourceStorageModeShared
+                                                      deallocator:nil];
+    if (!ctx->gguf_lm_head_buf) {
+        fprintf(stderr, "WARNING: Cannot wrap GGUF LM head as Metal buffer (%.2f GB)\n",
+                size / 1e9);
+    } else {
+        printf("[metal] GGUF LM head wrapped as Metal buffer (%.2f GB)\n",
+               aligned_size / 1e9);
+    }
+}
+
+static void metal_set_gguf_qkv(MetalCtx *ctx, void *data, size_t size) {
+    size_t page_size = 16384;
+    size_t aligned_size = (size + page_size - 1) & ~(page_size - 1);
+
+    ctx->gguf_qkv_buf = [ctx->device newBufferWithBytesNoCopy:data
+                                                       length:aligned_size
+                                                      options:MTLResourceStorageModeShared
+                                                  deallocator:nil];
+    if (!ctx->gguf_qkv_buf) {
+        fprintf(stderr, "WARNING: Cannot wrap GGUF qkv overlay as Metal buffer (%.2f GB)\n",
+                size / 1e9);
+    } else {
+        printf("[metal] GGUF qkv overlay wrapped as Metal buffer (%.2f GB)\n",
+               aligned_size / 1e9);
+    }
+}
+
+static void metal_set_gguf_full_attn(MetalCtx *ctx, void *data, size_t size) {
+    size_t page_size = 16384;
+    size_t aligned_size = (size + page_size - 1) & ~(page_size - 1);
+
+    ctx->gguf_full_attn_buf = [ctx->device newBufferWithBytesNoCopy:data
+                                                             length:aligned_size
+                                                            options:MTLResourceStorageModeShared
+                                                        deallocator:nil];
+    if (!ctx->gguf_full_attn_buf) {
+        fprintf(stderr, "WARNING: Cannot wrap GGUF full-attn overlay as Metal buffer (%.2f GB)\n",
+                size / 1e9);
+    } else {
+        printf("[metal] GGUF full-attn overlay wrapped as Metal buffer (%.2f GB)\n",
+               aligned_size / 1e9);
+    }
+}
+
+static void metal_set_gguf_linear(MetalCtx *ctx, void *data, size_t size) {
+    if (!ctx || !data || size == 0) {
+        return;
+    }
+    ctx->gguf_linear_buf = [ctx->device newBufferWithBytesNoCopy:data
+                                                          length:size
+                                                         options:MTLResourceStorageModeShared
+                                                     deallocator:nil];
+    if (!ctx->gguf_linear_buf) {
+        fprintf(stderr, "WARNING: Cannot wrap GGUF linear overlay as Metal buffer (%.2f GB)\n",
+                size / 1e9);
+    } else {
+        printf("[metal] GGUF linear overlay wrapped as Metal buffer (%.2f GB)\n",
+               size / 1e9);
+    }
+}
+
 // GPU dequant matvec: out[out_dim] = W_4bit * x[in_dim]
 // W_packed, scales, biases are pointers into mmap'd weight file
 // x_f32 is CPU float array, result written back to out_f32
@@ -1460,6 +2109,42 @@ static void gpu_dequant_matvec(
     [cmdbuf waitUntilCompleted];
 
     // Copy result back
+    memcpy(out_f32, [o_buf contents], o_size);
+}
+
+static void gpu_q6_k_matvec(
+    MetalCtx *ctx,
+    const GGUFBlockQ6K *W_q6_k,
+    const float *x_f32, float *out_f32,
+    uint32_t out_dim, uint32_t in_dim
+) {
+    memcpy([ctx->buf_input contents], x_f32, in_dim * sizeof(float));
+
+    size_t o_size = (size_t)out_dim * sizeof(float);
+    id<MTLBuffer> o_buf = ctx->buf_output;
+    if (o_size > [o_buf length]) {
+        o_buf = [ctx->device newBufferWithLength:o_size options:MTLResourceStorageModeShared];
+    }
+
+    NSUInteger w_off = 0;
+    if (ctx->gguf_lm_head_buf) {
+        w_off = (NSUInteger)((const char *)W_q6_k - (const char *)[ctx->gguf_lm_head_buf contents]);
+    }
+
+    id<MTLCommandBuffer> cmdbuf = [ctx->queue commandBuffer];
+    id<MTLComputeCommandEncoder> enc = [cmdbuf computeCommandEncoder];
+    [enc setComputePipelineState:ctx->matvec_q6_k];
+    [enc setBuffer:ctx->gguf_lm_head_buf offset:w_off atIndex:0];
+    [enc setBuffer:ctx->buf_input        offset:0     atIndex:1];
+    [enc setBuffer:o_buf                 offset:0     atIndex:2];
+    [enc setBytes:&out_dim               length:4     atIndex:3];
+    [enc setBytes:&in_dim                length:4     atIndex:4];
+    [enc dispatchThreadgroups:MTLSizeMake(out_dim, 1, 1)
+        threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+    [enc endEncoding];
+    [cmdbuf commit];
+    [cmdbuf waitUntilCompleted];
+
     memcpy(out_f32, [o_buf contents], o_size);
 }
 
@@ -1589,6 +2274,18 @@ static void fast_dequant_matvec(
     }
 }
 
+static void fast_q6_k_matvec(
+    const GGUFBlockQ6K *W,
+    const float *x, float *out,
+    int out_dim, int in_dim
+) {
+    if (g_metal && g_metal->gguf_lm_head_buf && g_metal->matvec_q6_k) {
+        gpu_q6_k_matvec(g_metal, W, x, out, (uint32_t)out_dim, (uint32_t)in_dim);
+    } else {
+        cpu_q6_k_matvec(W, x, out, out_dim, in_dim);
+    }
+}
+
 // ============================================================================
 // Batched GPU matmul: encode N independent matmuls sharing the same input
 // into ONE command buffer, reducing dispatch overhead by N-1 round-trips.
@@ -1603,7 +2300,123 @@ typedef struct {
     uint32_t in_dim;
     uint32_t group_size;
     int batch_slot;          // which batch_out[slot] to use for GPU output
+    uint8_t kind;
+    uint8_t source;
 } BatchMatvecSpec;
+
+enum {
+    MATVEC_KIND_MLX4 = 0,
+    MATVEC_KIND_GGUF_Q8_0 = 1,
+};
+
+enum {
+    MATVEC_SOURCE_WF = 0,
+    MATVEC_SOURCE_GGUF_QKV = 1,
+    MATVEC_SOURCE_GGUF_FULL_ATTN = 2,
+    MATVEC_SOURCE_GGUF_LINEAR = 3,
+};
+
+static id<MTLBuffer> matvec_source_buffer(MetalCtx *ctx, uint8_t source, const char **base_out) {
+    if (base_out) {
+        *base_out = NULL;
+    }
+    id<MTLBuffer> buf = nil;
+    switch (source) {
+        case MATVEC_SOURCE_WF:
+            buf = ctx->wf_buf;
+            break;
+        case MATVEC_SOURCE_GGUF_QKV:
+            buf = ctx->gguf_qkv_buf;
+            break;
+        case MATVEC_SOURCE_GGUF_FULL_ATTN:
+            buf = ctx->gguf_full_attn_buf;
+            break;
+        case MATVEC_SOURCE_GGUF_LINEAR:
+            buf = ctx->gguf_linear_buf;
+            break;
+        default:
+            buf = nil;
+            break;
+    }
+    if (buf && base_out) {
+        *base_out = (const char *)[buf contents];
+    }
+    return buf;
+}
+
+static int batch_spec_can_gpu(MetalCtx *ctx, const BatchMatvecSpec *spec) {
+    if (!ctx) {
+        return 0;
+    }
+    if (spec->kind == MATVEC_KIND_GGUF_Q8_0) {
+        return (ctx->matvec_q8_0 != nil && matvec_source_buffer(ctx, spec->source, NULL) != nil);
+    }
+    return (ctx->wf_buf != nil);
+}
+
+static void gpu_q8_0_matvec(
+    MetalCtx *ctx,
+    id<MTLBuffer> w_buf,
+    const char *w_base,
+    const GGUFBlockQ8_0 *W_q8,
+    const float *x_f32, float *out_f32,
+    uint32_t out_dim, uint32_t in_dim
+) {
+    memcpy([ctx->buf_input contents], x_f32, in_dim * sizeof(float));
+
+    size_t o_size = (size_t)out_dim * sizeof(float);
+    id<MTLBuffer> o_buf = ctx->buf_output;
+    if (o_size > [o_buf length]) {
+        o_buf = [ctx->device newBufferWithLength:o_size options:MTLResourceStorageModeShared];
+    }
+
+    NSUInteger w_off = (NSUInteger)((const char *)W_q8 - w_base);
+
+    id<MTLCommandBuffer> cmdbuf = [ctx->queue commandBuffer];
+    id<MTLComputeCommandEncoder> enc = [cmdbuf computeCommandEncoder];
+    [enc setComputePipelineState:ctx->matvec_q8_0];
+    [enc setBuffer:w_buf                  offset:w_off atIndex:0];
+    [enc setBuffer:ctx->buf_input         offset:0     atIndex:1];
+    [enc setBuffer:o_buf                  offset:0     atIndex:2];
+    [enc setBytes:&out_dim                length:4     atIndex:3];
+    [enc setBytes:&in_dim                 length:4     atIndex:4];
+    uint32_t num_tgs = (out_dim + 7) / 8;
+    [enc dispatchThreadgroups:MTLSizeMake(num_tgs, 1, 1)
+        threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+    [enc endEncoding];
+    [cmdbuf commit];
+    [cmdbuf waitUntilCompleted];
+
+    memcpy(out_f32, [o_buf contents], o_size);
+}
+
+static void fast_kind_matvec(
+    const void *W, const void *scales, const void *biases, uint8_t kind, uint8_t source,
+    const float *x, float *out,
+    int out_dim, int in_dim, int group_size
+) {
+    if (kind == MATVEC_KIND_GGUF_Q8_0) {
+        const char *w_base = NULL;
+        id<MTLBuffer> w_buf = g_metal ? matvec_source_buffer(g_metal, source, &w_base) : nil;
+        if (g_metal && g_metal->matvec_q8_0 && w_buf && w_base) {
+            gpu_q8_0_matvec(g_metal, w_buf, w_base, (const GGUFBlockQ8_0 *)W, x, out,
+                            (uint32_t)out_dim, (uint32_t)in_dim);
+        } else {
+            cpu_q8_0_matvec((const GGUFBlockQ8_0 *)W, x, out, out_dim, in_dim);
+        }
+    } else {
+        fast_dequant_matvec(W, scales, biases, x, out, out_dim, in_dim, group_size);
+    }
+}
+
+static int batch_specs_have_q8(BatchMatvecSpec *specs, int num_specs) {
+    for (int i = 0; i < num_specs; i++) {
+        if (specs[i].kind == MATVEC_KIND_GGUF_Q8_0) {
+            return 1;
+        }
+    }
+    return 0;
+}
 
 // Run N matmuls in a single command buffer. All share the same input vector.
 // The input is copied once; all outputs go to preallocated batch_out slots.
@@ -1619,31 +2432,43 @@ static void gpu_batch_matvec(
 
     for (int i = 0; i < num_specs; i++) {
         BatchMatvecSpec *s = &specs[i];
-        NSUInteger w_off = (NSUInteger)((const char *)s->W      - (const char *)[ctx->wf_buf contents]);
-        NSUInteger s_off = (NSUInteger)((const char *)s->scales  - (const char *)[ctx->wf_buf contents]);
-        NSUInteger b_off = (NSUInteger)((const char *)s->biases  - (const char *)[ctx->wf_buf contents]);
-
         id<MTLBuffer> o_buf = ctx->batch_out[s->batch_slot];
-
         id<MTLComputeCommandEncoder> enc = [cmdbuf computeCommandEncoder];
-        int use_v3 = (s->in_dim <= 4096);
-        [enc setComputePipelineState: use_v3 ? ctx->matvec_v3 : ctx->matvec_fast];
-        [enc setBuffer:ctx->wf_buf  offset:w_off atIndex:0];
-        [enc setBuffer:ctx->wf_buf  offset:s_off atIndex:1];
-        [enc setBuffer:ctx->wf_buf  offset:b_off atIndex:2];
-        [enc setBuffer:ctx->buf_input offset:0   atIndex:3];
-        [enc setBuffer:o_buf        offset:0     atIndex:4];
-        [enc setBytes:&s->out_dim   length:4     atIndex:5];
-        [enc setBytes:&s->in_dim    length:4     atIndex:6];
-        [enc setBytes:&s->group_size length:4    atIndex:7];
-
-        if (use_v3) {
+        if (s->kind == MATVEC_KIND_GGUF_Q8_0) {
+            const char *w_base = NULL;
+            id<MTLBuffer> w_buf = matvec_source_buffer(ctx, s->source, &w_base);
+            NSUInteger w_off = (NSUInteger)((const char *)s->W - w_base);
+            [enc setComputePipelineState:ctx->matvec_q8_0];
+            [enc setBuffer:w_buf         offset:w_off atIndex:0];
+            [enc setBuffer:ctx->buf_input offset:0     atIndex:1];
+            [enc setBuffer:o_buf          offset:0     atIndex:2];
+            [enc setBytes:&s->out_dim     length:4     atIndex:3];
+            [enc setBytes:&s->in_dim      length:4     atIndex:4];
             uint32_t num_tgs = (s->out_dim + 7) / 8;
             [enc dispatchThreadgroups:MTLSizeMake(num_tgs, 1, 1)
                 threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
         } else {
-            [enc dispatchThreadgroups:MTLSizeMake(s->out_dim, 1, 1)
-                threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+            NSUInteger w_off = (NSUInteger)((const char *)s->W      - (const char *)[ctx->wf_buf contents]);
+            NSUInteger s_off = (NSUInteger)((const char *)s->scales  - (const char *)[ctx->wf_buf contents]);
+            NSUInteger b_off = (NSUInteger)((const char *)s->biases  - (const char *)[ctx->wf_buf contents]);
+            int use_v3 = (s->in_dim <= 4096);
+            [enc setComputePipelineState: use_v3 ? ctx->matvec_v3 : ctx->matvec_fast];
+            [enc setBuffer:ctx->wf_buf    offset:w_off atIndex:0];
+            [enc setBuffer:ctx->wf_buf    offset:s_off atIndex:1];
+            [enc setBuffer:ctx->wf_buf    offset:b_off atIndex:2];
+            [enc setBuffer:ctx->buf_input offset:0     atIndex:3];
+            [enc setBuffer:o_buf          offset:0     atIndex:4];
+            [enc setBytes:&s->out_dim     length:4     atIndex:5];
+            [enc setBytes:&s->in_dim      length:4     atIndex:6];
+            [enc setBytes:&s->group_size  length:4     atIndex:7];
+            if (use_v3) {
+                uint32_t num_tgs = (s->out_dim + 7) / 8;
+                [enc dispatchThreadgroups:MTLSizeMake(num_tgs, 1, 1)
+                    threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+            } else {
+                [enc dispatchThreadgroups:MTLSizeMake(s->out_dim, 1, 1)
+                    threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+            }
         }
         [enc endEncoding];
     }
@@ -1673,31 +2498,43 @@ static void gpu_encode_batch_matvec(
 ) {
     for (int i = 0; i < num_specs; i++) {
         BatchMatvecSpec *s = &specs[i];
-        NSUInteger w_off = (NSUInteger)((const char *)s->W      - (const char *)[ctx->wf_buf contents]);
-        NSUInteger s_off = (NSUInteger)((const char *)s->scales  - (const char *)[ctx->wf_buf contents]);
-        NSUInteger b_off = (NSUInteger)((const char *)s->biases  - (const char *)[ctx->wf_buf contents]);
-
         id<MTLBuffer> o_buf = ctx->batch_out[s->batch_slot];
-
         id<MTLComputeCommandEncoder> enc = [cmdbuf computeCommandEncoder];
-        int use_v3 = (s->in_dim <= 4096);
-        [enc setComputePipelineState: use_v3 ? ctx->matvec_v3 : ctx->matvec_fast];
-        [enc setBuffer:ctx->wf_buf  offset:w_off atIndex:0];
-        [enc setBuffer:ctx->wf_buf  offset:s_off atIndex:1];
-        [enc setBuffer:ctx->wf_buf  offset:b_off atIndex:2];
-        [enc setBuffer:ctx->buf_input offset:0   atIndex:3];
-        [enc setBuffer:o_buf        offset:0     atIndex:4];
-        [enc setBytes:&s->out_dim   length:4     atIndex:5];
-        [enc setBytes:&s->in_dim    length:4     atIndex:6];
-        [enc setBytes:&s->group_size length:4    atIndex:7];
-
-        if (use_v3) {
+        if (s->kind == MATVEC_KIND_GGUF_Q8_0) {
+            const char *w_base = NULL;
+            id<MTLBuffer> w_buf = matvec_source_buffer(ctx, s->source, &w_base);
+            NSUInteger w_off = (NSUInteger)((const char *)s->W - w_base);
+            [enc setComputePipelineState:ctx->matvec_q8_0];
+            [enc setBuffer:w_buf         offset:w_off atIndex:0];
+            [enc setBuffer:ctx->buf_input offset:0     atIndex:1];
+            [enc setBuffer:o_buf          offset:0     atIndex:2];
+            [enc setBytes:&s->out_dim     length:4     atIndex:3];
+            [enc setBytes:&s->in_dim      length:4     atIndex:4];
             uint32_t num_tgs = (s->out_dim + 7) / 8;
             [enc dispatchThreadgroups:MTLSizeMake(num_tgs, 1, 1)
                 threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
         } else {
-            [enc dispatchThreadgroups:MTLSizeMake(s->out_dim, 1, 1)
-                threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+            NSUInteger w_off = (NSUInteger)((const char *)s->W      - (const char *)[ctx->wf_buf contents]);
+            NSUInteger s_off = (NSUInteger)((const char *)s->scales  - (const char *)[ctx->wf_buf contents]);
+            NSUInteger b_off = (NSUInteger)((const char *)s->biases  - (const char *)[ctx->wf_buf contents]);
+            int use_v3 = (s->in_dim <= 4096);
+            [enc setComputePipelineState: use_v3 ? ctx->matvec_v3 : ctx->matvec_fast];
+            [enc setBuffer:ctx->wf_buf    offset:w_off atIndex:0];
+            [enc setBuffer:ctx->wf_buf    offset:s_off atIndex:1];
+            [enc setBuffer:ctx->wf_buf    offset:b_off atIndex:2];
+            [enc setBuffer:ctx->buf_input offset:0     atIndex:3];
+            [enc setBuffer:o_buf          offset:0     atIndex:4];
+            [enc setBytes:&s->out_dim     length:4     atIndex:5];
+            [enc setBytes:&s->in_dim      length:4     atIndex:6];
+            [enc setBytes:&s->group_size  length:4     atIndex:7];
+            if (use_v3) {
+                uint32_t num_tgs = (s->out_dim + 7) / 8;
+                [enc dispatchThreadgroups:MTLSizeMake(num_tgs, 1, 1)
+                    threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+            } else {
+                [enc dispatchThreadgroups:MTLSizeMake(s->out_dim, 1, 1)
+                    threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+            }
         }
         [enc endEncoding];
     }
@@ -2135,13 +2972,34 @@ static void fast_batch_matvec(
     const float *x, uint32_t x_dim,
     BatchMatvecSpec *specs, int num_specs
 ) {
-    if (g_metal && g_metal->wf_buf) {
-        gpu_batch_matvec(g_metal, x, x_dim, specs, num_specs);
+    if (g_metal) {
+        BatchMatvecSpec gpu_specs[8];
+        int num_gpu_specs = 0;
+        for (int i = 0; i < num_specs; i++) {
+            BatchMatvecSpec *s = &specs[i];
+            if (!batch_spec_can_gpu(g_metal, s)) {
+                continue;
+            }
+            gpu_specs[num_gpu_specs++] = *s;
+        }
+        if (num_gpu_specs > 0) {
+            gpu_batch_matvec(g_metal, x, x_dim, gpu_specs, num_gpu_specs);
+        }
+        for (int i = 0; i < num_specs; i++) {
+            BatchMatvecSpec *s = &specs[i];
+            if (batch_spec_can_gpu(g_metal, s)) {
+                continue;
+            }
+            fast_kind_matvec(s->W, s->scales, s->biases, s->kind, s->source,
+                             x, s->out_cpu,
+                             (int)s->out_dim, (int)s->in_dim, (int)s->group_size);
+        }
     } else {
         for (int i = 0; i < num_specs; i++) {
             BatchMatvecSpec *s = &specs[i];
-            cpu_dequant_matvec(s->W, s->scales, s->biases, x, s->out_cpu,
-                               s->out_dim, s->in_dim, s->group_size);
+            fast_kind_matvec(s->W, s->scales, s->biases, s->kind, s->source,
+                             x, s->out_cpu,
+                             (int)s->out_dim, (int)s->in_dim, (int)s->group_size);
         }
     }
 }
@@ -2372,6 +3230,145 @@ static float vec_rms(const float *v, int n) {
     float sum = 0.0f;
     for (int i = 0; i < n; i++) sum += v[i] * v[i];
     return sqrtf(sum / n);
+}
+
+static float vec_cosine(const float *a, const float *b, int n) {
+    double dot = 0.0;
+    double aa = 0.0;
+    double bb = 0.0;
+    for (int i = 0; i < n; i++) {
+        dot += (double)a[i] * (double)b[i];
+        aa += (double)a[i] * (double)a[i];
+        bb += (double)b[i] * (double)b[i];
+    }
+    if (aa <= 0.0 || bb <= 0.0) return 0.0f;
+    return (float)(dot / (sqrt(aa) * sqrt(bb)));
+}
+
+static float vec_max_abs_diff(const float *a, const float *b, int n, int *idx_out) {
+    float max_diff = 0.0f;
+    int max_idx = -1;
+    for (int i = 0; i < n; i++) {
+        float diff = fabsf(a[i] - b[i]);
+        if (diff > max_diff) {
+            max_diff = diff;
+            max_idx = i;
+        }
+    }
+    if (idx_out) *idx_out = max_idx;
+    return max_diff;
+}
+
+static int full_attn_o_debug_enabled(void) {
+    static int init = 0;
+    static int enabled = 0;
+    if (!init) {
+        const char *env = getenv("FLASH_MOE_DEBUG_FULL_ATTN_O");
+        enabled = (env && atoi(env) != 0);
+        init = 1;
+    }
+    return enabled;
+}
+
+static int full_attn_o_debug_target_layer(void) {
+    static int init = 0;
+    static int target = 3;
+    if (!init) {
+        const char *env = getenv("FLASH_MOE_DEBUG_FULL_ATTN_LAYER");
+        if (env && *env) target = atoi(env);
+        init = 1;
+    }
+    return target;
+}
+
+static int full_attn_o_debug_target_pos(void) {
+    static int init = 0;
+    static int target = -1;
+    if (!init) {
+        const char *env = getenv("FLASH_MOE_DEBUG_FULL_ATTN_POS");
+        if (env && *env) target = atoi(env);
+        init = 1;
+    }
+    return target;
+}
+
+static int full_attn_force_cmd2_fallback(void) {
+    static int init = 0;
+    static int enabled = 0;
+    if (!init) {
+        const char *env = getenv("FLASH_MOE_FORCE_FULL_ATTN_CMD2_FALLBACK");
+        enabled = (env && atoi(env) != 0);
+        init = 1;
+    }
+    return enabled;
+}
+
+static int disable_gpu_combine_debug(void) {
+    static int init = 0;
+    static int enabled = 0;
+    if (!init) {
+        const char *env = getenv("FLASH_MOE_DISABLE_GPU_COMBINE");
+        enabled = (env && atoi(env) != 0);
+        init = 1;
+    }
+    return enabled;
+}
+
+static void maybe_debug_full_attn_o_proj_compare(
+    WeightFile *wf,
+    int layer_idx,
+    int seq_pos,
+    const float *attn_in,
+    const float *gguf_gpu_out,
+    const GGUFBlockQ8_0 *gguf_w,
+    int in_dim
+) {
+    static int printed = 0;
+    if (!full_attn_o_debug_enabled() || printed) return;
+    if (layer_idx != full_attn_o_debug_target_layer()) return;
+    int target_pos = full_attn_o_debug_target_pos();
+    if (target_pos >= 0 && seq_pos != target_pos) return;
+
+    char name[256];
+    snprintf(name, sizeof(name), "model.layers.%d.self_attn.o_proj.weight", layer_idx);
+    uint32_t *native_w = get_tensor_ptr(wf, name);
+    snprintf(name, sizeof(name), "model.layers.%d.self_attn.o_proj.scales", layer_idx);
+    uint16_t *native_s = get_tensor_ptr(wf, name);
+    snprintf(name, sizeof(name), "model.layers.%d.self_attn.o_proj.biases", layer_idx);
+    uint16_t *native_b = get_tensor_ptr(wf, name);
+    if (!native_w || !native_s || !native_b) {
+        fprintf(stderr, "[FA-O-DBG] layer=%d missing native o_proj tensors\n", layer_idx);
+        printed = 1;
+        return;
+    }
+
+    float native_out[HIDDEN_DIM];
+    float gguf_cpu_out[HIDDEN_DIM];
+    memset(native_out, 0, sizeof(native_out));
+    memset(gguf_cpu_out, 0, sizeof(gguf_cpu_out));
+
+    fast_dequant_matvec(native_w, native_s, native_b, attn_in, native_out, HIDDEN_DIM, in_dim, GROUP_SIZE);
+    cpu_q8_0_matvec(gguf_w, attn_in, gguf_cpu_out, HIDDEN_DIM, in_dim);
+
+    int idx_native_vs_gguf = -1;
+    int idx_gpu_vs_cpu = -1;
+    float max_native_vs_gguf = vec_max_abs_diff(native_out, gguf_cpu_out, HIDDEN_DIM, &idx_native_vs_gguf);
+    float max_gpu_vs_cpu = vec_max_abs_diff(gguf_gpu_out, gguf_cpu_out, HIDDEN_DIM, &idx_gpu_vs_cpu);
+
+    fprintf(stderr,
+            "[FA-O-DBG] layer=%d pos=%d | native_rms=%.6f gguf_cpu_rms=%.6f gguf_gpu_rms=%.6f\n",
+            layer_idx, seq_pos, vec_rms(native_out, HIDDEN_DIM), vec_rms(gguf_cpu_out, HIDDEN_DIM),
+            vec_rms(gguf_gpu_out, HIDDEN_DIM));
+    fprintf(stderr,
+            "[FA-O-DBG] native_vs_gguf_cpu: cos=%.6f max_abs=%.6f idx=%d | gguf_gpu_vs_cpu: cos=%.6f max_abs=%.6f idx=%d\n",
+            vec_cosine(native_out, gguf_cpu_out, HIDDEN_DIM), max_native_vs_gguf, idx_native_vs_gguf,
+            vec_cosine(gguf_gpu_out, gguf_cpu_out, HIDDEN_DIM), max_gpu_vs_cpu, idx_gpu_vs_cpu);
+    fprintf(stderr,
+            "[FA-O-DBG] sample native[0..3]=[%.6f %.6f %.6f %.6f] gguf_cpu[0..3]=[%.6f %.6f %.6f %.6f] gguf_gpu[0..3]=[%.6f %.6f %.6f %.6f]\n",
+            native_out[0], native_out[1], native_out[2], native_out[3],
+            gguf_cpu_out[0], gguf_cpu_out[1], gguf_cpu_out[2], gguf_cpu_out[3],
+            gguf_gpu_out[0], gguf_gpu_out[1], gguf_gpu_out[2], gguf_gpu_out[3]);
+    printed = 1;
 }
 
 __attribute__((unused))
@@ -3120,6 +4117,21 @@ static void embed_lookup(WeightFile *wf, int token_id, float *out) {
     // But the embedding is quantized: each row has hidden_dim/8 uint32 values (packed 4-bit)
     // plus scales and biases per group
 
+    if (wf->gguf_embedding_data) {
+        const GGUFBlockQ8_0 *W = (const GGUFBlockQ8_0 *)wf->gguf_embedding_data;
+        const int blocks_per_row = HIDDEN_DIM / GGUF_QK8_0;
+        const GGUFBlockQ8_0 *row = W + (size_t)token_id * blocks_per_row;
+        for (int b = 0; b < blocks_per_row; b++) {
+            const GGUFBlockQ8_0 *blk = &row[b];
+            const float d = f16_to_f32(blk->d);
+            const int base = b * GGUF_QK8_0;
+            for (int i = 0; i < GGUF_QK8_0; i++) {
+                out[base + i] = d * (float)blk->qs[i];
+            }
+        }
+        return;
+    }
+
     TensorInfo *w_info = get_tensor_info(wf, "model.embed_tokens.weight");
     TensorInfo *s_info = get_tensor_info(wf, "model.embed_tokens.scales");
     TensorInfo *b_info = get_tensor_info(wf, "model.embed_tokens.biases");
@@ -3169,6 +4181,12 @@ static void lm_head_forward(WeightFile *wf, const float *hidden, float *logits) 
     // lm_head: [hidden_dim=4096] -> [vocab_size=248320]
     // This is a HUGE matmul. For 248320 output dims, it will be slow on CPU.
     // Optimization: only compute top candidates
+
+    if (wf->gguf_lm_head_data) {
+        const GGUFBlockQ6K *W = (const GGUFBlockQ6K *)wf->gguf_lm_head_data;
+        fast_q6_k_matvec(W, hidden, logits, VOCAB_SIZE, HIDDEN_DIM);
+        return;
+    }
 
     TensorInfo *w_info = get_tensor_info(wf, "lm_head.weight");
     TensorInfo *s_info = get_tensor_info(wf, "lm_head.scales");
@@ -3901,6 +4919,20 @@ static void infer_prefetch_shutdown(void) {
 // ============================================================================
 
 typedef struct {
+    uint8_t q_kind;
+    uint8_t k_kind;
+    uint8_t v_kind;
+    uint8_t o_kind;
+    uint8_t qkv_kind;
+    uint8_t z_kind;
+    uint8_t out_proj_kind;
+    uint8_t q_source;
+    uint8_t k_source;
+    uint8_t v_source;
+    uint8_t o_source;
+    uint8_t qkv_source;
+    uint8_t z_source;
+    uint8_t out_proj_source;
     // Input/post-attention layer norms
     uint16_t *input_norm_w;
     uint16_t *post_attn_norm_w;
@@ -3952,24 +4984,44 @@ static void build_layer_cache(WeightFile *wf) {
             // Full attention
             snprintf(name, sizeof(name), "model.layers.%d.self_attn.q_proj.weight", i);
             lc->q_w = get_tensor_ptr(wf, name);
+            if (wf->gguf_full_attn_q_layers[i]) {
+                lc->q_w = (uint32_t *)wf->gguf_full_attn_q_layers[i];
+                lc->q_kind = MATVEC_KIND_GGUF_Q8_0;
+                lc->q_source = MATVEC_SOURCE_GGUF_FULL_ATTN;
+            }
             snprintf(name, sizeof(name), "model.layers.%d.self_attn.q_proj.scales", i);
             lc->q_s = get_tensor_ptr(wf, name);
             snprintf(name, sizeof(name), "model.layers.%d.self_attn.q_proj.biases", i);
             lc->q_b = get_tensor_ptr(wf, name);
             snprintf(name, sizeof(name), "model.layers.%d.self_attn.k_proj.weight", i);
             lc->k_w = get_tensor_ptr(wf, name);
+            if (wf->gguf_full_attn_k_layers[i]) {
+                lc->k_w = (uint32_t *)wf->gguf_full_attn_k_layers[i];
+                lc->k_kind = MATVEC_KIND_GGUF_Q8_0;
+                lc->k_source = MATVEC_SOURCE_GGUF_FULL_ATTN;
+            }
             snprintf(name, sizeof(name), "model.layers.%d.self_attn.k_proj.scales", i);
             lc->k_s = get_tensor_ptr(wf, name);
             snprintf(name, sizeof(name), "model.layers.%d.self_attn.k_proj.biases", i);
             lc->k_b = get_tensor_ptr(wf, name);
             snprintf(name, sizeof(name), "model.layers.%d.self_attn.v_proj.weight", i);
             lc->v_w = get_tensor_ptr(wf, name);
+            if (wf->gguf_full_attn_v_layers[i]) {
+                lc->v_w = (uint32_t *)wf->gguf_full_attn_v_layers[i];
+                lc->v_kind = MATVEC_KIND_GGUF_Q8_0;
+                lc->v_source = MATVEC_SOURCE_GGUF_FULL_ATTN;
+            }
             snprintf(name, sizeof(name), "model.layers.%d.self_attn.v_proj.scales", i);
             lc->v_s = get_tensor_ptr(wf, name);
             snprintf(name, sizeof(name), "model.layers.%d.self_attn.v_proj.biases", i);
             lc->v_b = get_tensor_ptr(wf, name);
             snprintf(name, sizeof(name), "model.layers.%d.self_attn.o_proj.weight", i);
             lc->o_w = get_tensor_ptr(wf, name);
+            if (wf->gguf_full_attn_o_layers[i]) {
+                lc->o_w = (uint32_t *)wf->gguf_full_attn_o_layers[i];
+                lc->o_kind = MATVEC_KIND_GGUF_Q8_0;
+                lc->o_source = MATVEC_SOURCE_GGUF_FULL_ATTN;
+            }
             snprintf(name, sizeof(name), "model.layers.%d.self_attn.o_proj.scales", i);
             lc->o_s = get_tensor_ptr(wf, name);
             snprintf(name, sizeof(name), "model.layers.%d.self_attn.o_proj.biases", i);
@@ -3982,12 +5034,22 @@ static void build_layer_cache(WeightFile *wf) {
             // Linear attention
             snprintf(name, sizeof(name), "model.layers.%d.linear_attn.in_proj_qkv.weight", i);
             lc->qkv_w = get_tensor_ptr(wf, name);
+            if (wf->gguf_qkv_layers[i]) {
+                lc->qkv_w = (uint32_t *)wf->gguf_qkv_layers[i];
+                lc->qkv_kind = MATVEC_KIND_GGUF_Q8_0;
+                lc->qkv_source = MATVEC_SOURCE_GGUF_QKV;
+            }
             snprintf(name, sizeof(name), "model.layers.%d.linear_attn.in_proj_qkv.scales", i);
             lc->qkv_s = get_tensor_ptr(wf, name);
             snprintf(name, sizeof(name), "model.layers.%d.linear_attn.in_proj_qkv.biases", i);
             lc->qkv_b = get_tensor_ptr(wf, name);
             snprintf(name, sizeof(name), "model.layers.%d.linear_attn.in_proj_z.weight", i);
             lc->z_w = get_tensor_ptr(wf, name);
+            if (wf->gguf_linear_z_layers[i]) {
+                lc->z_w = (uint32_t *)wf->gguf_linear_z_layers[i];
+                lc->z_kind = MATVEC_KIND_GGUF_Q8_0;
+                lc->z_source = MATVEC_SOURCE_GGUF_LINEAR;
+            }
             snprintf(name, sizeof(name), "model.layers.%d.linear_attn.in_proj_z.scales", i);
             lc->z_s = get_tensor_ptr(wf, name);
             snprintf(name, sizeof(name), "model.layers.%d.linear_attn.in_proj_z.biases", i);
@@ -4014,6 +5076,11 @@ static void build_layer_cache(WeightFile *wf) {
             lc->gated_norm_w = get_tensor_ptr(wf, name);
             snprintf(name, sizeof(name), "model.layers.%d.linear_attn.out_proj.weight", i);
             lc->out_proj_w = get_tensor_ptr(wf, name);
+            if (wf->gguf_linear_out_layers[i]) {
+                lc->out_proj_w = (uint32_t *)wf->gguf_linear_out_layers[i];
+                lc->out_proj_kind = MATVEC_KIND_GGUF_Q8_0;
+                lc->out_proj_source = MATVEC_SOURCE_GGUF_LINEAR;
+            }
             snprintf(name, sizeof(name), "model.layers.%d.linear_attn.out_proj.scales", i);
             lc->out_proj_s = get_tensor_ptr(wf, name);
             snprintf(name, sizeof(name), "model.layers.%d.linear_attn.out_proj.biases", i);
@@ -4293,9 +5360,9 @@ static void fused_layer_forward(
 
         if (lc->q_w && lc->q_s && lc->q_b && lc->k_w && lc->k_s && lc->k_b &&
             lc->v_w && lc->v_s && lc->v_b) {
-            attn_specs[0] = (BatchMatvecSpec){ lc->q_w, lc->q_s, lc->q_b, q_proj_out, (uint32_t)q_proj_dim, HIDDEN_DIM, GROUP_SIZE, 0 };
-            attn_specs[1] = (BatchMatvecSpec){ lc->k_w, lc->k_s, lc->k_b, k_out,      (uint32_t)kv_dim,     HIDDEN_DIM, GROUP_SIZE, 1 };
-            attn_specs[2] = (BatchMatvecSpec){ lc->v_w, lc->v_s, lc->v_b, v_out,      (uint32_t)kv_dim,     HIDDEN_DIM, GROUP_SIZE, 2 };
+            attn_specs[0] = (BatchMatvecSpec){ lc->q_w, lc->q_s, lc->q_b, q_proj_out, (uint32_t)q_proj_dim, HIDDEN_DIM, GROUP_SIZE, 0, lc->q_kind, lc->q_source };
+            attn_specs[1] = (BatchMatvecSpec){ lc->k_w, lc->k_s, lc->k_b, k_out,      (uint32_t)kv_dim,     HIDDEN_DIM, GROUP_SIZE, 1, lc->k_kind, lc->k_source };
+            attn_specs[2] = (BatchMatvecSpec){ lc->v_w, lc->v_s, lc->v_b, v_out,      (uint32_t)kv_dim,     HIDDEN_DIM, GROUP_SIZE, 2, lc->v_kind, lc->v_source };
             num_attn_specs = 3;
         }
     } else {
@@ -4309,10 +5376,10 @@ static void fused_layer_forward(
 
         if (lc->qkv_w && lc->qkv_s && lc->qkv_b && lc->z_w && lc->z_s && lc->z_b &&
             lc->b_w && lc->b_s && lc->b_b && lc->a_w && lc->a_s && lc->a_b) {
-            attn_specs[0] = (BatchMatvecSpec){ lc->qkv_w, lc->qkv_s, lc->qkv_b, qkv_out,   (uint32_t)qkv_dim,            HIDDEN_DIM, GROUP_SIZE, 0 };
-            attn_specs[1] = (BatchMatvecSpec){ lc->z_w,   lc->z_s,   lc->z_b,   z_out,      (uint32_t)z_dim,              HIDDEN_DIM, GROUP_SIZE, 1 };
-            attn_specs[2] = (BatchMatvecSpec){ lc->b_w,   lc->b_s,   lc->b_b,   beta_out,   (uint32_t)LINEAR_NUM_V_HEADS, HIDDEN_DIM, GROUP_SIZE, 2 };
-            attn_specs[3] = (BatchMatvecSpec){ lc->a_w,   lc->a_s,   lc->a_b,   alpha_out,  (uint32_t)LINEAR_NUM_V_HEADS, HIDDEN_DIM, GROUP_SIZE, 3 };
+            attn_specs[0] = (BatchMatvecSpec){ lc->qkv_w, lc->qkv_s, lc->qkv_b, qkv_out, (uint32_t)qkv_dim, HIDDEN_DIM, GROUP_SIZE, 0, lc->qkv_kind, lc->qkv_source };
+            attn_specs[1] = (BatchMatvecSpec){ lc->z_w,   lc->z_s,   lc->z_b,   z_out,      (uint32_t)z_dim,              HIDDEN_DIM, GROUP_SIZE, 1, lc->z_kind, lc->z_source };
+            attn_specs[2] = (BatchMatvecSpec){ lc->b_w,   lc->b_s,   lc->b_b,   beta_out,   (uint32_t)LINEAR_NUM_V_HEADS, HIDDEN_DIM, GROUP_SIZE, 2, MATVEC_KIND_MLX4, MATVEC_SOURCE_WF };
+            attn_specs[3] = (BatchMatvecSpec){ lc->a_w,   lc->a_s,   lc->a_b,   alpha_out,  (uint32_t)LINEAR_NUM_V_HEADS, HIDDEN_DIM, GROUP_SIZE, 3, MATVEC_KIND_MLX4, MATVEC_SOURCE_WF };
             num_attn_specs = 4;
         }
     }
@@ -4329,6 +5396,8 @@ static void fused_layer_forward(
         linear_layer_idx = layer_idx - (layer_idx + 1) / FULL_ATTN_INTERVAL;
     }
     // Can we run the full linear attention pipeline on GPU in CMD1?
+    int attn_specs_have_q8 = batch_specs_have_q8(attn_specs, num_attn_specs);
+
     int can_gpu_linear = (gpu_linear_attn_enabled &&
                           !is_full && g_metal && g_metal->delta_net_step &&
                           g_metal->conv1d_step && g_metal->rms_norm_qk &&
@@ -4336,6 +5405,7 @@ static void fused_layer_forward(
                           g_metal->wf_buf &&
                           linear_layer_idx >= 0 && linear_layer_idx < NUM_LINEAR_LAYERS &&
                           lc->conv1d_w && lc->A_log && lc->dt_bias && lc->gated_norm_w &&
+                          !attn_specs_have_q8 &&
                           !linear_attn_bypass);
 
     // Check if previous layer's CMD3 already computed combine+residual+norm on GPU.
@@ -4343,7 +5413,7 @@ static void fused_layer_forward(
     // We can submit CMD1 immediately — the GPU queue serializes CMD3(N-1) then CMD1(N).
     int prev_gpu_combined = (g_deferred.active && g_deferred.gpu_combined);
 
-    if (prev_gpu_combined && g_metal && g_metal->wf_buf && num_attn_specs > 0) {
+    if (prev_gpu_combined && g_metal && g_metal->wf_buf && num_attn_specs > 0 && !attn_specs_have_q8) {
         // ---- FAST PATH: GPU-combined previous CMD3 ----
         // buf_input already has the normalized hidden state from CMD3(N-1).
         // Submit CMD1 immediately — GPU runs CMD3(N-1) then CMD1(N) back-to-back.
@@ -4497,7 +5567,7 @@ static void fused_layer_forward(
 
         // Submit CMD1: attention projections
         if (g_timing_enabled) { t0 = now_ms(); }
-        if (g_metal && g_metal->wf_buf && num_attn_specs > 0) {
+        if (g_metal && g_metal->wf_buf && num_attn_specs > 0 && !attn_specs_have_q8) {
             memcpy([g_metal->buf_input contents], normed, HIDDEN_DIM * sizeof(float));
             cmd1 = [g_metal->queue commandBuffer];
             gpu_encode_batch_matvec(g_metal, cmd1, attn_specs, num_attn_specs);
@@ -4595,11 +5665,7 @@ static void fused_layer_forward(
 
             [cmd1 commit];
         } else {
-            for (int i = 0; i < num_attn_specs; i++) {
-                BatchMatvecSpec *s = &attn_specs[i];
-                cpu_dequant_matvec(s->W, s->scales, s->biases, normed, s->out_cpu,
-                                   s->out_dim, s->in_dim, s->group_size);
-            }
+            fast_batch_matvec(normed, HIDDEN_DIM, attn_specs, num_attn_specs);
         }
         if (g_timing_enabled) { t1 = now_ms(); g_timing.cmd1_submit += t1 - t0; }
 
@@ -4715,13 +5781,19 @@ static void fused_layer_forward(
     uint32_t *oproj_w = NULL;
     uint16_t *oproj_s = NULL, *oproj_b = NULL;
     int oproj_in_dim = 0;
+    uint8_t oproj_kind = MATVEC_KIND_MLX4;
+    uint8_t oproj_source = MATVEC_SOURCE_WF;
 
     if (is_full) {
         oproj_w = lc->o_w; oproj_s = lc->o_s; oproj_b = lc->o_b;
         oproj_in_dim = NUM_ATTN_HEADS * HEAD_DIM;
+        oproj_kind = lc->o_kind;
+        oproj_source = lc->o_source;
     } else if (!linear_attn_bypass) {
         oproj_w = lc->out_proj_w; oproj_s = lc->out_proj_s; oproj_b = lc->out_proj_b;
         oproj_in_dim = LINEAR_TOTAL_VALUE;
+        oproj_kind = lc->out_proj_kind;
+        oproj_source = lc->out_proj_source;
     }
 
     // All MoE weight pointers from cache (zero snprintf overhead)
@@ -4733,6 +5805,7 @@ static void fused_layer_forward(
 
     // ---- CPU attention compute (produces attn_out for o_proj) ----
     float *attn_out_for_oproj = NULL;
+    int full_attn_seq_pos = -1;
 
     if (is_full) {
         // ---- Full attention CPU compute ----
@@ -4776,6 +5849,7 @@ static void fused_layer_forward(
 
         // Update KV cache (CPU + GPU mirror)
         int cache_pos = kv->len;
+        full_attn_seq_pos = cache_pos;
         memcpy(kv->k_cache + cache_pos * kv_dim, k_out, kv_dim * sizeof(float));
         memcpy(kv->v_cache + cache_pos * kv_dim, v_out, kv_dim * sizeof(float));
 
@@ -4797,6 +5871,7 @@ static void fused_layer_forward(
         // GPU attention: defer dispatches to CMD2 (fused into single cmd buffer).
         // Only enabled when seq_len >= 32 (below that, CPU is faster).
         int gpu_attn_ready = (g_metal && g_metal->attn_scores_pipe &&
+                              lc->o_kind != MATVEC_KIND_GGUF_Q8_0 &&
                               fa_idx >= 0 && fa_idx < NUM_FULL_ATTN_LAYERS &&
                               kv->len >= 32 && kv->len < GPU_KV_SEQ);
 
@@ -5030,6 +6105,7 @@ static void fused_layer_forward(
     float *shared_up = s_shared_up;
     memset(shared_up, 0, SHARED_INTERMEDIATE * sizeof(float));
     float shared_gate_score = 0.0f;
+    int used_fused_cmd2 = 0;
 
     int have_moe_weights = (gate_w && gate_s && gate_b && sgw && sgs && sgb &&
                             suw && sus && sub && seg_w && seg_s && seg_b);
@@ -5037,13 +6113,20 @@ static void fused_layer_forward(
     // gpu_attn_fuse: attention dispatches fused into CMD2 (full-attn layers only).
     // Only enabled when seq_len >= 32 — below that, CPU attention is faster
     // because GPU command encoder overhead dominates at short sequences.
-    int gpu_attn_fuse = (is_full && !attn_out_for_oproj && g_metal && g_metal->attn_scores_pipe
+    int gpu_attn_fuse = (is_full && lc->o_kind != MATVEC_KIND_GGUF_Q8_0 &&
+                         !attn_out_for_oproj && g_metal && g_metal->attn_scores_pipe
                          && kv && kv->len >= 32 && kv->len < GPU_KV_SEQ);
 
-    if ((attn_out_for_oproj || gpu_attn_fuse) && oproj_w && oproj_s && oproj_b &&
+    int disable_fused_cmd2 = full_attn_force_cmd2_fallback();
+
+    if (!disable_fused_cmd2 &&
+        (attn_out_for_oproj || gpu_attn_fuse) && oproj_w &&
+        (oproj_kind == MATVEC_KIND_GGUF_Q8_0 || (oproj_s && oproj_b)) &&
         g_metal && g_metal->wf_buf && have_moe_weights &&
+        (oproj_kind != MATVEC_KIND_GGUF_Q8_0 || matvec_source_buffer(g_metal, oproj_source, NULL) != nil) &&
         g_metal->residual_add && g_metal->rms_norm_sum &&
         g_metal->rms_norm_apply_bf16 && lc->post_attn_norm_w) {
+        used_fused_cmd2 = 1;
         // ---- FULLY FUSED CMD2 ----
         // For GPU attention (full-attn layers): attention dispatches are prepended,
         //   o_proj reads from buf_attn_out instead of batch_out[6].
@@ -5150,10 +6233,6 @@ static void fused_layer_forward(
 
         // ---- o_proj matvec ----
         {
-            NSUInteger w_off = (NSUInteger)((const char *)oproj_w - (const char *)[g_metal->wf_buf contents]);
-            NSUInteger s_off = (NSUInteger)((const char *)oproj_s - (const char *)[g_metal->wf_buf contents]);
-            NSUInteger b_off = (NSUInteger)((const char *)oproj_b - (const char *)[g_metal->wf_buf contents]);
-
             // For GPU attention: o_proj reads from buf_attn_out
             // For CPU attention: o_proj reads from batch_out[6]
             id<MTLBuffer> oproj_input = gpu_attn_fuse ? g_metal->buf_attn_out : g_metal->batch_out[6];
@@ -5161,18 +6240,36 @@ static void fused_layer_forward(
             id<MTLComputeCommandEncoder> enc = [cmd_fused computeCommandEncoder];
             uint32_t o_out_dim = HIDDEN_DIM;
             uint32_t o_in_dim = (uint32_t)oproj_in_dim;
-            uint32_t o_gs = GROUP_SIZE;
-            [enc setComputePipelineState:g_metal->matvec_fast];
-            [enc setBuffer:g_metal->wf_buf  offset:w_off atIndex:0];
-            [enc setBuffer:g_metal->wf_buf  offset:s_off atIndex:1];
-            [enc setBuffer:g_metal->wf_buf  offset:b_off atIndex:2];
-            [enc setBuffer:oproj_input      offset:0    atIndex:3];
-            [enc setBuffer:g_metal->buf_output offset:0 atIndex:4];
-            [enc setBytes:&o_out_dim  length:4 atIndex:5];
-            [enc setBytes:&o_in_dim   length:4 atIndex:6];
-            [enc setBytes:&o_gs       length:4 atIndex:7];
-            [enc dispatchThreadgroups:MTLSizeMake(o_out_dim, 1, 1)
-                threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+            if (oproj_kind == MATVEC_KIND_GGUF_Q8_0) {
+                const char *w_base = NULL;
+                id<MTLBuffer> q8_buf = matvec_source_buffer(g_metal, oproj_source, &w_base);
+                NSUInteger w_off = (NSUInteger)((const char *)oproj_w - w_base);
+                [enc setComputePipelineState:g_metal->matvec_q8_0];
+                [enc setBuffer:q8_buf                      offset:w_off atIndex:0];
+                [enc setBuffer:oproj_input                 offset:0     atIndex:1];
+                [enc setBuffer:g_metal->buf_output         offset:0     atIndex:2];
+                [enc setBytes:&o_out_dim                   length:4     atIndex:3];
+                [enc setBytes:&o_in_dim                    length:4     atIndex:4];
+                uint32_t num_tgs = (o_out_dim + 7) / 8;
+                [enc dispatchThreadgroups:MTLSizeMake(num_tgs, 1, 1)
+                    threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+            } else {
+                NSUInteger w_off = (NSUInteger)((const char *)oproj_w - (const char *)[g_metal->wf_buf contents]);
+                NSUInteger s_off = (NSUInteger)((const char *)oproj_s - (const char *)[g_metal->wf_buf contents]);
+                NSUInteger b_off = (NSUInteger)((const char *)oproj_b - (const char *)[g_metal->wf_buf contents]);
+                uint32_t o_gs = GROUP_SIZE;
+                [enc setComputePipelineState:g_metal->matvec_fast];
+                [enc setBuffer:g_metal->wf_buf       offset:w_off atIndex:0];
+                [enc setBuffer:g_metal->wf_buf       offset:s_off atIndex:1];
+                [enc setBuffer:g_metal->wf_buf       offset:b_off atIndex:2];
+                [enc setBuffer:oproj_input           offset:0     atIndex:3];
+                [enc setBuffer:g_metal->buf_output   offset:0     atIndex:4];
+                [enc setBytes:&o_out_dim             length:4     atIndex:5];
+                [enc setBytes:&o_in_dim              length:4     atIndex:6];
+                [enc setBytes:&o_gs                  length:4     atIndex:7];
+                [enc dispatchThreadgroups:MTLSizeMake(o_out_dim, 1, 1)
+                    threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+            }
             [enc endEncoding];
         }
 
@@ -5254,9 +6351,24 @@ static void fused_layer_forward(
     } else {
         // ---- Non-fused fallback path ----
         // O projection
-        if (attn_out_for_oproj && oproj_w && oproj_s && oproj_b) {
-            fast_dequant_matvec(oproj_w, oproj_s, oproj_b, attn_out_for_oproj,
-                                attn_projected, HIDDEN_DIM, oproj_in_dim, GROUP_SIZE);
+        if (attn_out_for_oproj && oproj_w &&
+            (oproj_kind == MATVEC_KIND_GGUF_Q8_0 || (oproj_s && oproj_b))) {
+            fast_kind_matvec(oproj_w, oproj_s, oproj_b, oproj_kind, oproj_source,
+                             attn_out_for_oproj, attn_projected,
+                             HIDDEN_DIM, oproj_in_dim, GROUP_SIZE);
+            if (is_full &&
+                oproj_kind == MATVEC_KIND_GGUF_Q8_0 &&
+                oproj_source == MATVEC_SOURCE_GGUF_FULL_ATTN) {
+                maybe_debug_full_attn_o_proj_compare(
+                    wf,
+                    layer_idx,
+                    full_attn_seq_pos,
+                    attn_out_for_oproj,
+                    attn_projected,
+                    (const GGUFBlockQ8_0 *)oproj_w,
+                    oproj_in_dim
+                );
+            }
         }
         // attn_out_for_oproj is static — no free needed
         attn_out_for_oproj = NULL;
@@ -5615,8 +6727,14 @@ static void fused_layer_forward(
                            g_metal->wf_buf &&
                            layer_idx < NUM_LAYERS - 1 &&
                            layer_cache[layer_idx + 1].input_norm_w != NULL);
+        if (disable_gpu_combine_debug()) {
+            gpu_combine = 0;
+        }
 
         if (gpu_combine) {
+            if (!used_fused_cmd2) {
+                memcpy([g_metal->buf_h_mid contents], h_mid, HIDDEN_DIM * sizeof(float));
+            }
             // Copy h_mid from buf_h_mid (populated by CMD2) — it's still valid on GPU.
             // h_mid is already in buf_h_mid from CMD2's residual_add dispatch.
 
@@ -6769,6 +7887,13 @@ static void print_usage(const char *prog) {
     printf("  --model PATH         Model path\n");
     printf("  --weights PATH       model_weights.bin path\n");
     printf("  --manifest PATH      model_weights.json path\n");
+    printf("  --gguf-lm-head PATH  Optional raw Q6_K LM head blob copied from GGUF\n");
+    printf("  --gguf-full-attn-bin PATH  Optional raw Q8_0 full-attention q/k/v/o overlay blob\n");
+    printf("  --gguf-full-attn-json PATH Optional full-attention overlay manifest JSON\n");
+    printf("  --gguf-qkv-bin PATH  Optional raw Q8_0 qkv family blob copied from GGUF\n");
+    printf("  --gguf-qkv-json PATH Optional qkv family manifest JSON\n");
+    printf("  --gguf-linear-bin PATH Optional raw Q8_0 linear gate/out overlay blob\n");
+    printf("  --gguf-linear-json PATH Optional linear gate/out overlay manifest JSON\n");
     printf("  --vocab PATH         vocab.bin path\n");
     printf("  --prompt-tokens PATH prompt_tokens.bin path\n");
     printf("  --prompt TEXT         Prompt text (requires encode_prompt.py)\n");
@@ -6787,6 +7912,7 @@ static void print_usage(const char *prog) {
     printf("  --think-budget N     Max thinking tokens before force </think> (default: 2048, 0=unlimited)\n");
     printf("  --ppl PATH           Measure perplexity on ground truth token file\n");
     printf("  --stream             Clean streaming output (no progress, no stats)\n");
+    printf("  --gguf-embedding P   Use extracted GGUF Q8_0 embedding blob\n");
     printf("  --nax                Enable NAX tensor matmul for LM head (M5+, slower for single-token)\n");
     printf("  --no-nax             Disable NAX (default)\n");
     printf("  --serve PORT         Run HTTP server (OpenAI-compatible API)\n");
@@ -6798,6 +7924,14 @@ int main(int argc, char **argv) {
         const char *model_path = MODEL_PATH_DEFAULT;
         const char *weights_path = NULL;
         const char *manifest_path = NULL;
+        const char *gguf_embedding_path = NULL;
+        const char *gguf_full_attn_bin_path = NULL;
+        const char *gguf_full_attn_json_path = NULL;
+        const char *gguf_qkv_bin_path = NULL;
+        const char *gguf_qkv_json_path = NULL;
+        const char *gguf_linear_bin_path = NULL;
+        const char *gguf_linear_json_path = NULL;
+        const char *gguf_lm_head_path = NULL;
         const char *vocab_path = NULL;
         const char *prompt_tokens_path = NULL;
         const char *prompt_text = NULL;
@@ -6812,6 +7946,14 @@ int main(int argc, char **argv) {
             {"model",         required_argument, 0, 'm'},
             {"weights",       required_argument, 0, 'w'},
             {"manifest",      required_argument, 0, 'j'},
+            {"gguf-embedding", required_argument, 0, 'I'},
+            {"gguf-full-attn-bin", required_argument, 0, 'A'},
+            {"gguf-full-attn-json", required_argument, 0, 'N'},
+            {"gguf-qkv-bin",  required_argument, 0, 'J'},
+            {"gguf-qkv-json", required_argument, 0, 'K'},
+            {"gguf-linear-bin", required_argument, 0, 'U'},
+            {"gguf-linear-json", required_argument, 0, 'V'},
+            {"gguf-lm-head",  required_argument, 0, 'Y'},
             {"vocab",         required_argument, 0, 'v'},
             {"prompt-tokens", required_argument, 0, 'p'},
             {"prompt",        required_argument, 0, 'P'},
@@ -6839,11 +7981,19 @@ int main(int argc, char **argv) {
         };
 
         int c;
-        while ((c = getopt_long(argc, argv, "m:w:j:v:p:P:t:k:C:M:R:B:LSTFE2Gh", long_options, NULL)) != -1) {
+        while ((c = getopt_long(argc, argv, "m:w:j:I:A:N:J:K:U:V:Y:v:p:P:t:k:C:M:R:B:LSTFE2Gh", long_options, NULL)) != -1) {
             switch (c) {
                 case 'm': model_path = optarg; break;
                 case 'w': weights_path = optarg; break;
                 case 'j': manifest_path = optarg; break;
+                case 'I': gguf_embedding_path = optarg; break;
+                case 'A': gguf_full_attn_bin_path = optarg; break;
+                case 'N': gguf_full_attn_json_path = optarg; break;
+                case 'J': gguf_qkv_bin_path = optarg; break;
+                case 'K': gguf_qkv_json_path = optarg; break;
+                case 'U': gguf_linear_bin_path = optarg; break;
+                case 'V': gguf_linear_json_path = optarg; break;
+                case 'Y': gguf_lm_head_path = optarg; break;
                 case 'v': vocab_path = optarg; break;
                 case 'p': prompt_tokens_path = optarg; break;
                 case 'P': prompt_text = optarg; break;
@@ -6948,6 +8098,21 @@ int main(int argc, char **argv) {
             printf("Model:    %s\n", model_path);
             printf("Weights:  %s\n", weights_path);
             printf("Manifest: %s\n", manifest_path);
+            if (gguf_embedding_path) {
+                printf("Embedding:%s\n", gguf_embedding_path);
+            }
+            if (gguf_full_attn_bin_path) {
+                printf("FullAttn: %s\n", gguf_full_attn_bin_path);
+            }
+            if (gguf_qkv_bin_path) {
+                printf("QKV:      %s\n", gguf_qkv_bin_path);
+            }
+            if (gguf_linear_bin_path) {
+                printf("LinearOv: %s\n", gguf_linear_bin_path);
+            }
+            if (gguf_lm_head_path) {
+                printf("LM Head:  %s\n", gguf_lm_head_path);
+            }
             printf("Vocab:    %s\n", vocab_path);
             printf("K:        %d experts/layer\n", K);
             printf("Quant:    %s experts (%zu bytes each)\n", g_use_2bit ? "2-bit" : "4-bit", active_expert_size());
@@ -6971,9 +8136,47 @@ int main(int argc, char **argv) {
             return 1;
         }
 
+        if (gguf_embedding_path && !attach_gguf_embedding(wf, gguf_embedding_path)) {
+            fprintf(stderr, "ERROR: Failed to attach GGUF embedding\n");
+            return 1;
+        }
+
+        if (gguf_full_attn_bin_path &&
+            !attach_gguf_full_attn_overlay(wf, gguf_full_attn_bin_path, gguf_full_attn_json_path)) {
+            fprintf(stderr, "ERROR: Failed to attach GGUF full-attn overlay\n");
+            return 1;
+        }
+
+        if (gguf_qkv_bin_path && !attach_gguf_qkv_overlay(wf, gguf_qkv_bin_path, gguf_qkv_json_path)) {
+            fprintf(stderr, "ERROR: Failed to attach GGUF qkv overlay\n");
+            return 1;
+        }
+
+        if (gguf_linear_bin_path && !attach_gguf_linear_overlay(wf, gguf_linear_bin_path, gguf_linear_json_path)) {
+            fprintf(stderr, "ERROR: Failed to attach GGUF linear overlay\n");
+            return 1;
+        }
+
+        if (gguf_lm_head_path && !attach_gguf_lm_head(wf, gguf_lm_head_path)) {
+            fprintf(stderr, "ERROR: Failed to attach GGUF LM head\n");
+            return 1;
+        }
+
         // Wrap weight file for Metal GPU access
         if (g_metal) {
             metal_set_weights(g_metal, wf->data, wf->size);
+            if (wf->gguf_full_attn_data) {
+                metal_set_gguf_full_attn(g_metal, wf->gguf_full_attn_data, wf->gguf_full_attn_size);
+            }
+            if (wf->gguf_qkv_data) {
+                metal_set_gguf_qkv(g_metal, wf->gguf_qkv_data, wf->gguf_qkv_size);
+            }
+            if (wf->gguf_linear_data) {
+                metal_set_gguf_linear(g_metal, wf->gguf_linear_data, wf->gguf_linear_size);
+            }
+            if (wf->gguf_lm_head_data) {
+                metal_set_gguf_lm_head(g_metal, wf->gguf_lm_head_data, wf->gguf_lm_head_size);
+            }
         }
 
         // ---- Load vocabulary ----
@@ -7249,9 +8452,12 @@ int main(int argc, char **argv) {
                     if (tokens_scored % 10 == 0 || tokens_scored == num_eval) {
                         double elapsed = now_ms() - t_ppl_start;
                         double avg_nll = total_nll / tokens_scored;
-                        fprintf(stderr, "\r[ppl] %d/%d tokens | NLL=%.4f | PPL=%.2f | %.2f tok/s",
-                                tokens_scored, num_eval, avg_nll, exp(avg_nll),
-                                tokens_scored * 1000.0 / elapsed);
+                        double tok_s = tokens_scored * 1000.0 / elapsed;
+                        double eta_s = tok_s > 0.0 ? (num_eval - tokens_scored) / tok_s : 0.0;
+                        char eta_buf[16];
+                        format_eta(eta_s, eta_buf, sizeof(eta_buf));
+                        fprintf(stderr, "\r[ppl] %d/%d tokens | NLL=%.4f | PPL=%.2f | %.2f tok/s | ETA %s",
+                                tokens_scored, num_eval, avg_nll, exp(avg_nll), tok_s, eta_buf);
                     }
                 }
             }

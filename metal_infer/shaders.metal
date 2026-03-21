@@ -40,6 +40,26 @@ inline uint16_t f32_to_bf16(float f) {
     return uint16_t(as_type<uint>(f) >> 16);
 }
 
+inline float f16_to_f32(ushort fp16_bits) {
+    return float(as_type<half>(fp16_bits));
+}
+
+#define GGUF_QK8_0 32
+#define GGUF_QK_K 256
+#define GGUF_Q8_MAX_IN_DIM 8192
+
+struct GGUFBlockQ8_0 {
+    ushort d;
+    char   qs[GGUF_QK8_0];
+};
+
+struct GGUFBlockQ6K {
+    uchar ql[GGUF_QK_K/2];
+    uchar qh[GGUF_QK_K/4];
+    char  scales[GGUF_QK_K/16];
+    ushort d;
+};
+
 
 // ============================================================================
 // Kernel 1: 4-bit dequantized matrix-vector multiply (NAIVE — reference)
@@ -159,6 +179,104 @@ kernel void dequant_matvec_4bit_fast(
         if (simd_lane == 0) {
             out[tgid] = val;
         }
+    }
+}
+
+// ============================================================================
+// GGUF Q8_0 matvec for resident tensors
+// Reuses the same tiled shape as the 4-bit kernel: 8 rows per threadgroup.
+// ============================================================================
+
+kernel void dequant_matvec_q8_0(
+    device const GGUFBlockQ8_0* W      [[buffer(0)]],
+    device const float*         x      [[buffer(1)]],
+    device float*               out    [[buffer(2)]],
+    constant uint&              out_dim [[buffer(3)]],
+    constant uint&              in_dim  [[buffer(4)]],
+    uint tgid   [[threadgroup_position_in_grid]],
+    uint lid    [[thread_position_in_threadgroup]],
+    uint simd_lane  [[thread_index_in_simdgroup]],
+    uint simd_group [[simdgroup_index_in_threadgroup]]
+) {
+    const uint row = tgid * 8 + simd_group;
+    const uint blocks_per_row = in_dim / GGUF_QK8_0;
+
+    threadgroup float x_shared[GGUF_Q8_MAX_IN_DIM];
+    for (uint i = lid; i < in_dim; i += 256) {
+        x_shared[i] = x[i];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (row >= out_dim) return;
+
+    device const GGUFBlockQ8_0* row_blocks = W + row * blocks_per_row;
+    float acc = 0.0f;
+
+    for (uint bi = simd_lane; bi < blocks_per_row; bi += 32) {
+        device const GGUFBlockQ8_0& blk = row_blocks[bi];
+        const float d = f16_to_f32(blk.d);
+        const uint base = bi * GGUF_QK8_0;
+        for (uint i = 0; i < GGUF_QK8_0; i++) {
+            acc += d * float(blk.qs[i]) * x_shared[base + i];
+        }
+    }
+
+    const float sum = simd_sum(acc);
+    if (simd_lane == 0) {
+        out[row] = sum;
+    }
+}
+
+// ============================================================================
+// GGUF Q6_K matvec for resident tensors
+// One SIMD group handles one output row exactly, preserving GGUF block layout.
+// ============================================================================
+
+kernel void dequant_matvec_q6_k(
+    device const GGUFBlockQ6K* W      [[buffer(0)]],
+    device const float*        x      [[buffer(1)]],
+    device float*              out    [[buffer(2)]],
+    constant uint&             out_dim [[buffer(3)]],
+    constant uint&             in_dim  [[buffer(4)]],
+    uint3 tgpig [[threadgroup_position_in_grid]],
+    ushort lane [[thread_index_in_simdgroup]]
+) {
+    const uint row = tgpig.x;
+    if (row >= out_dim) return;
+
+    const uint blocks_per_row = in_dim / GGUF_QK_K;
+    device const GGUFBlockQ6K* row_blocks = W + row * blocks_per_row;
+
+    float acc = 0.0f;
+
+    for (uint bi = 0; bi < blocks_per_row; ++bi) {
+        device const GGUFBlockQ6K& blk = row_blocks[bi];
+        const float d = f16_to_f32(blk.d);
+        device const float* x_block = x + bi * GGUF_QK_K;
+
+        for (uint part = 0; part < GGUF_QK_K; part += 128) {
+            device const uchar* ql = blk.ql + part / 2;
+            device const uchar* qh = blk.qh + part / 4;
+            device const char* sc = blk.scales + part / 16;
+
+            const uint is = lane / 16;
+            const uchar qh_lane = qh[lane];
+            const int q1 = int((ql[lane +  0] & 0xF) | (((qh_lane >> 0) & 0x3) << 4)) - 32;
+            const int q2 = int((ql[lane + 32] & 0xF) | (((qh_lane >> 2) & 0x3) << 4)) - 32;
+            const int q3 = int((ql[lane +  0] >> 4) | (((qh_lane >> 4) & 0x3) << 4)) - 32;
+            const int q4 = int((ql[lane + 32] >> 4) | (((qh_lane >> 6) & 0x3) << 4)) - 32;
+
+            const uint base = part + lane;
+            acc += d * float(sc[is + 0]) * float(q1) * x_block[base +  0];
+            acc += d * float(sc[is + 2]) * float(q2) * x_block[base + 32];
+            acc += d * float(sc[is + 4]) * float(q3) * x_block[base + 64];
+            acc += d * float(sc[is + 6]) * float(q4) * x_block[base + 96];
+        }
+    }
+
+    const float sum = simd_sum(acc);
+    if (lane == 0) {
+        out[row] = sum;
     }
 }
 

@@ -1,0 +1,153 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1180" height="900" viewBox="0 0 1180 900" role="img" aria-labelledby="title desc">
+  <title id="title">GGUF Resident-Tensor Checkpoint</title>
+  <desc id="desc">Locked resident-tensor snapshot for Flash-MoE GGUF hybrid work, comparing embedding and LM head overlays across 4-bit and 2-bit paths.</desc>
+  <defs>
+    <style>
+      .bg { fill: #f6f3ed; }
+      .panel { fill: #fffdf9; stroke: #d7cfc2; stroke-width: 2; }
+      .title { fill: #1f1f1f; font: 700 30px Helvetica, Arial, sans-serif; }
+      .subtitle { fill: #5b554d; font: 400 16px Helvetica, Arial, sans-serif; }
+      .section { fill: #2f2a24; font: 700 20px Helvetica, Arial, sans-serif; }
+      .label { fill: #2f2a24; font: 600 15px Helvetica, Arial, sans-serif; }
+      .small { fill: #6b645c; font: 400 13px Helvetica, Arial, sans-serif; }
+      .tableh { fill: #4a433b; font: 700 13px Helvetica, Arial, sans-serif; }
+      .table { fill: #2f2a24; font: 400 13px Helvetica, Arial, sans-serif; }
+      .value { fill: #1f1f1f; font: 700 13px Helvetica, Arial, sans-serif; }
+      .axis { stroke: #b7aea0; stroke-width: 1.5; }
+      .grid { stroke: #e3ddd4; stroke-width: 1; }
+    </style>
+  </defs>
+
+  <rect class="bg" x="0" y="0" width="1180" height="900"/>
+
+  <text class="title" x="56" y="62">GGUF Resident-Tensor Checkpoint</text>
+  <text class="subtitle" x="56" y="92">Locked baseline for persistent GGUF overlays. Full PPL uses the 2k-token set. Lower PPL is better; higher tok/s is better.</text>
+
+  <rect class="panel" x="44" y="122" width="1092" height="734" rx="18"/>
+
+  <text class="section" x="72" y="162">Summary</text>
+  <text class="small" x="72" y="186">Date: 2026-03-20</text>
+  <text class="small" x="72" y="206">This SVG is the locked resident-tensor checkpoint for future GGUF autoresearch comparisons.</text>
+  <text class="small" x="72" y="226">Resident overlay includes `token_embd.weight` and `output.weight`; streamed experts are intentionally out of scope here.</text>
+
+  <rect x="72" y="246" width="1036" height="36" fill="#efe7db" rx="8"/>
+  <text class="tableh" x="92" y="269">Configuration</text>
+  <text class="tableh" x="468" y="269">Full PPL</text>
+  <text class="tableh" x="598" y="269">Cross-Entropy</text>
+  <text class="tableh" x="764" y="269">Full-PPL tok/s</text>
+  <text class="tableh" x="946" y="269">Takeaway</text>
+
+  <rect x="72" y="290" width="1036" height="38" fill="#fffaf2"/>
+  <text class="table" x="92" y="315">4-bit baseline</text>
+  <text class="value" x="468" y="315">3.64</text>
+  <text class="value" x="598" y="315">1.2920</text>
+  <text class="value" x="764" y="315">8.58</text>
+  <text class="table" x="946" y="315">Current production-quality reference</text>
+
+  <rect x="72" y="328" width="1036" height="38" fill="#f7fbfb"/>
+  <text class="table" x="92" y="353">4-bit + GGUF Q6_K LM head</text>
+  <text class="value" x="468" y="353">3.62</text>
+  <text class="value" x="598" y="353">1.2856</text>
+  <text class="value" x="764" y="353">8.29</text>
+  <text class="table" x="946" y="353">Slightly better quality, slightly slower</text>
+
+  <rect x="72" y="366" width="1036" height="38" fill="#eef7f7"/>
+  <text class="table" x="92" y="391">4-bit + GGUF embedding + GGUF Q6_K LM head</text>
+  <text class="value" x="468" y="391">3.61</text>
+  <text class="value" x="598" y="391">1.2829</text>
+  <text class="value" x="764" y="391">8.35</text>
+  <text class="table" x="946" y="391">Locked resident-tensor checkpoint</text>
+
+  <rect x="72" y="404" width="1036" height="38" fill="#f5f7ff"/>
+  <text class="table" x="92" y="429">--2bit</text>
+  <text class="value" x="468" y="429">5.71</text>
+  <text class="value" x="598" y="429">1.7415</text>
+  <text class="value" x="764" y="429">11.21</text>
+  <text class="table" x="946" y="429">Much faster, materially worse quality</text>
+
+  <rect x="72" y="442" width="1036" height="38" fill="#eef9f4"/>
+  <text class="table" x="92" y="467">--2bit + GGUF Q6_K LM head</text>
+  <text class="value" x="468" y="467">5.66</text>
+  <text class="value" x="598" y="467">1.7333</text>
+  <text class="value" x="764" y="467">11.40</text>
+  <text class="table" x="946" y="467">Small 2-bit recovery; still far from 4-bit quality</text>
+
+  <rect x="72" y="480" width="1036" height="38" fill="#edf9f2"/>
+  <text class="table" x="92" y="505">--2bit + GGUF embedding + GGUF Q6_K LM head</text>
+  <text class="value" x="468" y="505">5.72</text>
+  <text class="value" x="598" y="505">1.7445</text>
+  <text class="value" x="764" y="505">9.37</text>
+  <text class="table" x="946" y="505">Resident overlay works, but quality remains lower</text>
+
+  <text class="section" x="72" y="566">Full PPL (Lower Is Better)</text>
+  <line class="axis" x1="250" y1="604" x2="650" y2="604"/>
+  <line class="grid" x1="250" y1="604" x2="250" y2="808"/>
+  <line class="grid" x1="330" y1="604" x2="330" y2="808"/>
+  <line class="grid" x1="410" y1="604" x2="410" y2="808"/>
+  <line class="grid" x1="490" y1="604" x2="490" y2="808"/>
+  <line class="grid" x1="570" y1="604" x2="570" y2="808"/>
+  <line class="grid" x1="650" y1="604" x2="650" y2="808"/>
+  <text class="small" x="246" y="828">0</text>
+  <text class="small" x="322" y="828">1.5</text>
+  <text class="small" x="402" y="828">3.0</text>
+  <text class="small" x="482" y="828">4.5</text>
+  <text class="small" x="562" y="828">6.0</text>
+  <text class="small" x="641" y="828">7.5</text>
+
+  <text class="label" x="72" y="630">4-bit baseline</text>
+  <rect x="250" y="614" width="194" height="20" fill="#c56b2d" rx="10"/>
+  <text class="value" x="454" y="630">3.64</text>
+
+  <text class="label" x="72" y="668">4-bit + GGUF Q6_K LM head</text>
+  <rect x="250" y="652" width="193" height="20" fill="#2d8f82" rx="10"/>
+  <text class="value" x="453" y="668">3.62</text>
+
+  <text class="label" x="72" y="706">4-bit + GGUF embedding + GGUF LM head</text>
+  <rect x="250" y="690" width="192" height="20" fill="#1f8d70" rx="10"/>
+  <text class="value" x="452" y="706">3.61</text>
+
+  <text class="label" x="72" y="744">--2bit</text>
+  <rect x="250" y="728" width="305" height="20" fill="#5670d1" rx="10"/>
+  <text class="value" x="565" y="744">5.71</text>
+
+  <text class="label" x="72" y="782">--2bit + GGUF Q6_K LM head</text>
+  <rect x="250" y="766" width="302" height="20" fill="#47a96f" rx="10"/>
+  <text class="value" x="562" y="782">5.66</text>
+
+  <text class="label" x="72" y="820">--2bit + GGUF embedding + GGUF LM head</text>
+  <rect x="250" y="804" width="304" height="20" fill="#79a93f" rx="10"/>
+  <text class="value" x="564" y="820">5.72</text>
+
+  <text class="section" x="720" y="566">Full-PPL Throughput (Higher Is Better)</text>
+  <line class="axis" x1="760" y1="604" x2="1060" y2="604"/>
+  <line class="grid" x1="760" y1="604" x2="760" y2="808"/>
+  <line class="grid" x1="820" y1="604" x2="820" y2="808"/>
+  <line class="grid" x1="880" y1="604" x2="880" y2="808"/>
+  <line class="grid" x1="940" y1="604" x2="940" y2="808"/>
+  <line class="grid" x1="1000" y1="604" x2="1000" y2="808"/>
+  <line class="grid" x1="1060" y1="604" x2="1060" y2="808"/>
+  <text class="small" x="756" y="828">0</text>
+  <text class="small" x="810" y="828">2.5</text>
+  <text class="small" x="872" y="828">5.0</text>
+  <text class="small" x="932" y="828">7.5</text>
+  <text class="small" x="991" y="828">10.0</text>
+  <text class="small" x="1047" y="828">12.5</text>
+
+  <rect x="760" y="614" width="206" height="20" fill="#c56b2d" rx="10"/>
+  <text class="value" x="974" y="630">8.58</text>
+
+  <rect x="760" y="652" width="199" height="20" fill="#2d8f82" rx="10"/>
+  <text class="value" x="967" y="668">8.29</text>
+
+  <rect x="760" y="690" width="201" height="20" fill="#1f8d70" rx="10"/>
+  <text class="value" x="969" y="706">8.35</text>
+
+  <rect x="760" y="728" width="269" height="20" fill="#5670d1" rx="10"/>
+  <text class="value" x="1037" y="744">11.21</text>
+
+  <rect x="760" y="766" width="274" height="20" fill="#47a96f" rx="10"/>
+  <text class="value" x="1042" y="782">11.40</text>
+
+  <rect x="760" y="804" width="188" height="20" fill="#79a93f" rx="10"/>
+  <text class="value" x="956" y="820">9.37</text>
+</svg>

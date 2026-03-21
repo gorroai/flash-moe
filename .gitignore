@@ -30,8 +30,15 @@ __pycache__/
 *.npz
 logs/
 *.log
+autoresearch/results.tsv
+autoresearch/last_result.json
+autoresearch/logs/
+autoresearch/baselines/
+autoresearch/gguf/
 
 # Test binaries and experiment data
 metal_infer/test_lzfse
 metal_infer/repack_experts_lz4
 metal_infer/routing_data.bin
+metal_infer/nax_bench
+metal_infer/nax_bench.ir

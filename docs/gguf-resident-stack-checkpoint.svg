@@ -1,0 +1,131 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1220" height="820" viewBox="0 0 1220 820" role="img" aria-labelledby="title desc">
+  <title id="title">GGUF Resident Stack Checkpoint</title>
+  <desc id="desc">Resident GGUF checkpoint after finishing the non-shared persistent Q8_0 linear tensors attn_gate and ssm_out. The isolated linear overlay is a keep, and the combined resident stack reaches 3.42 full 2k-token perplexity on the 4-bit path.</desc>
+  <defs>
+    <style>
+      .bg { fill: #f5f1e8; }
+      .panel { fill: #fffdf8; stroke: #d7cebe; stroke-width: 2; }
+      .title { fill: #1f1f1f; font: 700 30px Helvetica, Arial, sans-serif; }
+      .subtitle { fill: #5c554c; font: 400 16px Helvetica, Arial, sans-serif; }
+      .section { fill: #2d2924; font: 700 20px Helvetica, Arial, sans-serif; }
+      .tableh { fill: #4a433b; font: 700 13px Helvetica, Arial, sans-serif; }
+      .table { fill: #2f2a24; font: 400 13px Helvetica, Arial, sans-serif; }
+      .value { fill: #1f1f1f; font: 700 13px Helvetica, Arial, sans-serif; }
+      .small { fill: #6b645c; font: 400 13px Helvetica, Arial, sans-serif; }
+      .label { fill: #2f2a24; font: 600 15px Helvetica, Arial, sans-serif; }
+      .axis { stroke: #b8aea0; stroke-width: 1.5; }
+      .grid { stroke: #e3ddd4; stroke-width: 1; }
+      .good { fill: #e8f6ee; }
+      .warn { fill: #fff4e7; }
+      .note { fill: #f1ebe0; }
+    </style>
+  </defs>
+
+  <rect class="bg" x="0" y="0" width="1220" height="820"/>
+  <text class="title" x="56" y="62">GGUF Resident Stack Checkpoint</text>
+  <text class="subtitle" x="56" y="92">2026-03-20. Non-shared persistent tensors are now covered: embedding, LM head, linear-attention QKV, full attention, attn_gate, and ssm_out.</text>
+
+  <rect class="panel" x="44" y="122" width="1132" height="654" rx="18"/>
+
+  <text class="section" x="72" y="162">Summary</text>
+  <text class="small" x="72" y="186">Scope: resident GGUF overlays only. Shared experts and streamed experts remain out of scope by design.</text>
+  <text class="small" x="72" y="206">New completion point: resident Q8_0 linear overlay for `blk.*.attn_gate.weight` and `blk.*.ssm_out.weight`.</text>
+
+  <rect x="72" y="236" width="1076" height="36" fill="#efe7db" rx="8"/>
+  <text class="tableh" x="92" y="259">Configuration</text>
+  <text class="tableh" x="380" y="259">Smoke</text>
+  <text class="tableh" x="472" y="259">Decode tok/s</text>
+  <text class="tableh" x="590" y="259">Prefill tok/s</text>
+  <text class="tableh" x="710" y="259">Short PPL</text>
+  <text class="tableh" x="814" y="259">2k PPL</text>
+  <text class="tableh" x="914" y="259">2k tok/s</text>
+  <text class="tableh" x="1010" y="259">Status</text>
+  <text class="tableh" x="1084" y="259">Notes</text>
+
+  <rect class="warn" x="72" y="280" width="1076" height="38"/>
+  <text class="table" x="92" y="305">4-bit baseline</text>
+  <text class="value" x="380" y="305">Reference</text>
+  <text class="table" x="472" y="305">n/a</text>
+  <text class="table" x="590" y="305">n/a</text>
+  <text class="value" x="710" y="305">5.51</text>
+  <text class="value" x="814" y="305">3.64</text>
+  <text class="value" x="914" y="305">8.58</text>
+  <text class="value" x="1010" y="305">Baseline</text>
+  <text class="table" x="1084" y="305">Recorded prior checkpoint</text>
+
+  <rect class="good" x="72" y="318" width="1076" height="38"/>
+  <text class="table" x="92" y="343">Linear overlay only (`attn_gate` + `ssm_out`)</text>
+  <text class="value" x="380" y="343">Sane</text>
+  <text class="value" x="472" y="343">7.10</text>
+  <text class="value" x="590" y="343">1.82</text>
+  <text class="value" x="710" y="343">5.49</text>
+  <text class="value" x="814" y="343">3.57</text>
+  <text class="value" x="914" y="343">7.27</text>
+  <text class="value" x="1010" y="343">Keep</text>
+  <text class="table" x="1084" y="343">Inverse Qwen3.5 row and column bridge</text>
+
+  <rect class="good" x="72" y="356" width="1076" height="38"/>
+  <text class="table" x="92" y="381">Resident stack before linear overlay</text>
+  <text class="value" x="380" y="381">Sane</text>
+  <text class="table" x="472" y="381">n/a</text>
+  <text class="table" x="590" y="381">n/a</text>
+  <text class="value" x="710" y="381">5.18</text>
+  <text class="value" x="814" y="381">3.49</text>
+  <text class="value" x="914" y="381">5.10</text>
+  <text class="value" x="1010" y="381">Keep</text>
+  <text class="table" x="1084" y="381">Embedding + LM head + QKV + full attention</text>
+
+  <rect class="good" x="72" y="394" width="1076" height="38"/>
+  <text class="table" x="92" y="419">Final resident stack with linear overlay</text>
+  <text class="value" x="380" y="419">Sane</text>
+  <text class="table" x="472" y="419">n/a</text>
+  <text class="table" x="590" y="419">n/a</text>
+  <text class="value" x="710" y="419">5.20</text>
+  <text class="value" x="814" y="419">3.42</text>
+  <text class="value" x="914" y="419">5.43</text>
+  <text class="value" x="1010" y="419">Keep</text>
+  <text class="table" x="1084" y="419">Best full resident 4-bit checkpoint so far</text>
+
+  <text class="section" x="72" y="486">Full 2k PPL</text>
+  <line class="axis" x1="260" y1="526" x2="694" y2="526"/>
+  <line class="grid" x1="260" y1="526" x2="260" y2="650"/>
+  <line class="grid" x1="332" y1="526" x2="332" y2="650"/>
+  <line class="grid" x1="404" y1="526" x2="404" y2="650"/>
+  <line class="grid" x1="476" y1="526" x2="476" y2="650"/>
+  <line class="grid" x1="548" y1="526" x2="548" y2="650"/>
+  <line class="grid" x1="620" y1="526" x2="620" y2="650"/>
+  <line class="grid" x1="692" y1="526" x2="692" y2="650"/>
+  <text class="small" x="256" y="670">0</text>
+  <text class="small" x="324" y="670">0.75</text>
+  <text class="small" x="398" y="670">1.5</text>
+  <text class="small" x="468" y="670">2.25</text>
+  <text class="small" x="542" y="670">3.0</text>
+  <text class="small" x="614" y="670">3.75</text>
+  <text class="small" x="684" y="670">4.5</text>
+
+  <text class="label" x="72" y="552">4-bit baseline</text>
+  <rect x="260" y="536" width="350" height="20" fill="#cf6d31" rx="10"/>
+  <text class="value" x="620" y="552">3.64</text>
+
+  <text class="label" x="72" y="592">Linear overlay only</text>
+  <rect x="260" y="576" width="343" height="20" fill="#3a8d76" rx="10"/>
+  <text class="value" x="613" y="592">3.57</text>
+
+  <text class="label" x="72" y="632">Resident stack before linear</text>
+  <rect x="260" y="616" width="335" height="20" fill="#226b59" rx="10"/>
+  <text class="value" x="605" y="632">3.49</text>
+
+  <text class="label" x="72" y="672">Final resident stack with linear</text>
+  <rect x="260" y="656" width="328" height="20" fill="#165645" rx="10"/>
+  <text class="value" x="598" y="672">3.42</text>
+
+  <text class="section" x="760" y="486">Takeaways</text>
+  <rect class="note" x="760" y="514" width="352" height="178" rx="16"/>
+  <text class="small" x="784" y="548">1. `attn_gate` and `ssm_out` are now finished as a resident GGUF `Q8_0` overlay.</text>
+  <text class="small" x="784" y="576">2. The isolated linear overlay is a real quality win over the plain 4-bit baseline.</text>
+  <text class="small" x="784" y="604">3. Adding the linear overlay improves the best full resident 2k PPL from `3.49` to `3.42`.</text>
+  <text class="small" x="784" y="632">4. Remaining blocked work is shared experts, which stays closed until explicitly reopened.</text>
+  <text class="small" x="784" y="672">Checkpoint: docs/gguf-resident-stack-checkpoint.svg</text>
+  <text class="small" x="784" y="698">Notebook: docs/gguf-hybrid-bringup-log.md</text>
+  <text class="small" x="784" y="724">Artifacts: autoresearch/gguf/linear_q8_0.bin + linear_q8_0.json</text>
+</svg>

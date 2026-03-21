@@ -1,0 +1,161 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="960" viewBox="0 0 1280 960" role="img" aria-labelledby="title desc">
+  <title id="title">Resident GGUF Delta By Change</title>
+  <desc id="desc">Per-change comparison against the plain 4-bit baseline. Each row shows full 2k-token perplexity improvement and full-PPL throughput loss for a measured resident GGUF checkpoint.</desc>
+  <defs>
+    <style>
+      .bg { fill: #f5f1e8; }
+      .panel { fill: #fffdf8; stroke: #d7cebe; stroke-width: 2; }
+      .title { fill: #1f1f1f; font: 700 30px Helvetica, Arial, sans-serif; }
+      .subtitle { fill: #5c554c; font: 400 16px Helvetica, Arial, sans-serif; }
+      .section { fill: #2d2924; font: 700 20px Helvetica, Arial, sans-serif; }
+      .tableh { fill: #4a433b; font: 700 13px Helvetica, Arial, sans-serif; }
+      .label { fill: #2f2a24; font: 600 14px Helvetica, Arial, sans-serif; }
+      .body { fill: #2f2a24; font: 400 13px Helvetica, Arial, sans-serif; }
+      .value { fill: #1f1f1f; font: 700 13px Helvetica, Arial, sans-serif; }
+      .small { fill: #6b645c; font: 400 12px Helvetica, Arial, sans-serif; }
+      .axis { stroke: #b8aea0; stroke-width: 1.2; }
+      .grid { stroke: #e3ddd4; stroke-width: 1; }
+      .good { fill: #1f8d70; }
+      .good2 { fill: #2ea37a; }
+      .bad { fill: #cb6d4a; }
+      .bad2 { fill: #d68567; }
+      .note { fill: #f1ebe0; }
+    </style>
+  </defs>
+
+  <rect class="bg" x="0" y="0" width="1280" height="960"/>
+  <text class="title" x="56" y="62">Resident GGUF Delta By Change</text>
+  <text class="subtitle" x="56" y="92">Compared against the plain 4-bit baseline: full 2k-token PPL `3.64` at `8.58 tok/s`. Green bars show quality improvement. Orange bars show throughput loss.</text>
+
+  <rect class="panel" x="44" y="124" width="1192" height="754" rx="18"/>
+
+  <text class="section" x="72" y="166">Single-Change Checkpoints</text>
+  <text class="small" x="72" y="190">These rows represent the measured resident checkpoints that were tested mostly in isolation. “Embedding” is recorded as the measured embedding plus LM-head checkpoint.</text>
+
+  <rect x="72" y="214" width="1136" height="36" fill="#efe7db" rx="8"/>
+  <text class="tableh" x="92" y="237">Change</text>
+  <text class="tableh" x="372" y="237">Full 2k PPL</text>
+  <text class="tableh" x="472" y="237">Delta</text>
+  <text class="tableh" x="552" y="237">PPL Improvement</text>
+  <text class="tableh" x="804" y="237">2k tok/s</text>
+  <text class="tableh" x="900" y="237">Delta</text>
+  <text class="tableh" x="972" y="237">Speed Loss</text>
+
+  <line class="axis" x1="552" y1="264" x2="768" y2="264"/>
+  <line class="grid" x1="606" y1="264" x2="606" y2="520"/>
+  <line class="grid" x1="660" y1="264" x2="660" y2="520"/>
+  <line class="grid" x1="714" y1="264" x2="714" y2="520"/>
+  <line class="grid" x1="768" y1="264" x2="768" y2="520"/>
+  <text class="small" x="548" y="536">0.00</text>
+  <text class="small" x="600" y="536">0.06</text>
+  <text class="small" x="654" y="536">0.12</text>
+  <text class="small" x="708" y="536">0.18</text>
+  <text class="small" x="762" y="536">0.24</text>
+
+  <line class="axis" x1="972" y1="264" x2="1180" y2="264"/>
+  <line class="grid" x1="1024" y1="264" x2="1024" y2="520"/>
+  <line class="grid" x1="1076" y1="264" x2="1076" y2="520"/>
+  <line class="grid" x1="1128" y1="264" x2="1128" y2="520"/>
+  <line class="grid" x1="1180" y1="264" x2="1180" y2="520"/>
+  <text class="small" x="968" y="536">0.0</text>
+  <text class="small" x="1018" y="536">0.9</text>
+  <text class="small" x="1070" y="536">1.8</text>
+  <text class="small" x="1122" y="536">2.7</text>
+  <text class="small" x="1172" y="536">3.6</text>
+
+  <text class="label" x="92" y="288">LM head only</text>
+  <text class="value" x="372" y="288">3.62</text>
+  <text class="value" x="472" y="288">+0.02</text>
+  <rect class="good" x="552" y="274" width="18" height="18" rx="6"/>
+  <text class="value" x="778" y="288">+0.02</text>
+  <text class="value" x="804" y="288">8.29</text>
+  <text class="value" x="900" y="288">-0.29</text>
+  <rect class="bad" x="972" y="274" width="17" height="18" rx="6"/>
+  <text class="value" x="1188" y="288" text-anchor="end">-3.4%</text>
+
+  <text class="label" x="92" y="332">Embedding + LM head</text>
+  <text class="value" x="372" y="332">3.61</text>
+  <text class="value" x="472" y="332">+0.03</text>
+  <rect class="good" x="552" y="318" width="27" height="18" rx="6"/>
+  <text class="value" x="778" y="332">+0.03</text>
+  <text class="value" x="804" y="332">8.35</text>
+  <text class="value" x="900" y="332">-0.23</text>
+  <rect class="bad" x="972" y="318" width="13" height="18" rx="6"/>
+  <text class="value" x="1188" y="332" text-anchor="end">-2.7%</text>
+
+  <text class="label" x="92" y="376">Linear-attn QKV</text>
+  <text class="value" x="372" y="376">3.52</text>
+  <text class="value" x="472" y="376">+0.12</text>
+  <rect class="good2" x="552" y="362" width="108" height="18" rx="6"/>
+  <text class="value" x="778" y="376">+0.12</text>
+  <text class="value" x="804" y="376">7.22</text>
+  <text class="value" x="900" y="376">-1.36</text>
+  <rect class="bad2" x="972" y="362" width="79" height="18" rx="6"/>
+  <text class="value" x="1188" y="376" text-anchor="end">-15.9%</text>
+
+  <text class="label" x="92" y="420">Full-attention block</text>
+  <text class="value" x="372" y="420">3.48</text>
+  <text class="value" x="472" y="420">+0.16</text>
+  <rect class="good2" x="552" y="406" width="144" height="18" rx="6"/>
+  <text class="value" x="778" y="420">+0.16</text>
+  <text class="value" x="804" y="420">6.28</text>
+  <text class="value" x="900" y="420">-2.30</text>
+  <rect class="bad2" x="972" y="406" width="134" height="18" rx="6"/>
+  <text class="value" x="1188" y="420" text-anchor="end">-26.8%</text>
+
+  <text class="label" x="92" y="464">Linear overlay (`attn_gate` + `ssm_out`)</text>
+  <text class="value" x="372" y="464">3.57</text>
+  <text class="value" x="472" y="464">+0.07</text>
+  <rect class="good2" x="552" y="450" width="63" height="18" rx="6"/>
+  <text class="value" x="778" y="464">+0.07</text>
+  <text class="value" x="804" y="464">7.27</text>
+  <text class="value" x="900" y="464">-1.31</text>
+  <rect class="bad2" x="972" y="450" width="76" height="18" rx="6"/>
+  <text class="value" x="1188" y="464" text-anchor="end">-15.3%</text>
+
+  <text class="section" x="72" y="592">Stack Checkpoints</text>
+  <text class="small" x="72" y="616">These rows show how the composed resident stack evolved as more kept overlays were layered together.</text>
+
+  <rect x="72" y="640" width="1136" height="36" fill="#efe7db" rx="8"/>
+  <text class="tableh" x="92" y="663">Stack</text>
+  <text class="tableh" x="372" y="663">Full 2k PPL</text>
+  <text class="tableh" x="472" y="663">Delta</text>
+  <text class="tableh" x="552" y="663">PPL Improvement</text>
+  <text class="tableh" x="804" y="663">2k tok/s</text>
+  <text class="tableh" x="900" y="663">Delta</text>
+  <text class="tableh" x="972" y="663">Speed Loss</text>
+
+  <line class="axis" x1="552" y1="690" x2="768" y2="690"/>
+  <line class="grid" x1="606" y1="690" x2="606" y2="818"/>
+  <line class="grid" x1="660" y1="690" x2="660" y2="818"/>
+  <line class="grid" x1="714" y1="690" x2="714" y2="818"/>
+  <line class="grid" x1="768" y1="690" x2="768" y2="818"/>
+  <line class="axis" x1="972" y1="690" x2="1180" y2="690"/>
+  <line class="grid" x1="1024" y1="690" x2="1024" y2="818"/>
+  <line class="grid" x1="1076" y1="690" x2="1076" y2="818"/>
+  <line class="grid" x1="1128" y1="690" x2="1128" y2="818"/>
+  <line class="grid" x1="1180" y1="690" x2="1180" y2="818"/>
+
+  <text class="label" x="92" y="718">Resident stack before linear overlay</text>
+  <text class="value" x="372" y="718">3.49</text>
+  <text class="value" x="472" y="718">+0.15</text>
+  <rect class="good2" x="552" y="704" width="135" height="18" rx="6"/>
+  <text class="value" x="778" y="718">+0.15</text>
+  <text class="value" x="804" y="718">5.10</text>
+  <text class="value" x="900" y="718">-3.48</text>
+  <rect class="bad2" x="972" y="704" width="201" height="18" rx="6"/>
+  <text class="value" x="1188" y="718" text-anchor="end">-40.6%</text>
+
+  <text class="label" x="92" y="762">Final resident stack with linear overlay</text>
+  <text class="value" x="372" y="762">3.42</text>
+  <text class="value" x="472" y="762">+0.22</text>
+  <rect class="good2" x="552" y="748" width="198" height="18" rx="6"/>
+  <text class="value" x="778" y="762">+0.22</text>
+  <text class="value" x="804" y="762">5.43</text>
+  <text class="value" x="900" y="762">-3.15</text>
+  <rect class="bad2" x="972" y="748" width="182" height="18" rx="6"/>
+  <text class="value" x="1188" y="762" text-anchor="end">-36.7%</text>
+
+  <rect class="note" x="72" y="820" width="1136" height="34" rx="10"/>
+  <text class="small" x="92" y="842">Source: docs/gguf-hybrid-bringup-log.md. Metric choice: full 2k-token PPL and full-PPL throughput. Lower PPL is better; higher tok/s is better.</text>
+</svg>
