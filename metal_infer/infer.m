@@ -8644,6 +8644,18 @@ int main(int argc, char **argv) {
             printf("\n");
         }
 
+        // ---- Auto-detect Q3-GGUF experts ----
+        if (!g_use_q3_experts && !g_use_2bit) {
+            char probe[1024];
+            snprintf(probe, sizeof(probe), "%s/packed_experts_Q3/layer_00.bin", model_path);
+            int pq3 = open(probe, O_RDONLY);
+            if (pq3 >= 0) {
+                close(pq3);
+                g_use_q3_experts = 1;
+                printf("[auto] Using Q3-GGUF experts (packed_experts_Q3/ detected)\n");
+            }
+        }
+
         // ---- Auto-detect 2-bit experts ----
         if (!g_use_2bit && !g_use_q3_experts) {
             char probe[1024];
