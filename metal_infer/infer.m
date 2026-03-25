@@ -264,7 +264,7 @@ static int g_layer_is_q3_hybrid[NUM_LAYERS];  // per-layer quant: 1=Q3 hybrid, 0
 static int g_use_q3_outlier = 0;  // active layer override: exact layer-27 IQ4_XS gate/up + Q5_K down
 static int g_layer_is_q3_outlier[NUM_LAYERS];
 static int g_cache_telemetry_enabled = 0;  // enabled by --cache-telemetry flag
-static int g_cache_io_split = 1;  // enabled by --cache-io-split N: split each routed expert pread into N page-aligned chunks
+static int g_cache_io_split = 4;  // enabled by --cache-io-split N: split each routed expert pread into N page-aligned chunks
 static int g_think_budget = 2048; // max thinking tokens before force-emitting </think>
 static int g_stream_mode = 0;    // --stream: clean output only, no progress/stats
 static int g_nax_disabled = 1;   // NAX disabled by default (slower for M=1 decode); --nax to enable
