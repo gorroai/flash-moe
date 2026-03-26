@@ -2887,31 +2887,19 @@ static void gpu_batch_matvec(
 // ============================================================================
 
 // Encode N matmuls into cmdbuf. Input must already be in ctx->buf_input.
-// Fused single-encoder mode: all same-type 4-bit specs are batched into one
-// compute encoder instead of N separate encoders. This eliminates N-1 encoder
-// boundary barriers for independent matmuls (CMD1: 3 barriers saved for 4 specs;
-// CMD2 moe_specs: 3 barriers saved). The GPU can pipeline consecutive dispatches
-// within a single encoder without explicit drain between them.
-// Q8_0 specs (different buffer layout) still get their own encoder.
 static void gpu_encode_batch_matvec(
     MetalCtx *ctx,
     id<MTLCommandBuffer> cmdbuf,
     BatchMatvecSpec *specs, int num_specs
 ) {
-    id<MTLComputeCommandEncoder> shared_enc = nil;
-    id<MTLComputePipelineState> shared_pipe = nil;
-
     for (int i = 0; i < num_specs; i++) {
         BatchMatvecSpec *s = &specs[i];
         id<MTLBuffer> o_buf = ctx->batch_out[s->batch_slot];
-
+        id<MTLComputeCommandEncoder> enc = [cmdbuf computeCommandEncoder];
         if (s->kind == MATVEC_KIND_GGUF_Q8_0) {
-            // Q8_0: close shared encoder, use dedicated encoder (different buffer layout)
-            if (shared_enc) { [shared_enc endEncoding]; shared_enc = nil; shared_pipe = nil; }
             const char *w_base = NULL;
             id<MTLBuffer> w_buf = matvec_source_buffer(ctx, s->source, &w_base);
             NSUInteger w_off = (NSUInteger)((const char *)s->W - w_base);
-            id<MTLComputeCommandEncoder> enc = [cmdbuf computeCommandEncoder];
             [enc setComputePipelineState:ctx->matvec_q8_0];
             [enc setBuffer:w_buf         offset:w_off atIndex:0];
             [enc setBuffer:ctx->buf_input offset:0     atIndex:1];
@@ -2921,45 +2909,31 @@ static void gpu_encode_batch_matvec(
             uint32_t num_tgs = (s->out_dim + 7) / 8;
             [enc dispatchThreadgroups:MTLSizeMake(num_tgs, 1, 1)
                 threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
-            [enc endEncoding];
         } else {
-            // 4-bit: accumulate into shared encoder to eliminate encoder-boundary barriers
             NSUInteger w_off = (NSUInteger)((const char *)s->W      - (const char *)[ctx->wf_buf contents]);
             NSUInteger s_off = (NSUInteger)((const char *)s->scales  - (const char *)[ctx->wf_buf contents]);
             NSUInteger b_off = (NSUInteger)((const char *)s->biases  - (const char *)[ctx->wf_buf contents]);
             int use_v3 = (s->in_dim <= 4096);
-            id<MTLComputePipelineState> pipe = use_v3 ? ctx->matvec_v3 : ctx->matvec_fast;
-
-            if (!shared_enc) {
-                shared_enc = [cmdbuf computeCommandEncoder];
-                [shared_enc setComputePipelineState:pipe];
-                [shared_enc setBuffer:ctx->buf_input offset:0 atIndex:3]; // common input — persists across dispatches
-                shared_pipe = pipe;
-            } else if (pipe != shared_pipe) {
-                [shared_enc setComputePipelineState:pipe];
-                shared_pipe = pipe;
-            }
-
-            [shared_enc setBuffer:ctx->wf_buf offset:w_off atIndex:0];
-            [shared_enc setBuffer:ctx->wf_buf offset:s_off atIndex:1];
-            [shared_enc setBuffer:ctx->wf_buf offset:b_off atIndex:2];
-            [shared_enc setBuffer:o_buf        offset:0     atIndex:4];
-            [shared_enc setBytes:&s->out_dim   length:4     atIndex:5];
-            [shared_enc setBytes:&s->in_dim    length:4     atIndex:6];
-            [shared_enc setBytes:&s->group_size length:4    atIndex:7];
-
+            [enc setComputePipelineState: use_v3 ? ctx->matvec_v3 : ctx->matvec_fast];
+            [enc setBuffer:ctx->wf_buf    offset:w_off atIndex:0];
+            [enc setBuffer:ctx->wf_buf    offset:s_off atIndex:1];
+            [enc setBuffer:ctx->wf_buf    offset:b_off atIndex:2];
+            [enc setBuffer:ctx->buf_input offset:0     atIndex:3];
+            [enc setBuffer:o_buf          offset:0     atIndex:4];
+            [enc setBytes:&s->out_dim     length:4     atIndex:5];
+            [enc setBytes:&s->in_dim      length:4     atIndex:6];
+            [enc setBytes:&s->group_size  length:4     atIndex:7];
             if (use_v3) {
                 uint32_t num_tgs = (s->out_dim + 7) / 8;
-                [shared_enc dispatchThreadgroups:MTLSizeMake(num_tgs, 1, 1)
+                [enc dispatchThreadgroups:MTLSizeMake(num_tgs, 1, 1)
                     threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
             } else {
-                [shared_enc dispatchThreadgroups:MTLSizeMake(s->out_dim, 1, 1)
+                [enc dispatchThreadgroups:MTLSizeMake(s->out_dim, 1, 1)
                     threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
             }
         }
+        [enc endEncoding];
     }
-
-    if (shared_enc) { [shared_enc endEncoding]; }
 }
 
 // Copy batch results from GPU buffers back to CPU pointers.
