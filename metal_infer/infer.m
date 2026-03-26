@@ -4571,7 +4571,7 @@ static void lm_head_forward(WeightFile *wf, const float *hidden, float *logits) 
 // Parallel I/O infrastructure for expert pread (from proven main.m pattern)
 // ============================================================================
 
-#define NUM_IO_THREADS 8  // 8 threads helps cached split-fanout reads; K=4 paths still only issue up to 4 expert blobs
+#define NUM_IO_THREADS 16  // 16 threads: matches K=4 × split=4 = 16 tasks, one read per thread (vs 2 reads/thread at 8)
 
 typedef struct {
     int fd;
