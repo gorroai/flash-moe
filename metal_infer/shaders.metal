@@ -827,6 +827,72 @@ kernel void dequant_matvec_4bit_v5(
 }
 
 // ============================================================================
+// Kernel 1g: 4-bit dequant matvec with x_shared[8192] (for in_dim=8192 layers)
+// ============================================================================
+// Same structure as v3 but with threadgroup memory sized for in_dim=8192.
+// Metal macOS threadgroup limit is 32 KB = 8192 floats exactly.
+// Targets o_proj (in_dim=8192, out_dim=4096) in CMD2, replacing matvec_fast.
+// matvec_fast dispatches one TG per output row with NO x caching:
+//   4096 TGs × 8192 reads = 128 MB x-vector bandwidth per matmul.
+// v3_8k amortizes x across 8 rows per TG:
+//   512 TGs × 8192 reads = 16 MB x-vector bandwidth — 8× reduction.
+
+#define ROWS_PER_TG_8K 8
+
+kernel void dequant_matvec_4bit_v3_8k(
+    device const uint32_t* W_packed   [[buffer(0)]],
+    device const uint16_t* scales     [[buffer(1)]],
+    device const uint16_t* biases     [[buffer(2)]],
+    device const float*    x          [[buffer(3)]],
+    device float*          out        [[buffer(4)]],
+    constant uint&         out_dim    [[buffer(5)]],
+    constant uint&         in_dim     [[buffer(6)]],
+    constant uint&         group_size [[buffer(7)]],
+    uint tgid       [[threadgroup_position_in_grid]],
+    uint lid        [[thread_position_in_threadgroup]],
+    uint simd_lane  [[thread_index_in_simdgroup]],
+    uint simd_group [[simdgroup_index_in_threadgroup]]
+) {
+    uint row = tgid * ROWS_PER_TG_8K + simd_group;
+    uint packed_cols = in_dim / 8;
+    uint num_groups  = in_dim / group_size;
+
+    // Cache input vector in threadgroup shared memory (32 KB for in_dim=8192)
+    threadgroup float x_shared[8192];
+    for (uint i = lid; i < in_dim; i += 256) {
+        x_shared[i] = x[i];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (row >= out_dim) return;
+
+    device const uint32_t* w_row = W_packed + row * packed_cols;
+    device const uint16_t* s_row = scales + row * num_groups;
+    device const uint16_t* b_row = biases + row * num_groups;
+
+    float acc = 0.0f;
+    for (uint col = simd_lane; col < packed_cols; col += 32) {
+        uint g = col / (group_size / 8);
+        float scale = bf16_to_f32(s_row[g]);
+        float bias  = bf16_to_f32(b_row[g]);
+        uint32_t packed = w_row[col];
+        uint x_base = col * 8;
+        acc += (float((packed >>  0) & 0xF) * scale + bias) * x_shared[x_base + 0];
+        acc += (float((packed >>  4) & 0xF) * scale + bias) * x_shared[x_base + 1];
+        acc += (float((packed >>  8) & 0xF) * scale + bias) * x_shared[x_base + 2];
+        acc += (float((packed >> 12) & 0xF) * scale + bias) * x_shared[x_base + 3];
+        acc += (float((packed >> 16) & 0xF) * scale + bias) * x_shared[x_base + 4];
+        acc += (float((packed >> 20) & 0xF) * scale + bias) * x_shared[x_base + 5];
+        acc += (float((packed >> 24) & 0xF) * scale + bias) * x_shared[x_base + 6];
+        acc += (float((packed >> 28) & 0xF) * scale + bias) * x_shared[x_base + 7];
+    }
+    float sum = simd_sum(acc);
+    if (simd_lane == 0) {
+        out[row] = sum;
+    }
+}
+
+// ============================================================================
 // Kernel 1e: 2-bit affine dequant matvec (same structure as v3)
 // ============================================================================
 // Packs 16 x 2-bit values per uint32. Each value is 0-3, dequantized as:
