@@ -1953,8 +1953,7 @@ typedef struct {
     id<MTLLibrary>              library;
     id<MTLComputePipelineState> matvec_v3;
     id<MTLComputePipelineState> matvec_v5;  // LUT dequant variant
-    id<MTLComputePipelineState> matvec_fast;  // for in_dim > 4096 (fallback)
-    id<MTLComputePipelineState> matvec_v7k;  // v3-style tiled for in_dim=7168 (HIDDEN_DIM): half x_shared 14KB, 8x fewer TGs
+    id<MTLComputePipelineState> matvec_fast;  // for in_dim > 4096
     id<MTLComputePipelineState> matvec_2bit;  // 2-bit expert dequant kernel
     id<MTLComputePipelineState> matvec_iq3_xxs; // GGUF IQ3_XXS streamed expert kernel
     id<MTLComputePipelineState> matvec_iq4_xs; // GGUF IQ4_XS streamed expert kernel
@@ -2113,7 +2112,6 @@ static MetalCtx *metal_setup(void) {
 
     ctx->matvec_v3     = makePipe(@"dequant_matvec_4bit_v3");
     ctx->matvec_v5     = makePipe(@"dequant_matvec_4bit_v5");  // LUT variant (no uint→float conversions)
-    ctx->matvec_v7k    = makePipe(@"dequant_matvec_4bit_v7k"); // v3-style tiled for in_dim=7168, half x_shared
     ctx->matvec_fast   = makePipe(@"dequant_matvec_4bit_fast");
     ctx->matvec_2bit   = makePipe(@"dequant_matvec_2bit");
     ctx->matvec_iq3_xxs = makePipe(@"dequant_matvec_iq3_xxs");
@@ -2481,12 +2479,10 @@ static void gpu_dequant_matvec(
     id<MTLCommandBuffer> cmdbuf = [ctx->queue commandBuffer];
     id<MTLComputeCommandEncoder> enc = [cmdbuf computeCommandEncoder];
 
-    // v3: handles in_dim <= 4096; v7k: handles in_dim == HIDDEN_DIM=7168; fast: fallback
-    int use_v3  = (in_dim <= 4096);
-    int use_v7k = (!use_v3 && in_dim == HIDDEN_DIM && ctx->matvec_v7k);
-    id<MTLComputePipelineState> pipe = use_v3 ? ctx->matvec_v3 :
-                                      (use_v7k ? ctx->matvec_v7k : ctx->matvec_fast);
-    [enc setComputePipelineState: pipe];
+    // v3 shader uses x_shared[4096], so can only handle in_dim <= 4096
+    // For larger in_dim (e.g. o_proj with in_dim=8192), use matvec_fast
+    int use_v3 = (in_dim <= 4096);
+    [enc setComputePipelineState: use_v3 ? ctx->matvec_v3 : ctx->matvec_fast];
     [enc setBuffer:ctx->wf_buf  offset:w_off atIndex:0];
     [enc setBuffer:ctx->wf_buf  offset:s_off atIndex:1];
     [enc setBuffer:ctx->wf_buf  offset:b_off atIndex:2];
@@ -2496,13 +2492,8 @@ static void gpu_dequant_matvec(
     [enc setBytes:&in_dim       length:4     atIndex:6];
     [enc setBytes:&group_size   length:4     atIndex:7];
 
-    if (use_v7k) {
-        // v7k: 16 rows/TG, 512 threads — 2 TGs/core×512=1024 threads=100% GPU occupancy
-        uint32_t num_tgs = (out_dim + 15) / 16;
-        [enc dispatchThreadgroups:MTLSizeMake(num_tgs, 1, 1)
-            threadsPerThreadgroup:MTLSizeMake(512, 1, 1)];
-    } else if (use_v3) {
-        // v3: 8 rows/TG, 256 threads
+    if (use_v3) {
+        // v3: tiled threadgroups, 256 threads, 8 rows per TG
         uint32_t num_tgs = (out_dim + 7) / 8;
         [enc dispatchThreadgroups:MTLSizeMake(num_tgs, 1, 1)
             threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
@@ -2859,11 +2850,8 @@ static void gpu_batch_matvec(
             NSUInteger w_off = (NSUInteger)((const char *)s->W      - (const char *)[ctx->wf_buf contents]);
             NSUInteger s_off = (NSUInteger)((const char *)s->scales  - (const char *)[ctx->wf_buf contents]);
             NSUInteger b_off = (NSUInteger)((const char *)s->biases  - (const char *)[ctx->wf_buf contents]);
-            int use_v3  = (s->in_dim <= 4096);
-            int use_v7k = (!use_v3 && s->in_dim == HIDDEN_DIM && ctx->matvec_v7k);
-            id<MTLComputePipelineState> pipe = use_v3 ? ctx->matvec_v3 :
-                                              (use_v7k ? ctx->matvec_v7k : ctx->matvec_fast);
-            [enc setComputePipelineState: pipe];
+            int use_v3 = (s->in_dim <= 4096);
+            [enc setComputePipelineState: use_v3 ? ctx->matvec_v3 : ctx->matvec_fast];
             [enc setBuffer:ctx->wf_buf    offset:w_off atIndex:0];
             [enc setBuffer:ctx->wf_buf    offset:s_off atIndex:1];
             [enc setBuffer:ctx->wf_buf    offset:b_off atIndex:2];
@@ -2872,11 +2860,7 @@ static void gpu_batch_matvec(
             [enc setBytes:&s->out_dim     length:4     atIndex:5];
             [enc setBytes:&s->in_dim      length:4     atIndex:6];
             [enc setBytes:&s->group_size  length:4     atIndex:7];
-            if (use_v7k) {
-                uint32_t num_tgs = (s->out_dim + 15) / 16;
-                [enc dispatchThreadgroups:MTLSizeMake(num_tgs, 1, 1)
-                    threadsPerThreadgroup:MTLSizeMake(512, 1, 1)];
-            } else if (use_v3) {
+            if (use_v3) {
                 uint32_t num_tgs = (s->out_dim + 7) / 8;
                 [enc dispatchThreadgroups:MTLSizeMake(num_tgs, 1, 1)
                     threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
@@ -2932,11 +2916,8 @@ static void gpu_encode_batch_matvec(
             NSUInteger w_off = (NSUInteger)((const char *)s->W      - (const char *)[ctx->wf_buf contents]);
             NSUInteger s_off = (NSUInteger)((const char *)s->scales  - (const char *)[ctx->wf_buf contents]);
             NSUInteger b_off = (NSUInteger)((const char *)s->biases  - (const char *)[ctx->wf_buf contents]);
-            int use_v3  = (s->in_dim <= 4096);
-            int use_v7k = (!use_v3 && s->in_dim == HIDDEN_DIM && ctx->matvec_v7k);
-            id<MTLComputePipelineState> pipe = use_v3 ? ctx->matvec_v3 :
-                                              (use_v7k ? ctx->matvec_v7k : ctx->matvec_fast);
-            [enc setComputePipelineState: pipe];
+            int use_v3 = (s->in_dim <= 4096);
+            [enc setComputePipelineState: use_v3 ? ctx->matvec_v3 : ctx->matvec_fast];
             [enc setBuffer:ctx->wf_buf    offset:w_off atIndex:0];
             [enc setBuffer:ctx->wf_buf    offset:s_off atIndex:1];
             [enc setBuffer:ctx->wf_buf    offset:b_off atIndex:2];
@@ -2945,11 +2926,7 @@ static void gpu_encode_batch_matvec(
             [enc setBytes:&s->out_dim     length:4     atIndex:5];
             [enc setBytes:&s->in_dim      length:4     atIndex:6];
             [enc setBytes:&s->group_size  length:4     atIndex:7];
-            if (use_v7k) {
-                uint32_t num_tgs = (s->out_dim + 15) / 16;
-                [enc dispatchThreadgroups:MTLSizeMake(num_tgs, 1, 1)
-                    threadsPerThreadgroup:MTLSizeMake(512, 1, 1)];
-            } else if (use_v3) {
+            if (use_v3) {
                 uint32_t num_tgs = (s->out_dim + 7) / 8;
                 [enc dispatchThreadgroups:MTLSizeMake(num_tgs, 1, 1)
                     threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
