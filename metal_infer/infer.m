@@ -4938,9 +4938,11 @@ static uint64_t g_spec_route_preloads = 0;    // async preloads initiated (cache
 //   - Loads into scratch buffers (no cache pollution)
 //   - Uses CMD1_wait idle time (no additional CPU cost)
 //   - Only sync-preads misses (not all K experts)
-static int g_pred_experts[60][MAX_K];              // previous token's expert indices per layer
-static int g_pred_count[60];                       // how many experts stored per layer
+static int g_pred_experts[60][MAX_K];              // union of last 2 tokens' experts per layer (prediction set)
+static int g_pred_count[60];                       // how many experts in prediction set per layer
 static int g_pred_valid = 0;                       // 1 after first token completes (predictions available)
+static int g_actual_prev[60][MAX_K];               // actual expert selections from 2 tokens ago
+static int g_actual_prev_count[60];                // count for above
 // g_pred_enabled, g_pred_hits, g_pred_misses, g_pred_layers declared near timing (line ~163)
 
 static ExpertLRUCache *expert_cache_new(id<MTLDevice> device, int max_entries) {
@@ -7098,11 +7100,33 @@ static void fused_layer_forward(
 
         // Store this layer's routing for next token's temporal prediction.
         // MUST happen AFTER the prediction hit check above (which reads g_pred_experts).
+        // Build prediction set = union of current token's actual experts + prev token's actual experts (dedup, up to MAX_K).
+        // This raises hit rate from ~22% (last-1) to ~38% (last-2 union).
         if (g_pred_enabled && g_pred_generating) {
-            for (int k = 0; k < actual_K; k++) {
-                g_pred_experts[layer_idx][k] = expert_indices[k];
+            // Build combined set: current token's experts first
+            int combined[MAX_K];
+            int combined_count = 0;
+            for (int k = 0; k < actual_K && combined_count < MAX_K; k++) {
+                combined[combined_count++] = expert_indices[k];
             }
-            g_pred_count[layer_idx] = actual_K;
+            // Add prev token's experts if not already in combined
+            for (int p = 0; p < g_actual_prev_count[layer_idx] && combined_count < MAX_K; p++) {
+                int already = 0;
+                for (int c = 0; c < actual_K; c++) {
+                    if (g_actual_prev[layer_idx][p] == expert_indices[c]) { already = 1; break; }
+                }
+                if (!already) combined[combined_count++] = g_actual_prev[layer_idx][p];
+            }
+            // Update prev history with current token's actual experts
+            for (int k = 0; k < actual_K; k++) {
+                g_actual_prev[layer_idx][k] = expert_indices[k];
+            }
+            g_actual_prev_count[layer_idx] = actual_K;
+            // Store combined as next token's prediction set
+            for (int k = 0; k < combined_count; k++) {
+                g_pred_experts[layer_idx][k] = combined[k];
+            }
+            g_pred_count[layer_idx] = combined_count;
             if (layer_idx == NUM_LAYERS - 1) {
                 g_pred_valid = 1;
             }
