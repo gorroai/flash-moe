@@ -1950,8 +1950,7 @@ typedef struct {
     id<MTLLibrary>              library;
     id<MTLComputePipelineState> matvec_v3;
     id<MTLComputePipelineState> matvec_v5;  // LUT dequant variant
-    id<MTLComputePipelineState> matvec_v3_8k; // tiled x_shared[8192] for in_dim=8192 (o_proj etc.)
-    id<MTLComputePipelineState> matvec_fast;  // for in_dim > 8192
+    id<MTLComputePipelineState> matvec_fast;  // for in_dim > 4096
     id<MTLComputePipelineState> matvec_2bit;  // 2-bit expert dequant kernel
     id<MTLComputePipelineState> matvec_iq3_xxs; // GGUF IQ3_XXS streamed expert kernel
     id<MTLComputePipelineState> matvec_iq4_xs; // GGUF IQ4_XS streamed expert kernel
@@ -2110,7 +2109,6 @@ static MetalCtx *metal_setup(void) {
 
     ctx->matvec_v3     = makePipe(@"dequant_matvec_4bit_v3");
     ctx->matvec_v5     = makePipe(@"dequant_matvec_4bit_v5");  // LUT variant (no uint→float conversions)
-    ctx->matvec_v3_8k  = makePipe(@"dequant_matvec_4bit_v3_8k"); // tiled x_shared[8192] for in_dim=8192
     ctx->matvec_fast   = makePipe(@"dequant_matvec_4bit_fast");
     ctx->matvec_2bit   = makePipe(@"dequant_matvec_2bit");
     ctx->matvec_iq3_xxs = makePipe(@"dequant_matvec_iq3_xxs");
@@ -2478,11 +2476,10 @@ static void gpu_dequant_matvec(
     id<MTLCommandBuffer> cmdbuf = [ctx->queue commandBuffer];
     id<MTLComputeCommandEncoder> enc = [cmdbuf computeCommandEncoder];
 
-    // v3: x_shared[4096] for in_dim<=4096; v3_8k: x_shared[8192] for in_dim<=8192; fast: no cache
-    int use_v3    = (in_dim <= 4096);
-    int use_v3_8k = (!use_v3 && in_dim <= 8192);
-    id<MTLComputePipelineState> mv_pipe = use_v3 ? ctx->matvec_v3 : (use_v3_8k ? ctx->matvec_v3_8k : ctx->matvec_fast);
-    [enc setComputePipelineState: mv_pipe];
+    // v3 shader uses x_shared[4096], so can only handle in_dim <= 4096
+    // For larger in_dim (e.g. o_proj with in_dim=8192), use matvec_fast
+    int use_v3 = (in_dim <= 4096);
+    [enc setComputePipelineState: use_v3 ? ctx->matvec_v3 : ctx->matvec_fast];
     [enc setBuffer:ctx->wf_buf  offset:w_off atIndex:0];
     [enc setBuffer:ctx->wf_buf  offset:s_off atIndex:1];
     [enc setBuffer:ctx->wf_buf  offset:b_off atIndex:2];
@@ -2492,8 +2489,8 @@ static void gpu_dequant_matvec(
     [enc setBytes:&in_dim       length:4     atIndex:6];
     [enc setBytes:&group_size   length:4     atIndex:7];
 
-    if (use_v3 || use_v3_8k) {
-        // v3/v3_8k: tiled threadgroups, 256 threads, 8 rows per TG
+    if (use_v3) {
+        // v3: tiled threadgroups, 256 threads, 8 rows per TG
         uint32_t num_tgs = (out_dim + 7) / 8;
         [enc dispatchThreadgroups:MTLSizeMake(num_tgs, 1, 1)
             threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
@@ -2850,10 +2847,8 @@ static void gpu_batch_matvec(
             NSUInteger w_off = (NSUInteger)((const char *)s->W      - (const char *)[ctx->wf_buf contents]);
             NSUInteger s_off = (NSUInteger)((const char *)s->scales  - (const char *)[ctx->wf_buf contents]);
             NSUInteger b_off = (NSUInteger)((const char *)s->biases  - (const char *)[ctx->wf_buf contents]);
-            int use_v3    = (s->in_dim <= 4096);
-            int use_v3_8k = (!use_v3 && s->in_dim <= 8192);
-            id<MTLComputePipelineState> mv_pipe2 = use_v3 ? ctx->matvec_v3 : (use_v3_8k ? ctx->matvec_v3_8k : ctx->matvec_fast);
-            [enc setComputePipelineState: mv_pipe2];
+            int use_v3 = (s->in_dim <= 4096);
+            [enc setComputePipelineState: use_v3 ? ctx->matvec_v3 : ctx->matvec_fast];
             [enc setBuffer:ctx->wf_buf    offset:w_off atIndex:0];
             [enc setBuffer:ctx->wf_buf    offset:s_off atIndex:1];
             [enc setBuffer:ctx->wf_buf    offset:b_off atIndex:2];
@@ -2862,7 +2857,7 @@ static void gpu_batch_matvec(
             [enc setBytes:&s->out_dim     length:4     atIndex:5];
             [enc setBytes:&s->in_dim      length:4     atIndex:6];
             [enc setBytes:&s->group_size  length:4     atIndex:7];
-            if (use_v3 || use_v3_8k) {
+            if (use_v3) {
                 uint32_t num_tgs = (s->out_dim + 7) / 8;
                 [enc dispatchThreadgroups:MTLSizeMake(num_tgs, 1, 1)
                     threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
@@ -2918,10 +2913,8 @@ static void gpu_encode_batch_matvec(
             NSUInteger w_off = (NSUInteger)((const char *)s->W      - (const char *)[ctx->wf_buf contents]);
             NSUInteger s_off = (NSUInteger)((const char *)s->scales  - (const char *)[ctx->wf_buf contents]);
             NSUInteger b_off = (NSUInteger)((const char *)s->biases  - (const char *)[ctx->wf_buf contents]);
-            int use_v3    = (s->in_dim <= 4096);
-            int use_v3_8k = (!use_v3 && s->in_dim <= 8192);
-            id<MTLComputePipelineState> mv_pipe3 = use_v3 ? ctx->matvec_v3 : (use_v3_8k ? ctx->matvec_v3_8k : ctx->matvec_fast);
-            [enc setComputePipelineState: mv_pipe3];
+            int use_v3 = (s->in_dim <= 4096);
+            [enc setComputePipelineState: use_v3 ? ctx->matvec_v3 : ctx->matvec_fast];
             [enc setBuffer:ctx->wf_buf    offset:w_off atIndex:0];
             [enc setBuffer:ctx->wf_buf    offset:s_off atIndex:1];
             [enc setBuffer:ctx->wf_buf    offset:b_off atIndex:2];
@@ -2930,7 +2923,7 @@ static void gpu_encode_batch_matvec(
             [enc setBytes:&s->out_dim     length:4     atIndex:5];
             [enc setBytes:&s->in_dim      length:4     atIndex:6];
             [enc setBytes:&s->group_size  length:4     atIndex:7];
-            if (use_v3 || use_v3_8k) {
+            if (use_v3) {
                 uint32_t num_tgs = (s->out_dim + 7) / 8;
                 [enc dispatchThreadgroups:MTLSizeMake(num_tgs, 1, 1)
                     threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
@@ -2968,10 +2961,8 @@ static void gpu_encode_dequant_matvec_with_io_bufs(
     NSUInteger b_off = (NSUInteger)((const char *)biases  - (const char *)[ctx->wf_buf contents]);
 
     id<MTLComputeCommandEncoder> enc = [cmdbuf computeCommandEncoder];
-    int use_v3    = (in_dim <= 4096);
-    int use_v3_8k = (!use_v3 && in_dim <= 8192);
-    id<MTLComputePipelineState> mv_pipe4 = use_v3 ? ctx->matvec_v3 : (use_v3_8k ? ctx->matvec_v3_8k : ctx->matvec_fast);
-    [enc setComputePipelineState: mv_pipe4];
+    int use_v3 = (in_dim <= 4096);
+    [enc setComputePipelineState: use_v3 ? ctx->matvec_v3 : ctx->matvec_fast];
     [enc setBuffer:ctx->wf_buf offset:w_off atIndex:0];
     [enc setBuffer:ctx->wf_buf offset:s_off atIndex:1];
     [enc setBuffer:ctx->wf_buf offset:b_off atIndex:2];
@@ -2981,7 +2972,7 @@ static void gpu_encode_dequant_matvec_with_io_bufs(
     [enc setBytes:&in_dim      length:4     atIndex:6];
     [enc setBytes:&group_size  length:4     atIndex:7];
 
-    if (use_v3 || use_v3_8k) {
+    if (use_v3) {
         uint32_t num_tgs = (out_dim + 7) / 8;
         [enc dispatchThreadgroups:MTLSizeMake(num_tgs, 1, 1)
             threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
@@ -6698,10 +6689,7 @@ static void fused_layer_forward(
                 NSUInteger s_off = (NSUInteger)((const char *)oproj_s - (const char *)[g_metal->wf_buf contents]);
                 NSUInteger b_off = (NSUInteger)((const char *)oproj_b - (const char *)[g_metal->wf_buf contents]);
                 uint32_t o_gs = GROUP_SIZE;
-                // o_proj: in_dim=8192 → use v3_8k (x_shared[8192]) instead of matvec_fast (no cache)
-                int op_use_v3_8k = (o_in_dim <= 8192);
-                id<MTLComputePipelineState> op_pipe = op_use_v3_8k ? g_metal->matvec_v3_8k : g_metal->matvec_fast;
-                [enc setComputePipelineState:op_pipe];
+                [enc setComputePipelineState:g_metal->matvec_fast];
                 [enc setBuffer:g_metal->wf_buf       offset:w_off atIndex:0];
                 [enc setBuffer:g_metal->wf_buf       offset:s_off atIndex:1];
                 [enc setBuffer:g_metal->wf_buf       offset:b_off atIndex:2];
@@ -6710,14 +6698,8 @@ static void fused_layer_forward(
                 [enc setBytes:&o_out_dim             length:4     atIndex:5];
                 [enc setBytes:&o_in_dim              length:4     atIndex:6];
                 [enc setBytes:&o_gs                  length:4     atIndex:7];
-                if (op_use_v3_8k) {
-                    uint32_t num_tgs = (o_out_dim + 7) / 8;
-                    [enc dispatchThreadgroups:MTLSizeMake(num_tgs, 1, 1)
-                        threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
-                } else {
-                    [enc dispatchThreadgroups:MTLSizeMake(o_out_dim, 1, 1)
-                        threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
-                }
+                [enc dispatchThreadgroups:MTLSizeMake(o_out_dim, 1, 1)
+                    threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
             }
             [enc endEncoding];
         }
