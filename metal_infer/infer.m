@@ -228,7 +228,10 @@ static LayerTimingAccum g_timing = {0};
 static int g_timing_enabled = 0;
 
 // Temporal prediction pipeline counters (declared early for timing_print access)
-static int g_pred_enabled = 0;
+// M5 Max: expert IO per layer ~0.7ms cold, overlap window (CMD1+attn+CMD2) ~0.87ms
+// All predicted reads complete within the window even cold → enabled by default.
+// M3 Max failed (SSD reads 2.4ms >> 1.2ms window). M5 Max succeeds (reads 0.1ms << 0.87ms window).
+static int g_pred_enabled = 1;
 static int g_pred_generating = 0;   // only set to 1 after prefill (predictions only help during generation)
 static uint64_t g_pred_hits = 0;
 static uint64_t g_pred_misses = 0;
