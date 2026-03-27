@@ -5768,6 +5768,8 @@ static void fused_layer_forward(
     double t_layer_start = 0, t0 = 0, t1 = 0;
     if (g_timing_enabled) { t_layer_start = now_ms(); }
     int pred_started = 0;  // set to 1 if we started prediction preads during CMD1_wait
+    id<MTLCommandBuffer> cmd2_pre = nil;  // Exp27: pre-encoded CMD2 (GDN fast path)
+    int pre_encoded_cmd2 = 0;
 
     init_layer_scratch();
     if (!layer_cache_built) build_layer_cache(wf);
@@ -5949,6 +5951,113 @@ static void fused_layer_forward(
         }
 
         [cmd1 commit];
+
+        // Exp27: Pre-encode CMD2 for GDN linear-attn layers.
+        // All CMD2 buffer inputs are Metal buffer objects or fixed weight pointers;
+        // no CPU data is needed. GPU serial queue guarantees:
+        //   CMD3(N-1) → CMD1(N) → CMD2(N) — no explicit synchronization required.
+        // Pre-committing CMD2 immediately after CMD1 eliminates the ~30μs CPU-GPU
+        // round-trip gap between CMD1 completion and CMD2 submission.
+        // Only enabled when out_proj is MLX4 (not Q8_0 overlay). Safe fallback otherwise.
+        if (gpu_linear_attn && !full_attn_force_cmd2_fallback() &&
+            lc->out_proj_w && lc->out_proj_s && lc->out_proj_b &&
+            lc->out_proj_kind == MATVEC_KIND_MLX4 &&
+            lc->gate_w && lc->gate_s && lc->gate_b &&
+            lc->sg_w && lc->sg_s && lc->sg_b &&
+            lc->su_w && lc->su_s && lc->su_b &&
+            lc->seg_w && lc->seg_s && lc->seg_b &&
+            lc->post_attn_norm_w &&
+            g_metal->wf_buf && g_metal->residual_add &&
+            g_metal->rms_norm_sum && g_metal->rms_norm_apply_bf16 &&
+            g_metal->matvec_fast) {
+
+            cmd2_pre = [g_metal->queue commandBuffer];
+
+            // Enc 1: o_proj  (batch_out[6] → buf_output)
+            // batch_out[6] is written by CMD1's gated_rms_norm. GPU serial queue handles ordering.
+            {
+                NSUInteger w_off = (NSUInteger)((const char *)lc->out_proj_w - (const char *)[g_metal->wf_buf contents]);
+                NSUInteger s_off = (NSUInteger)((const char *)lc->out_proj_s - (const char *)[g_metal->wf_buf contents]);
+                NSUInteger b_off = (NSUInteger)((const char *)lc->out_proj_b - (const char *)[g_metal->wf_buf contents]);
+                uint32_t o_out = HIDDEN_DIM, o_in = LINEAR_TOTAL_VALUE, o_gs = GROUP_SIZE;
+                id<MTLComputeCommandEncoder> enc = [cmd2_pre computeCommandEncoder];
+                [enc setComputePipelineState:g_metal->matvec_fast];
+                [enc setBuffer:g_metal->wf_buf       offset:w_off atIndex:0];
+                [enc setBuffer:g_metal->wf_buf       offset:s_off atIndex:1];
+                [enc setBuffer:g_metal->wf_buf       offset:b_off atIndex:2];
+                [enc setBuffer:g_metal->batch_out[6] offset:0     atIndex:3];
+                [enc setBuffer:g_metal->buf_output   offset:0     atIndex:4];
+                [enc setBytes:&o_out length:4 atIndex:5];
+                [enc setBytes:&o_in  length:4 atIndex:6];
+                [enc setBytes:&o_gs  length:4 atIndex:7];
+                [enc dispatchThreadgroups:MTLSizeMake(o_out, 1, 1)
+                    threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+                [enc endEncoding];
+            }
+
+            // Enc 2: residual_add (buf_moe_hidden + buf_output → buf_h_mid)
+            // buf_moe_hidden = CMD3(N-1) MoE output, written before CMD1(N) in serial queue.
+            // Using buf_moe_hidden directly avoids the CPU round-trip through buf_residual.
+            {
+                uint32_t dim = HIDDEN_DIM;
+                uint32_t tgs = (dim + 255) / 256;
+                id<MTLComputeCommandEncoder> enc = [cmd2_pre computeCommandEncoder];
+                [enc setComputePipelineState:g_metal->residual_add];
+                [enc setBuffer:g_metal->buf_moe_hidden offset:0 atIndex:0];
+                [enc setBuffer:g_metal->buf_output     offset:0 atIndex:1];
+                [enc setBuffer:g_metal->buf_h_mid      offset:0 atIndex:2];
+                [enc setBytes:&dim length:4 atIndex:3];
+                [enc dispatchThreadgroups:MTLSizeMake(tgs, 1, 1)
+                    threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+                [enc endEncoding];
+            }
+
+            // Enc 3: rms_norm_sum_sq (buf_h_mid → buf_sum_sq)
+            {
+                uint32_t dim = HIDDEN_DIM;
+                id<MTLComputeCommandEncoder> enc = [cmd2_pre computeCommandEncoder];
+                [enc setComputePipelineState:g_metal->rms_norm_sum];
+                [enc setBuffer:g_metal->buf_h_mid  offset:0 atIndex:0];
+                [enc setBuffer:g_metal->buf_sum_sq offset:0 atIndex:1];
+                [enc setBytes:&dim length:4 atIndex:2];
+                [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1)
+                    threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+                [enc endEncoding];
+            }
+
+            // Enc 4: rms_norm_apply_bf16 (buf_h_mid + norm_w + sum_sq → buf_input)
+            {
+                NSUInteger norm_off = (NSUInteger)((const char *)lc->post_attn_norm_w - (const char *)[g_metal->wf_buf contents]);
+                uint32_t dim = HIDDEN_DIM;
+                float eps = RMS_NORM_EPS;
+                uint32_t tgs = (dim + 255) / 256;
+                id<MTLComputeCommandEncoder> enc = [cmd2_pre computeCommandEncoder];
+                [enc setComputePipelineState:g_metal->rms_norm_apply_bf16];
+                [enc setBuffer:g_metal->buf_h_mid  offset:0        atIndex:0];
+                [enc setBuffer:g_metal->wf_buf     offset:norm_off atIndex:1];
+                [enc setBuffer:g_metal->buf_sum_sq offset:0        atIndex:2];
+                [enc setBuffer:g_metal->buf_input  offset:0        atIndex:3];
+                [enc setBytes:&dim length:4 atIndex:4];
+                [enc setBytes:&eps length:4 atIndex:5];
+                [enc dispatchThreadgroups:MTLSizeMake(tgs, 1, 1)
+                    threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+                [enc endEncoding];
+            }
+
+            // Enc 5-8: routing gate + shared expert projections (reads buf_input)
+            {
+                BatchMatvecSpec moe_pre[4] = {
+                    { lc->gate_w, lc->gate_s, lc->gate_b, s_gate_scores, (uint32_t)NUM_EXPERTS,         HIDDEN_DIM, GROUP_SIZE, 0, MATVEC_KIND_MLX4, 0 },
+                    { lc->sg_w,   lc->sg_s,   lc->sg_b,   s_shared_gate, (uint32_t)SHARED_INTERMEDIATE,  HIDDEN_DIM, GROUP_SIZE, 1, MATVEC_KIND_MLX4, 0 },
+                    { lc->su_w,   lc->su_s,   lc->su_b,   s_shared_up,   (uint32_t)SHARED_INTERMEDIATE,  HIDDEN_DIM, GROUP_SIZE, 2, MATVEC_KIND_MLX4, 0 },
+                    { lc->seg_w,  lc->seg_s,  lc->seg_b,  s_gate_scores, 1,                             HIDDEN_DIM, GROUP_SIZE, 3, MATVEC_KIND_MLX4, 0 },
+                };
+                gpu_encode_batch_matvec(g_metal, cmd2_pre, moe_pre, 4);
+            }
+
+            [cmd2_pre commit];
+            pre_encoded_cmd2 = 1;
+        }
 
         if (g_timing_enabled) { t1 = now_ms(); g_timing.cmd1_submit += t1 - t0; }
 
@@ -6553,7 +6662,20 @@ static void fused_layer_forward(
 
     int disable_fused_cmd2 = full_attn_force_cmd2_fallback();
 
-    if (!disable_fused_cmd2 &&
+    if (pre_encoded_cmd2) {
+        // Exp27: CMD2 was pre-encoded and committed immediately after CMD1.
+        // Just wait for it and read back results. No re-encoding needed.
+        used_fused_cmd2 = 1;
+        [cmd2_pre waitUntilCompleted];
+        memcpy(gate_scores, [g_metal->batch_out[0] contents], NUM_EXPERTS        * sizeof(float));
+        memcpy(shared_gate, [g_metal->batch_out[1] contents], SHARED_INTERMEDIATE * sizeof(float));
+        memcpy(shared_up,   [g_metal->batch_out[2] contents], SHARED_INTERMEDIATE * sizeof(float));
+        shared_gate_score = ((float *)[g_metal->batch_out[3] contents])[0];
+        memcpy(h_mid,   [g_metal->buf_h_mid contents], HIDDEN_DIM * sizeof(float));
+        memcpy(h_post,  [g_metal->buf_input contents],  HIDDEN_DIM * sizeof(float));
+        memcpy(hidden,  h_mid,                          HIDDEN_DIM * sizeof(float));
+        if (g_timing_enabled) { t1 = now_ms(); g_timing.cmd2_wait += t1 - t0; }
+    } else if (!disable_fused_cmd2 &&
         (attn_out_for_oproj || gpu_attn_fuse) && oproj_w &&
         (oproj_kind == MATVEC_KIND_GGUF_Q8_0 || (oproj_s && oproj_b)) &&
         g_metal && g_metal->wf_buf && have_moe_weights &&
