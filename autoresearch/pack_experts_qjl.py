@@ -156,7 +156,9 @@ def encode_matrix_qjl(W: np.ndarray, D_bits: np.ndarray):
     norms = np.linalg.norm(W, axis=1).astype(np.float32)
 
     # Apply D scrambling: D_j ∈ {-1, +1}
-    D_signs = (D_bits * 2 - 1).astype(np.float32)   # {0,1} → {-1,+1}
+    # IMPORTANT: cast to float32 BEFORE multiplication to avoid uint8 overflow
+    # (uint8: 0*2-1=255, not -1; float32: 0.0*2-1=-1.0)
+    D_signs = D_bits.astype(np.float32) * 2 - 1   # {0,1} → {-1.0, +1.0}
     W_scrambled = W * D_signs[np.newaxis, :]
 
     # Apply WHT
