@@ -144,6 +144,25 @@
 #define DOWN_S_OFF_Q3_OUTLIER  DOWN_W_OFF_Q3_OUTLIER
 #define DOWN_B_OFF_Q3_OUTLIER  DOWN_W_OFF_Q3_OUTLIER
 
+// QJL 1-bit expert layout (Exp34)
+// Source: 4-bit MLX experts SRHT-scrambled + sign-quantized
+// Per expert (1,597,440 bytes = 1.52 MB vs Q3 5.44 MB):
+//   gate_proj: float32[1024] norms + uint8[1024×512] sign_bits
+//   up_proj:   float32[1024] norms + uint8[1024×512] sign_bits
+//   down_proj: float32[4096] norms + uint8[4096×128] sign_bits
+#define QJL_GATE_NORMS_OFF  0
+#define QJL_GATE_SIGNS_OFF  (QJL_GATE_NORMS_OFF + MOE_INTERMEDIATE * 4)
+#define QJL_UP_NORMS_OFF    (QJL_GATE_SIGNS_OFF + MOE_INTERMEDIATE * (HIDDEN_DIM / 8))
+#define QJL_UP_SIGNS_OFF    (QJL_UP_NORMS_OFF   + MOE_INTERMEDIATE * 4)
+#define QJL_DOWN_NORMS_OFF  (QJL_UP_SIGNS_OFF   + MOE_INTERMEDIATE * (HIDDEN_DIM / 8))
+#define QJL_DOWN_SIGNS_OFF  (QJL_DOWN_NORMS_OFF + HIDDEN_DIM * 4)
+#define EXPERT_SIZE_QJL     (QJL_DOWN_SIGNS_OFF + HIDDEN_DIM * (MOE_INTERMEDIATE / 8))
+// D vectors stored in packed_experts_QJL/d_vectors.bin
+// Format: for each layer (in layer order): uint8[HIDDEN_DIM/8] D_shared + uint8[MOE_INTERMEDIATE/8] D_down
+#define QJL_D_SHARED_BYTES  (HIDDEN_DIM / 8)        // 512
+#define QJL_D_DOWN_BYTES    (MOE_INTERMEDIATE / 8)  // 128
+#define QJL_D_RECORD_BYTES  (QJL_D_SHARED_BYTES + QJL_D_DOWN_BYTES)  // 640 per layer
+
 // KV cache maximum context length
 #define MAX_SEQ_LEN 1048576  // 1M context — only 15 full-attn layers need KV cache, ~15GB at max
 #define GPU_KV_SEQ  8192     // GPU KV buffer pre-allocation (grows if exceeded, falls back to CPU attn)
@@ -266,6 +285,9 @@ static int g_use_q3_experts = 0;         // enabled by --q3-experts flag: use pa
 static int g_layer_is_q3_hybrid[NUM_LAYERS];  // per-layer quant: 1=Q3 hybrid, 0=4-bit
 static int g_use_q3_outlier = 0;  // active layer override: exact layer-27 IQ4_XS gate/up + Q5_K down
 static int g_layer_is_q3_outlier[NUM_LAYERS];
+static int g_use_qjl_experts = 0;  // --qjl-experts: 1-bit SRHT-QJL streamed experts
+static uint8_t g_qjl_d_shared[NUM_LAYERS][QJL_D_SHARED_BYTES];  // D diagonal for gate/up (in_dim=4096)
+static uint8_t g_qjl_d_down[NUM_LAYERS][QJL_D_DOWN_BYTES];      // D diagonal for down (in_dim=1024)
 static int g_cache_telemetry_enabled = 0;  // enabled by --cache-telemetry flag
 static int g_cache_io_split = 4;  // enabled by --cache-io-split N: split each routed expert pread into N page-aligned chunks
 static int g_think_budget = 2048; // max thinking tokens before force-emitting </think>
@@ -297,6 +319,7 @@ typedef enum {
     EXPERT_QUANT_2BIT = 1,
     EXPERT_QUANT_Q3_HYBRID = 2,
     EXPERT_QUANT_Q3_OUTLIER = 3,
+    EXPERT_QUANT_QJL = 4,   // 1-bit SRHT-QJL (Exp34)
 } ExpertQuantKind;
 
 typedef enum {
@@ -304,6 +327,7 @@ typedef enum {
     EXPERT_PROJ_IQ3_XXS = 1,
     EXPERT_PROJ_IQ4_XS = 2,
     EXPERT_PROJ_Q5_K = 3,
+    EXPERT_PROJ_QJL = 4,    // 1-bit QJL — handled by gpu_encode_experts_qjl()
 } ExpertProjectionKind;
 
 typedef struct {
@@ -320,6 +344,7 @@ static inline ExpertQuantKind active_expert_quant_kind(void) {
     if (g_use_q3_outlier) return EXPERT_QUANT_Q3_OUTLIER;
     if (g_use_q3_experts) return EXPERT_QUANT_Q3_HYBRID;
     if (g_use_2bit) return EXPERT_QUANT_2BIT;
+    if (g_use_qjl_experts) return EXPERT_QUANT_QJL;
     return EXPERT_QUANT_4BIT;
 }
 
@@ -362,6 +387,19 @@ static inline ExpertLayout expert_layout_for_kind(ExpertQuantKind kind) {
                 .up_kind = EXPERT_PROJ_IQ4_XS,
                 .down_kind = EXPERT_PROJ_Q5_K,
             };
+        case EXPERT_QUANT_QJL:
+            // QJL: sign_off → _w_off, norms_off → _s_off (reused fields)
+            // gpu_encode_experts_qjl() uses the QJL_*_OFF constants directly;
+            // this layout entry mainly carries expert_size for pread sizing.
+            return (ExpertLayout) {
+                .expert_size = EXPERT_SIZE_QJL,
+                .gate_w_off = QJL_GATE_SIGNS_OFF, .gate_s_off = QJL_GATE_NORMS_OFF, .gate_b_off = 0,
+                .up_w_off   = QJL_UP_SIGNS_OFF,   .up_s_off   = QJL_UP_NORMS_OFF,   .up_b_off   = 0,
+                .down_w_off = QJL_DOWN_SIGNS_OFF,  .down_s_off = QJL_DOWN_NORMS_OFF, .down_b_off = 0,
+                .gate_kind = EXPERT_PROJ_QJL,
+                .up_kind   = EXPERT_PROJ_QJL,
+                .down_kind = EXPERT_PROJ_QJL,
+            };
         case EXPERT_QUANT_4BIT:
         default:
             return (ExpertLayout) {
@@ -381,6 +419,7 @@ static inline const char *expert_quant_label(ExpertQuantKind kind) {
         case EXPERT_QUANT_2BIT: return "2-bit";
         case EXPERT_QUANT_Q3_HYBRID: return "Q3-GGUF";
         case EXPERT_QUANT_Q3_OUTLIER: return "Q3-outlier";
+        case EXPERT_QUANT_QJL: return "QJL-1bit";
         case EXPERT_QUANT_4BIT:
         default: return "4-bit";
     }
@@ -389,6 +428,7 @@ static inline const char *expert_quant_label(ExpertQuantKind kind) {
 static inline const char *requested_expert_quant_label(void) {
     if (g_use_q3_experts) return "Q3-GGUF";
     if (g_use_2bit) return "2-bit";
+    if (g_use_qjl_experts) return "QJL-1bit";
     return "4-bit";
 }
 
@@ -402,6 +442,7 @@ static inline size_t layer_expert_size(int layer) {
 
 static inline size_t max_expert_size_for_current_config(void) {
     if (g_use_q3_experts) return EXPERT_SIZE_Q3_OUTLIER;
+    if (g_use_qjl_experts) return EXPERT_SIZE_QJL;
     return EXPERT_SIZE;
 }
 static int g_freq_total_tokens = 0;  // total tokens processed while tracking
@@ -2056,6 +2097,11 @@ typedef struct {
     id<MTLBuffer> buf_delta_output;   // [8192] float
     id<MTLBuffer> buf_conv_input;     // [12288] float
     id<MTLBuffer> buf_conv_output;    // [12288] float
+    // QJL 1-bit expert scratch buffers (Exp34)
+    id<MTLComputePipelineState> wht_scramble;      // WHT(D⊙x) → proj buffer
+    id<MTLComputePipelineState> matvec_1bit_qjl;   // 1-bit dot product
+    id<MTLBuffer> buf_qjl_proj_gate_up;  // [HIDDEN_DIM floats] WHT(D_shared⊙x), shared across K experts
+    id<MTLBuffer> buf_qjl_proj_down[MAX_K]; // [MOE_INTERMEDIATE floats] WHT(D_down⊙act_k), per expert
 } MetalCtx;
 
 static MetalCtx *g_metal = NULL;
@@ -2113,6 +2159,8 @@ static MetalCtx *metal_setup(void) {
     ctx->matvec_v3     = makePipe(@"dequant_matvec_4bit_v3");
     ctx->matvec_v5     = makePipe(@"dequant_matvec_4bit_v5");  // LUT variant (no uint→float conversions)
     ctx->matvec_fast   = makePipe(@"dequant_matvec_4bit_fast");
+    ctx->wht_scramble    = makePipe(@"qjl_wht_scramble");              // QJL Pass 1
+    ctx->matvec_1bit_qjl = makePipe(@"dequant_matvec_1bit_qjl");       // QJL Pass 2
     ctx->matvec_2bit   = makePipe(@"dequant_matvec_2bit");
     ctx->matvec_iq3_xxs = makePipe(@"dequant_matvec_iq3_xxs");
     ctx->matvec_iq4_xs = makePipe(@"dequant_matvec_iq4_xs");
@@ -2261,6 +2309,14 @@ static MetalCtx *metal_setup(void) {
                                                                  options:MTLResourceStorageModeShared];
         ctx->buf_multi_expert_out[k]  = [ctx->device newBufferWithLength:HIDDEN_DIM * sizeof(float)
                                                                  options:MTLResourceStorageModeShared];
+    }
+
+    // QJL scratch buffers (always allocated; negligible size if QJL not used)
+    ctx->buf_qjl_proj_gate_up = [ctx->device newBufferWithLength:HIDDEN_DIM * sizeof(float)
+                                                         options:MTLResourceStorageModeShared];
+    for (int k = 0; k < MAX_K; k++) {
+        ctx->buf_qjl_proj_down[k] = [ctx->device newBufferWithLength:MOE_INTERMEDIATE * sizeof(float)
+                                                             options:MTLResourceStorageModeShared];
     }
 
     // Shared expert buffers (for fused CMD2)
@@ -3207,6 +3263,125 @@ static void gpu_encode_expert_forward_slot_buf(
 // Each expert gets its own encoder pair for GPU parallelism across experts.
 // Within each encoder, gate+up (or SwiGLU+down) are serialized but share
 // encoder creation overhead. Net win: fewer encoders, same parallelism.
+// ──────────────────────────────────────────────────────────────────────────────
+// QJL 1-bit expert dispatch (Exp34)
+//
+// Two-pass approach per projection:
+//   Pass 1 (shared): qjl_wht_scramble — compute WHT(D⊙x) once for gate/up input
+//   Pass 2 (per-row): dequant_matvec_1bit_qjl — 1-bit dot product per output row
+//
+// Encoder structure:
+//   Enc_X: WHT(D_shared ⊙ buf_multi_expert_input) → buf_qjl_proj_gate_up
+//   for k = 0..K-1:
+//     Enc_A: gate_qjl(proj_gate_up) + up_qjl(proj_gate_up)  [same encoder]
+//     Enc_B: SwiGLU | WHT(D_down⊙act_k)→proj_down[k] | down_qjl(proj_down[k])
+// ──────────────────────────────────────────────────────────────────────────────
+static void gpu_encode_experts_qjl(
+    MetalCtx *ctx,
+    id<MTLCommandBuffer> cmdbuf,
+    int K,
+    const int *valid,
+    id<MTLBuffer> __strong *expert_bufs,
+    int layer_idx
+) {
+    if (!ctx->wht_scramble || !ctx->matvec_1bit_qjl) return;
+
+    const uint8_t *d_shared = g_qjl_d_shared[layer_idx];  // 512 bytes
+    const uint8_t *d_down   = g_qjl_d_down[layer_idx];    // 128 bytes
+
+    uint32_t gate_up_out = MOE_INTERMEDIATE;   // 1024
+    uint32_t gate_up_in  = HIDDEN_DIM;         // 4096
+    uint32_t down_out    = HIDDEN_DIM;         // 4096
+    uint32_t down_in     = MOE_INTERMEDIATE;   // 1024
+    uint32_t swiglu_tgs  = (gate_up_out + 255) / 256;
+
+    // ── Enc X: compute WHT(D_shared ⊙ x) → buf_qjl_proj_gate_up ──────────────
+    // Shared across all K active experts (same input vector x for gate/up).
+    {
+        id<MTLComputeCommandEncoder> enc = [cmdbuf computeCommandEncoder];
+        [enc setComputePipelineState:ctx->wht_scramble];
+        [enc setBuffer:ctx->buf_multi_expert_input offset:0 atIndex:0];
+        [enc setBytes:d_shared length:QJL_D_SHARED_BYTES atIndex:1];
+        [enc setBuffer:ctx->buf_qjl_proj_gate_up  offset:0 atIndex:2];
+        [enc setBytes:&gate_up_in length:4 atIndex:3];
+        // TG shared memory: gate_up_in floats (16 KB for 4096-element WHT)
+        [enc setThreadgroupMemoryLength:gate_up_in * sizeof(float) atIndex:0];
+        [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1)
+            threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        [enc endEncoding];
+    }
+
+    // ── Per-expert: Enc A (gate+up) + Enc B (SwiGLU+WHT_down+down) ───────────
+    for (int k = 0; k < K; k++) {
+        if (!valid[k]) continue;
+
+        // Enc A: gate_proj + up_proj (both read buf_qjl_proj_gate_up)
+        {
+            id<MTLComputeCommandEncoder> enc = [cmdbuf computeCommandEncoder];
+            // gate_proj
+            [enc setComputePipelineState:ctx->matvec_1bit_qjl];
+            [enc setBuffer:expert_bufs[k]                  offset:QJL_GATE_SIGNS_OFF atIndex:0];
+            [enc setBuffer:expert_bufs[k]                  offset:QJL_GATE_NORMS_OFF atIndex:1];
+            [enc setBuffer:ctx->buf_qjl_proj_gate_up       offset:0 atIndex:2];
+            [enc setBuffer:ctx->buf_multi_expert_gate[k]   offset:0 atIndex:3];
+            [enc setBytes:&gate_up_out length:4 atIndex:4];
+            [enc setBytes:&gate_up_in  length:4 atIndex:5];
+            // TG shared memory: gate_up_in floats for x_shared cache
+            [enc setThreadgroupMemoryLength:gate_up_in * sizeof(float) atIndex:0];
+            [enc dispatchThreadgroups:MTLSizeMake(gate_up_out, 1, 1)
+                threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+            // up_proj (same encoder, serial)
+            [enc setBuffer:expert_bufs[k]                  offset:QJL_UP_SIGNS_OFF atIndex:0];
+            [enc setBuffer:expert_bufs[k]                  offset:QJL_UP_NORMS_OFF atIndex:1];
+            [enc setBuffer:ctx->buf_multi_expert_up[k]     offset:0 atIndex:3];
+            [enc setThreadgroupMemoryLength:gate_up_in * sizeof(float) atIndex:0];
+            [enc dispatchThreadgroups:MTLSizeMake(gate_up_out, 1, 1)
+                threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+            [enc endEncoding];
+        }
+
+        // Enc B: SwiGLU → WHT(D_down⊙act) → down_proj
+        {
+            id<MTLComputeCommandEncoder> enc = [cmdbuf computeCommandEncoder];
+
+            // SwiGLU: gate * sigmoid(gate) * up
+            [enc setComputePipelineState:ctx->swiglu];
+            [enc setBuffer:ctx->buf_multi_expert_gate[k] offset:0 atIndex:0];
+            [enc setBuffer:ctx->buf_multi_expert_up[k]   offset:0 atIndex:1];
+            [enc setBuffer:ctx->buf_multi_expert_act[k]  offset:0 atIndex:2];
+            [enc setBytes:&gate_up_out length:4 atIndex:3];
+            [enc dispatchThreadgroups:MTLSizeMake(swiglu_tgs, 1, 1)
+                threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+
+            // WHT(D_down ⊙ act_k) → buf_qjl_proj_down[k]
+            // act_k (MOE_INTERMEDIATE = 1024 floats) just written by SwiGLU above.
+            [enc setComputePipelineState:ctx->wht_scramble];
+            [enc setBuffer:ctx->buf_multi_expert_act[k]  offset:0 atIndex:0];
+            [enc setBytes:d_down length:QJL_D_DOWN_BYTES atIndex:1];
+            [enc setBuffer:ctx->buf_qjl_proj_down[k]     offset:0 atIndex:2];
+            [enc setBytes:&down_in length:4 atIndex:3];
+            // TG shared memory: down_in floats (4 KB for 1024-element WHT)
+            [enc setThreadgroupMemoryLength:down_in * sizeof(float) atIndex:0];
+            [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1)
+                threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+
+            // down_proj 1-bit dot product
+            [enc setComputePipelineState:ctx->matvec_1bit_qjl];
+            [enc setBuffer:expert_bufs[k]                  offset:QJL_DOWN_SIGNS_OFF atIndex:0];
+            [enc setBuffer:expert_bufs[k]                  offset:QJL_DOWN_NORMS_OFF atIndex:1];
+            [enc setBuffer:ctx->buf_qjl_proj_down[k]       offset:0 atIndex:2];
+            [enc setBuffer:ctx->buf_multi_expert_out[k]    offset:0 atIndex:3];
+            [enc setBytes:&down_out length:4 atIndex:4];
+            [enc setBytes:&down_in  length:4 atIndex:5];
+            // TG shared memory: down_in floats for x_shared cache
+            [enc setThreadgroupMemoryLength:down_in * sizeof(float) atIndex:0];
+            [enc dispatchThreadgroups:MTLSizeMake(down_out, 1, 1)
+                threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+            [enc endEncoding];
+        }
+    }
+}
+
 static void gpu_encode_experts_batched(
     MetalCtx *ctx,
     id<MTLCommandBuffer> cmdbuf,
@@ -7237,7 +7412,11 @@ static void fused_layer_forward(
         // (vs. 4*K + 2 = 18 with old per-expert encoding).
         id<MTLCommandBuffer> cmd_experts = [g_metal->queue commandBuffer];
 
-        gpu_encode_experts_batched(g_metal, cmd_experts, actual_K, valid, expert_bufs);
+        if (g_use_qjl_experts) {
+            gpu_encode_experts_qjl(g_metal, cmd_experts, actual_K, valid, expert_bufs, layer_idx);
+        } else {
+            gpu_encode_experts_batched(g_metal, cmd_experts, actual_K, valid, expert_bufs);
+        }
 
         // Shared expert SwiGLU + down_proj (2 more encoders)
         // Note: shared_gate/up already copied to GPU buffers above (before async pread wait)
@@ -8442,6 +8621,7 @@ static void print_usage(const char *prog) {
     printf("  --cache-io-split N   Experimental: split each routed expert pread into N page-aligned chunks\n");
     printf("  --2bit               Use 2-bit quantized experts (packed_experts_2bit/)\n");
     printf("  --q3-experts         Use hybrid Q3 streamed experts (packed_experts_Q3/)\n");
+    printf("  --qjl-experts        Use 1-bit QJL (SRHT) experts (packed_experts_QJL/)\n");
     printf("  --gpu-linear         Alias for the fused GPU delta-net path (default)\n");
     printf("  --predict            Enable temporal expert prediction (prefetch during CMD1_wait)\n");
     printf("  --collect-routing F  Log routing data to binary file F (for predictor training)\n");
@@ -8505,6 +8685,7 @@ int main(int argc, char **argv) {
             {"cache-io-split", required_argument, 0, 'W'},
             {"2bit",          no_argument,       0, '2'},
             {"q3-experts",    no_argument,       0, '3'},
+            {"qjl-experts",  no_argument,       0, '1'},
             {"gpu-linear",    no_argument,       0, 'G'},
             {"think-budget",  required_argument, 0, 'B'},
             {"serve",         required_argument, 0, 'R'},
@@ -8519,7 +8700,7 @@ int main(int argc, char **argv) {
         };
 
         int c;
-        while ((c = getopt_long(argc, argv, "m:w:j:I:A:N:J:K:U:V:Y:v:p:P:t:k:C:M:R:B:LSTFEW:23Gh", long_options, NULL)) != -1) {
+        while ((c = getopt_long(argc, argv, "m:w:j:I:A:N:J:K:U:V:Y:v:p:P:t:k:C:M:R:B:LSTFEW:123Gh", long_options, NULL)) != -1) {
             switch (c) {
                 case 'm': model_path = optarg; break;
                 case 'w': weights_path = optarg; break;
@@ -8547,6 +8728,7 @@ int main(int argc, char **argv) {
                 case 'W': g_cache_io_split = atoi(optarg); break;
                 case '2': g_use_2bit = 1; break;
                 case '3': g_use_q3_experts = 1; break;
+                case '1': g_use_qjl_experts = 1; break;
                 case 'G': gpu_linear_attn_enabled = 1; break;
                 case 'D': g_pred_enabled = 1; break;
                 case 'Z':
@@ -8569,6 +8751,10 @@ int main(int argc, char **argv) {
 
         if (g_use_2bit && g_use_q3_experts) {
             fprintf(stderr, "ERROR: --2bit and --q3-experts are mutually exclusive for now\n");
+            return 1;
+        }
+        if (g_use_qjl_experts && (g_use_2bit || g_use_q3_experts)) {
+            fprintf(stderr, "ERROR: --qjl-experts is mutually exclusive with --2bit and --q3-experts\n");
             return 1;
         }
 
@@ -8770,7 +8956,7 @@ int main(int argc, char **argv) {
         }
 
         // ---- Auto-detect 2-bit experts ----
-        if (!g_use_2bit && !g_use_q3_experts) {
+        if (!g_use_2bit && !g_use_q3_experts && !g_use_qjl_experts) {
             char probe[1024];
             snprintf(probe, sizeof(probe), "%s/packed_experts_2bit/layer_00.bin", model_path);
             int pfd = open(probe, O_RDONLY);
@@ -8808,11 +8994,35 @@ int main(int argc, char **argv) {
         memset(g_layer_is_q3_hybrid, 0, sizeof(g_layer_is_q3_hybrid));
         memset(g_layer_is_q3_outlier, 0, sizeof(g_layer_is_q3_outlier));
 
+        // ---- Load QJL D vectors ----
+        if (g_use_qjl_experts) {
+            char dvec_path[1024];
+            snprintf(dvec_path, sizeof(dvec_path), "%s/packed_experts_QJL/d_vectors.bin", model_path);
+            FILE *dvf = fopen(dvec_path, "rb");
+            if (!dvf) {
+                fprintf(stderr, "ERROR: QJL d_vectors.bin not found: %s\n", dvec_path);
+                fprintf(stderr, "       Run: python3 autoresearch/pack_experts_qjl.py --model %s\n", model_path);
+                return 1;
+            }
+            for (int li = 0; li < NUM_LAYERS; li++) {
+                if (fread(g_qjl_d_shared[li], 1, QJL_D_SHARED_BYTES, dvf) != QJL_D_SHARED_BYTES ||
+                    fread(g_qjl_d_down[li],   1, QJL_D_DOWN_BYTES,   dvf) != QJL_D_DOWN_BYTES) {
+                    fprintf(stderr, "ERROR: QJL d_vectors.bin truncated at layer %d\n", li);
+                    fclose(dvf);
+                    return 1;
+                }
+            }
+            fclose(dvf);
+        }
+
         for (int i = 0; i < NUM_LAYERS; i++) {
             char path[1024];
             layer_fds[i] = -1;
 
-            if (g_use_q3_experts) {
+            if (g_use_qjl_experts) {
+                snprintf(path, sizeof(path), "%s/packed_experts_QJL/layer_%02d.bin", model_path, i);
+                layer_fds[i] = open(path, O_RDONLY);
+            } else if (g_use_q3_experts) {
                 snprintf(path, sizeof(path), "%s/packed_experts_Q3/layer_%02d.bin", model_path, i);
                 layer_fds[i] = open(path, O_RDONLY);
                 if (layer_fds[i] >= 0) {
@@ -8885,6 +9095,9 @@ int main(int argc, char **argv) {
         } else if (g_use_q3_experts && layers_q3_outlier > 0) {
             printf("[mixed-quant] %d layers at Q3-GGUF, %d layers at Q3-outlier\n",
                    layers_q3, layers_q3_outlier);
+        } else if (g_use_qjl_experts) {
+            printf("[qjl] %d/%d QJL-1bit layers loaded (%d bytes/expert)\n",
+                   expert_layers_available, NUM_LAYERS, EXPERT_SIZE_QJL);
         } else if (g_use_2bit && layers_4bit > 0) {
             printf("[mixed-quant] %d layers at 2-bit, %d layers at 4-bit\n", layers_2bit, layers_4bit);
         }
@@ -8893,7 +9106,7 @@ int main(int argc, char **argv) {
         {
             char lz4_probe[1024];
             snprintf(lz4_probe, sizeof(lz4_probe), "%s/packed_experts_lz4/layer_00.bin", model_path);
-            if (!g_use_2bit && !g_use_q3_experts && access(lz4_probe, R_OK) == 0) {
+            if (!g_use_2bit && !g_use_q3_experts && !g_use_qjl_experts && access(lz4_probe, R_OK) == 0) {
                 int lz4_layers = 0;
                 for (int i = 0; i < NUM_LAYERS; i++) {
                     char lz4_path[1024];

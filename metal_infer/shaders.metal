@@ -474,6 +474,125 @@ kernel void dequant_matvec_4bit_fast(
 }
 
 // ============================================================================
+// QJL 1-bit expert kernels — Exp34 (QJL experiment)
+//
+// Two-pass streaming-expert dequant:
+//   Pass 1 — qjl_wht_scramble:
+//       Computes WHT(D ⊙ x) into a device buffer.
+//       D is a fixed per-layer diagonal ∈ {-1,+1}^d (packed bits).
+//       TG shared mem = in_dim × 4 bytes.  1 TG × 256 threads.
+//
+//   Pass 2 — dequant_matvec_1bit_qjl:
+//       out_i = (π/2/d) · norm_i · Σ_j q_{ij} · x''_j
+//       Loads x'' into TG shared memory (matvec_v3 style) to avoid repeated
+//       device reads across rows.  1 TG per output row × 64 threads.
+//       Batched FP32 accumulation every 128 elements.
+// ============================================================================
+
+kernel void qjl_wht_scramble(
+    device const float*   x      [[buffer(0)]],
+    device const uint8_t* D_bits [[buffer(1)]],  // packed {0,1} bits, in_dim/8 bytes
+    device float*         out    [[buffer(2)]],
+    constant uint&        in_dim [[buffer(3)]],
+    threadgroup float*    shared [[threadgroup(0)]],  // in_dim floats
+    uint lid     [[thread_position_in_threadgroup]],
+    uint tg_size [[threads_per_threadgroup]]
+) {
+    uint d = in_dim;
+
+    // Load D⊙x into threadgroup memory
+    for (uint i = lid; i < d; i += tg_size) {
+        uint byte_idx = i >> 3;
+        uint bit_idx  = i & 7;
+        float d_sign  = ((D_bits[byte_idx] >> bit_idx) & 1) ? 1.0f : -1.0f;
+        shared[i] = d_sign * x[i];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // In-place Walsh-Hadamard butterfly (stride doubling)
+    for (uint stride = 1; stride < d; stride <<= 1) {
+        for (uint i = lid; i < d >> 1; i += tg_size) {
+            uint group = i / stride;
+            uint pos   = i % stride;
+            uint a_idx = group * (stride << 1) + pos;
+            uint b_idx = a_idx + stride;
+            float a = shared[a_idx];
+            float b = shared[b_idx];
+            shared[a_idx] = a + b;
+            shared[b_idx] = a - b;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    // Write WHT result to device memory
+    for (uint i = lid; i < d; i += tg_size) {
+        out[i] = shared[i];
+    }
+}
+
+kernel void dequant_matvec_1bit_qjl(
+    device const uint8_t* signs   [[buffer(0)]],  // packed bits: out_dim × in_dim/8 bytes
+    device const float*   norms   [[buffer(1)]],  // L2 norms: out_dim floats
+    device const float*   x_trans [[buffer(2)]],  // WHT(D⊙x): in_dim floats
+    device float*         out     [[buffer(3)]],
+    constant uint&        out_dim [[buffer(4)]],
+    constant uint&        in_dim  [[buffer(5)]],
+    threadgroup float*    x_shared [[threadgroup(0)]],  // in_dim floats
+    uint tgid    [[threadgroup_position_in_grid]],
+    uint lid     [[thread_position_in_threadgroup]],
+    uint tg_size [[threads_per_threadgroup]]
+) {
+    uint d = in_dim;
+
+    // Load x_trans into shared memory cooperatively (matvec_v3 pattern)
+    for (uint i = lid; i < d; i += tg_size) {
+        x_shared[i] = x_trans[i];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (tgid >= out_dim) return;
+
+    uint n_bytes = d >> 3;
+    device const uint8_t* row = signs + (uint)tgid * n_bytes;
+    float acc = 0.0f;
+    float batch = 0.0f;
+    uint bcnt = 0;
+
+    for (uint b = lid; b < n_bytes; b += tg_size) {
+        uint8_t w = row[b];
+        uint base = b << 3;
+        // 8-wide unroll: ±x based on sign bit
+        batch += ((w & 0x01) ? x_shared[base+0] : -x_shared[base+0]);
+        batch += ((w & 0x02) ? x_shared[base+1] : -x_shared[base+1]);
+        batch += ((w & 0x04) ? x_shared[base+2] : -x_shared[base+2]);
+        batch += ((w & 0x08) ? x_shared[base+3] : -x_shared[base+3]);
+        batch += ((w & 0x10) ? x_shared[base+4] : -x_shared[base+4]);
+        batch += ((w & 0x20) ? x_shared[base+5] : -x_shared[base+5]);
+        batch += ((w & 0x40) ? x_shared[base+6] : -x_shared[base+6]);
+        batch += ((w & 0x80) ? x_shared[base+7] : -x_shared[base+7]);
+        // Flush batch accumulator every 128 elements (16 byte-iterations)
+        if (++bcnt == 16) { acc += batch; batch = 0.0f; bcnt = 0; }
+    }
+    acc += batch;
+
+    // SIMD tree reduction
+    threadgroup float simd_buf[32];
+    float simd_val = simd_sum(acc);
+    uint simd_lane  = lid % 32;
+    uint simd_group = lid / 32;
+    uint n_simd     = (tg_size + 31) / 32;
+    if (simd_lane == 0) simd_buf[simd_group] = simd_val;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (simd_group == 0 && simd_lane < n_simd) {
+        float v = simd_sum(simd_buf[simd_lane]);
+        if (simd_lane == 0) {
+            float scale = (M_PI_F / 2.0f) * norms[tgid] / (float)d;
+            out[tgid] = v * scale;
+        }
+    }
+}
+
+// ============================================================================
 // GGUF Q8_0 matvec for resident tensors
 // Reuses the same tiled shape as the 4-bit kernel: 8 rows per threadgroup.
 // ============================================================================
