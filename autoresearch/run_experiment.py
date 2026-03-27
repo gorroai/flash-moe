@@ -292,6 +292,7 @@ def main() -> int:
     parser.add_argument("--gen-tokens", type=int, default=int(config.get("gen_tokens", DEFAULT_GEN_TOKENS)), help="Generation token count")
     parser.add_argument("--2bit", dest="two_bit", action="store_true", help="Run the 2-bit expert path")
     parser.add_argument("--q3-experts", dest="q3_experts", action="store_true", help="Run the Q3 GGUF expert path")
+    parser.add_argument("--qjl-experts", dest="qjl_experts", action="store_true", help="Run the 1-bit QJL SRHT expert path")
     parser.add_argument("--cache-io-split", dest="cache_io_split", type=int, default=0, help="Fan out expert preads (0=default)")
     parser.add_argument("--ppl-max", type=float, default=float(config.get("short_ppl_max", DEFAULT_PPL_MAX)), help="Maximum allowed short perplexity")
     parser.add_argument("--full-ppl-max", type=float, default=float(config.get("full_ppl_max", DEFAULT_PPL_MAX)), help="Maximum allowed periodic full perplexity")
@@ -317,6 +318,7 @@ def main() -> int:
         "gguf": args.gguf,
         "two_bit": args.two_bit,
         "q3_experts": args.q3_experts,
+        "qjl_experts": args.qjl_experts,
         "cache_io_split": args.cache_io_split,
         "gguf_embedding": args.gguf_embedding,
         "gguf_full_attn_bin": args.gguf_full_attn_bin,
@@ -399,6 +401,8 @@ def main() -> int:
             smoke_cmd.append("--2bit")
         if args.q3_experts:
             smoke_cmd.append("--q3-experts")
+        if args.qjl_experts:
+            smoke_cmd.append("--qjl-experts")
         if args.cache_io_split:
             smoke_cmd.extend(["--cache-io-split", str(args.cache_io_split)])
         if args.gguf_embedding:
@@ -450,6 +454,8 @@ def main() -> int:
         gen_cmd.append("--2bit")
     if args.q3_experts:
         gen_cmd.append("--q3-experts")
+    if args.qjl_experts:
+        gen_cmd.append("--qjl-experts")
     if args.cache_io_split:
         gen_cmd.extend(["--cache-io-split", str(args.cache_io_split)])
     if args.gguf_embedding:
@@ -527,6 +533,8 @@ def main() -> int:
         ppl_cmd.append("--2bit")
     if args.q3_experts:
         ppl_cmd.append("--q3-experts")
+    if args.qjl_experts:
+        ppl_cmd.append("--qjl-experts")
     if args.cache_io_split:
         ppl_cmd.extend(["--cache-io-split", str(args.cache_io_split)])
     if args.gguf_embedding:
@@ -598,6 +606,8 @@ def main() -> int:
             full_ppl_cmd.append("--2bit")
         if args.q3_experts:
             full_ppl_cmd.append("--q3-experts")
+        if args.qjl_experts:
+            full_ppl_cmd.append("--qjl-experts")
         if args.cache_io_split:
             full_ppl_cmd.extend(["--cache-io-split", str(args.cache_io_split)])
         if args.gguf_embedding:
