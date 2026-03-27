@@ -948,6 +948,91 @@ kernel void dequant_matvec_4bit_v5(
 // ============================================================================
 // Kernel 1e: 2-bit affine dequant matvec (same structure as v3)
 // ============================================================================
+// Ternary 2-bit dequant matvec (Exp35)
+// ============================================================================
+//
+// Packs 16 x ternary values per uint32 (2 bits each):
+//   0b00 = 0, 0b01 = +1, 0b10 = -1
+// Symmetric quantization (no bias): val = ternary_code * scale
+// group_size = 128 (vs 64 for 4-bit): n_groups = in_dim / 128
+// packed_cols = in_dim / 16
+//
+// Dequant formula:
+//   bits = (packed >> (i*2)) & 0x3
+//   ternary_val = float(int(bits&1) - int((bits>>1)&1))
+//     bits=00 → 0-0=0, bits=01 → 1-0=+1, bits=10 → 0-1=-1, bits=11 → 0 (unused)
+//   output += ternary_val * scale * x[col*16 + i]
+//
+// Same threadgroup structure as dequant_matvec_2bit: 256 threads / 8 SIMD groups / 8 rows per TG.
+// buffer(2) is a dummy (unused) — present for uniform dispatch with other kernels.
+
+kernel void dequant_matvec_ternary(
+    device const uint32_t* W_packed   [[buffer(0)]],  // [out_dim, in_dim/16] 2-bit ternary
+    device const uint16_t* scales     [[buffer(1)]],  // [out_dim, num_groups] bf16, symmetric
+    device const uint16_t* unused_buf [[buffer(2)]],  // unused (uniform dispatch padding)
+    device const float*    x          [[buffer(3)]],  // [in_dim]
+    device float*          out        [[buffer(4)]],  // [out_dim]
+    constant uint&         out_dim    [[buffer(5)]],
+    constant uint&         in_dim     [[buffer(6)]],
+    constant uint&         group_size [[buffer(7)]],
+    uint tgid       [[threadgroup_position_in_grid]],
+    uint lid        [[thread_position_in_threadgroup]],
+    uint simd_lane  [[thread_index_in_simdgroup]],
+    uint simd_group [[simdgroup_index_in_threadgroup]]
+) {
+    uint row = tgid * ROWS_PER_TG + simd_group;
+    uint packed_cols = in_dim / 16;   // uint32 words per row
+    uint num_groups  = in_dim / group_size;  // groups per row (group_size=128)
+
+    // Cache x in threadgroup memory (max in_dim = HIDDEN_DIM = 4096)
+    threadgroup float x_shared[4096];
+    for (uint i = lid; i < in_dim; i += 256) {
+        x_shared[i] = x[i];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (row >= out_dim) return;
+
+    device const uint32_t* w_row = W_packed + row * packed_cols;
+    device const uint16_t* s_row = scales   + row * num_groups;
+
+    float acc = 0.0f;
+
+    // group_size/16 = 128/16 = 8 packed words per group
+    for (uint col = simd_lane; col < packed_cols; col += 32) {
+        uint g = col / (group_size / 16);   // group index
+        float scale = bf16_to_f32(s_row[g]);
+
+        uint32_t packed = w_row[col];
+        uint x_base = col * 16;
+
+        // Decode 16 ternary values. Encoding: 00=0, 01=+1, 10=-1
+        // ternary_val = float(int(bits&1) - int((bits>>1)&1))
+        acc += float(int((packed >>  0) & 1u) - int((packed >>  1) & 1u)) * scale * x_shared[x_base +  0];
+        acc += float(int((packed >>  2) & 1u) - int((packed >>  3) & 1u)) * scale * x_shared[x_base +  1];
+        acc += float(int((packed >>  4) & 1u) - int((packed >>  5) & 1u)) * scale * x_shared[x_base +  2];
+        acc += float(int((packed >>  6) & 1u) - int((packed >>  7) & 1u)) * scale * x_shared[x_base +  3];
+        acc += float(int((packed >>  8) & 1u) - int((packed >>  9) & 1u)) * scale * x_shared[x_base +  4];
+        acc += float(int((packed >> 10) & 1u) - int((packed >> 11) & 1u)) * scale * x_shared[x_base +  5];
+        acc += float(int((packed >> 12) & 1u) - int((packed >> 13) & 1u)) * scale * x_shared[x_base +  6];
+        acc += float(int((packed >> 14) & 1u) - int((packed >> 15) & 1u)) * scale * x_shared[x_base +  7];
+        acc += float(int((packed >> 16) & 1u) - int((packed >> 17) & 1u)) * scale * x_shared[x_base +  8];
+        acc += float(int((packed >> 18) & 1u) - int((packed >> 19) & 1u)) * scale * x_shared[x_base +  9];
+        acc += float(int((packed >> 20) & 1u) - int((packed >> 21) & 1u)) * scale * x_shared[x_base + 10];
+        acc += float(int((packed >> 22) & 1u) - int((packed >> 23) & 1u)) * scale * x_shared[x_base + 11];
+        acc += float(int((packed >> 24) & 1u) - int((packed >> 25) & 1u)) * scale * x_shared[x_base + 12];
+        acc += float(int((packed >> 26) & 1u) - int((packed >> 27) & 1u)) * scale * x_shared[x_base + 13];
+        acc += float(int((packed >> 28) & 1u) - int((packed >> 29) & 1u)) * scale * x_shared[x_base + 14];
+        acc += float(int((packed >> 30) & 1u) - int((packed >> 31) & 1u)) * scale * x_shared[x_base + 15];
+    }
+
+    float sum = simd_sum(acc);
+    if (simd_lane == 0) {
+        out[row] = sum;
+    }
+}
+
+
+// ============================================================================
 // Packs 16 x 2-bit values per uint32. Each value is 0-3, dequantized as:
 //   val = uint2 * scale + bias (same affine quantization, just 2-bit range)
 // Same group structure: group_size elements share one (scale, bias) pair.

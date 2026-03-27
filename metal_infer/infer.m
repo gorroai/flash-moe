@@ -144,6 +144,25 @@
 #define DOWN_S_OFF_Q3_OUTLIER  DOWN_W_OFF_Q3_OUTLIER
 #define DOWN_B_OFF_Q3_OUTLIER  DOWN_W_OFF_Q3_OUTLIER
 
+// Ternary 2-bit expert layout (Exp35)
+// Source: 4-bit MLX experts, ternary quantized with group_size=128, symmetric (no bias)
+// Per expert (3,342,336 bytes = 3.18 MB vs Q3 5.44 MB, vs 4-bit 6.75 MB):
+//   gate_proj weights [out=1024, in=4096, 2-bit] = 1,048,576 bytes
+//   gate_proj scales  [out=1024, groups=32, bf16] =    65,536 bytes
+//   up_proj   weights [out=1024, in=4096, 2-bit] = 1,048,576 bytes
+//   up_proj   scales  [out=1024, groups=32, bf16] =    65,536 bytes
+//   down_proj weights [out=4096, in=1024, 2-bit] = 1,048,576 bytes
+//   down_proj scales  [out=4096, groups=8,  bf16] =    65,536 bytes
+// Encoding: 0b00=0, 0b01=+1, 0b10=-1, 16 values per uint32
+// Page-aligned: 3342336/4=835584 bytes/chunk, 835584/4096=204 pages ✓
+#define TERNARY_GATE_W_OFF  0
+#define TERNARY_GATE_S_OFF  1048576
+#define TERNARY_UP_W_OFF    1114112
+#define TERNARY_UP_S_OFF    2162688
+#define TERNARY_DOWN_W_OFF  2228224
+#define TERNARY_DOWN_S_OFF  3276800
+#define EXPERT_SIZE_TERNARY 3342336
+
 // QJL 1-bit expert layout (Exp34)
 // Source: 4-bit MLX experts SRHT-scrambled + sign-quantized
 // Per expert (1,597,440 bytes = 1.52 MB vs Q3 5.44 MB):
@@ -286,6 +305,7 @@ static int g_layer_is_q3_hybrid[NUM_LAYERS];  // per-layer quant: 1=Q3 hybrid, 0
 static int g_use_q3_outlier = 0;  // active layer override: exact layer-27 IQ4_XS gate/up + Q5_K down
 static int g_layer_is_q3_outlier[NUM_LAYERS];
 static int g_use_qjl_experts = 0;  // --qjl-experts: 1-bit SRHT-QJL streamed experts
+static int g_use_ternary_experts = 0;  // --ternary-experts: ternary 2-bit symmetric (Exp35)
 static uint8_t g_qjl_d_shared[NUM_LAYERS][QJL_D_SHARED_BYTES];  // D diagonal for gate/up (in_dim=4096)
 static uint8_t g_qjl_d_down[NUM_LAYERS][QJL_D_DOWN_BYTES];      // D diagonal for down (in_dim=1024)
 static int g_cache_telemetry_enabled = 0;  // enabled by --cache-telemetry flag
@@ -320,6 +340,7 @@ typedef enum {
     EXPERT_QUANT_Q3_HYBRID = 2,
     EXPERT_QUANT_Q3_OUTLIER = 3,
     EXPERT_QUANT_QJL = 4,   // 1-bit SRHT-QJL (Exp34)
+    EXPERT_QUANT_TERNARY = 5, // ternary 2-bit, group_size=128, symmetric (Exp35)
 } ExpertQuantKind;
 
 typedef enum {
@@ -328,6 +349,7 @@ typedef enum {
     EXPERT_PROJ_IQ4_XS = 2,
     EXPERT_PROJ_Q5_K = 3,
     EXPERT_PROJ_QJL = 4,    // 1-bit QJL — handled by gpu_encode_experts_qjl()
+    EXPERT_PROJ_TERNARY = 5, // ternary 2-bit symmetric (Exp35)
 } ExpertProjectionKind;
 
 typedef struct {
@@ -345,6 +367,7 @@ static inline ExpertQuantKind active_expert_quant_kind(void) {
     if (g_use_q3_experts) return EXPERT_QUANT_Q3_HYBRID;
     if (g_use_2bit) return EXPERT_QUANT_2BIT;
     if (g_use_qjl_experts) return EXPERT_QUANT_QJL;
+    if (g_use_ternary_experts) return EXPERT_QUANT_TERNARY;
     return EXPERT_QUANT_4BIT;
 }
 
@@ -400,6 +423,18 @@ static inline ExpertLayout expert_layout_for_kind(ExpertQuantKind kind) {
                 .up_kind   = EXPERT_PROJ_QJL,
                 .down_kind = EXPERT_PROJ_QJL,
             };
+        case EXPERT_QUANT_TERNARY:
+            // Ternary 2-bit symmetric: weight (2-bit packed) + scale (bf16), no bias
+            // gate_b_off/up_b_off/down_b_off point to scales (dummy, unused by kernel buffer(2))
+            return (ExpertLayout) {
+                .expert_size = EXPERT_SIZE_TERNARY,
+                .gate_w_off = TERNARY_GATE_W_OFF, .gate_s_off = TERNARY_GATE_S_OFF, .gate_b_off = TERNARY_GATE_S_OFF,
+                .up_w_off   = TERNARY_UP_W_OFF,   .up_s_off   = TERNARY_UP_S_OFF,   .up_b_off   = TERNARY_UP_S_OFF,
+                .down_w_off = TERNARY_DOWN_W_OFF, .down_s_off = TERNARY_DOWN_S_OFF, .down_b_off = TERNARY_DOWN_S_OFF,
+                .gate_kind = EXPERT_PROJ_TERNARY,
+                .up_kind   = EXPERT_PROJ_TERNARY,
+                .down_kind = EXPERT_PROJ_TERNARY,
+            };
         case EXPERT_QUANT_4BIT:
         default:
             return (ExpertLayout) {
@@ -420,6 +455,7 @@ static inline const char *expert_quant_label(ExpertQuantKind kind) {
         case EXPERT_QUANT_Q3_HYBRID: return "Q3-GGUF";
         case EXPERT_QUANT_Q3_OUTLIER: return "Q3-outlier";
         case EXPERT_QUANT_QJL: return "QJL-1bit";
+        case EXPERT_QUANT_TERNARY: return "ternary-2bit";
         case EXPERT_QUANT_4BIT:
         default: return "4-bit";
     }
@@ -429,6 +465,7 @@ static inline const char *requested_expert_quant_label(void) {
     if (g_use_q3_experts) return "Q3-GGUF";
     if (g_use_2bit) return "2-bit";
     if (g_use_qjl_experts) return "QJL-1bit";
+    if (g_use_ternary_experts) return "ternary-2bit";
     return "4-bit";
 }
 
@@ -443,6 +480,7 @@ static inline size_t layer_expert_size(int layer) {
 static inline size_t max_expert_size_for_current_config(void) {
     if (g_use_q3_experts) return EXPERT_SIZE_Q3_OUTLIER;
     if (g_use_qjl_experts) return EXPERT_SIZE_QJL;
+    if (g_use_ternary_experts) return EXPERT_SIZE_TERNARY;
     return EXPERT_SIZE;
 }
 static int g_freq_total_tokens = 0;  // total tokens processed while tracking
@@ -1995,7 +2033,8 @@ typedef struct {
     id<MTLComputePipelineState> matvec_v3;
     id<MTLComputePipelineState> matvec_v5;  // LUT dequant variant
     id<MTLComputePipelineState> matvec_fast;  // for in_dim > 4096
-    id<MTLComputePipelineState> matvec_2bit;  // 2-bit expert dequant kernel
+    id<MTLComputePipelineState> matvec_2bit;     // 2-bit expert dequant kernel
+    id<MTLComputePipelineState> matvec_ternary;  // ternary 2-bit symmetric (Exp35)
     id<MTLComputePipelineState> matvec_iq3_xxs; // GGUF IQ3_XXS streamed expert kernel
     id<MTLComputePipelineState> matvec_iq4_xs; // GGUF IQ4_XS streamed expert kernel
     id<MTLComputePipelineState> matvec_q5_k; // GGUF Q5_K streamed expert kernel
@@ -2161,7 +2200,8 @@ static MetalCtx *metal_setup(void) {
     ctx->matvec_fast   = makePipe(@"dequant_matvec_4bit_fast");
     ctx->wht_scramble    = makePipe(@"qjl_wht_scramble");              // QJL Pass 1
     ctx->matvec_1bit_qjl = makePipe(@"dequant_matvec_1bit_qjl");       // QJL Pass 2
-    ctx->matvec_2bit   = makePipe(@"dequant_matvec_2bit");
+    ctx->matvec_2bit     = makePipe(@"dequant_matvec_2bit");
+    ctx->matvec_ternary  = makePipe(@"dequant_matvec_ternary");
     ctx->matvec_iq3_xxs = makePipe(@"dequant_matvec_iq3_xxs");
     ctx->matvec_iq4_xs = makePipe(@"dequant_matvec_iq4_xs");
     ctx->matvec_q5_k   = makePipe(@"dequant_matvec_q5_k");
@@ -3051,6 +3091,7 @@ static inline id<MTLComputePipelineState> expert_pipe_for_projection(
     if (proj_kind == EXPERT_PROJ_IQ4_XS) return ctx->matvec_iq4_xs;
     if (proj_kind == EXPERT_PROJ_Q5_K) return ctx->matvec_q5_k;
     if (kind == EXPERT_QUANT_2BIT) return ctx->matvec_2bit;
+    if (proj_kind == EXPERT_PROJ_TERNARY) return ctx->matvec_ternary;
     return ctx->matvec_v3;
 }
 
@@ -3095,6 +3136,11 @@ static inline void expert_dispatch_matvec(
         threadsPerThreadgroup:expert_threads_per_threadgroup(proj_kind)];
 }
 
+static inline uint32_t expert_group_size(ExpertQuantKind kind) {
+    if (kind == EXPERT_QUANT_TERNARY) return 128;  // ternary uses larger groups (symmetric)
+    return GROUP_SIZE;  // 64 for 4-bit, 2-bit, and Q3/QJL (which ignore this field)
+}
+
 // Encode one expert forward using multi-expert slot k.
 // Expert data must already be in buf_multi_expert_data[k].
 // Input must already be in buf_multi_expert_input.
@@ -3113,7 +3159,7 @@ static void gpu_encode_expert_forward_slot(
     uint32_t gate_up_in  = HIDDEN_DIM;
     uint32_t down_out    = HIDDEN_DIM;
     uint32_t down_in     = MOE_INTERMEDIATE;
-    uint32_t gs          = GROUP_SIZE;
+    uint32_t gs          = expert_group_size(quant_kind);
 
     // gate_proj: data[k] -> gate[k]
     {
@@ -3195,7 +3241,7 @@ static void gpu_encode_expert_forward_slot_buf(
     uint32_t gate_up_in  = HIDDEN_DIM;
     uint32_t down_out    = HIDDEN_DIM;
     uint32_t down_in     = MOE_INTERMEDIATE;
-    uint32_t gs          = GROUP_SIZE;
+    uint32_t gs          = expert_group_size(quant_kind);
 
     // gate_proj
     {
@@ -3399,7 +3445,7 @@ static void gpu_encode_experts_batched(
     uint32_t gate_up_in  = HIDDEN_DIM;
     uint32_t down_out    = HIDDEN_DIM;
     uint32_t down_in     = MOE_INTERMEDIATE;
-    uint32_t gs          = GROUP_SIZE;
+    uint32_t gs          = expert_group_size(quant_kind);
     uint32_t swiglu_tgs  = (gate_up_out + 255) / 256;
 
     // Per-expert: Encoder A (gate+up), Encoder B (SwiGLU+down)
@@ -3477,7 +3523,7 @@ static void gpu_encode_expert_forward(
     uint32_t gate_up_in  = HIDDEN_DIM;
     uint32_t down_out    = HIDDEN_DIM;
     uint32_t down_in     = MOE_INTERMEDIATE;
-    uint32_t gs          = GROUP_SIZE;
+    uint32_t gs          = expert_group_size(quant_kind);
 
     // gate_proj
     {
@@ -3609,7 +3655,7 @@ static void gpu_expert_forward(
     uint32_t gate_up_in  = HIDDEN_DIM;        // 4096
     uint32_t down_out    = HIDDEN_DIM;        // 4096
     uint32_t down_in     = MOE_INTERMEDIATE;  // 1024
-    uint32_t gs          = GROUP_SIZE;        // 64
+    uint32_t gs          = expert_group_size(quant_kind);  // 64 normally, 128 for ternary
 
     // Build one command buffer with all 4 dispatches:
     // 1. gate_proj matvec (h_post -> gate_out)
@@ -8622,6 +8668,7 @@ static void print_usage(const char *prog) {
     printf("  --2bit               Use 2-bit quantized experts (packed_experts_2bit/)\n");
     printf("  --q3-experts         Use hybrid Q3 streamed experts (packed_experts_Q3/)\n");
     printf("  --qjl-experts        Use 1-bit QJL (SRHT) experts (packed_experts_QJL/)\n");
+    printf("  --ternary-experts    Use ternary 2-bit symmetric experts (packed_experts_ternary/)\n");
     printf("  --gpu-linear         Alias for the fused GPU delta-net path (default)\n");
     printf("  --predict            Enable temporal expert prediction (prefetch during CMD1_wait)\n");
     printf("  --collect-routing F  Log routing data to binary file F (for predictor training)\n");
@@ -8686,6 +8733,7 @@ int main(int argc, char **argv) {
             {"2bit",          no_argument,       0, '2'},
             {"q3-experts",    no_argument,       0, '3'},
             {"qjl-experts",  no_argument,       0, '1'},
+            {"ternary-experts", no_argument,    0, '4'},
             {"gpu-linear",    no_argument,       0, 'G'},
             {"think-budget",  required_argument, 0, 'B'},
             {"serve",         required_argument, 0, 'R'},
@@ -8700,7 +8748,7 @@ int main(int argc, char **argv) {
         };
 
         int c;
-        while ((c = getopt_long(argc, argv, "m:w:j:I:A:N:J:K:U:V:Y:v:p:P:t:k:C:M:R:B:LSTFEW:123Gh", long_options, NULL)) != -1) {
+        while ((c = getopt_long(argc, argv, "m:w:j:I:A:N:J:K:U:V:Y:v:p:P:t:k:C:M:R:B:LSTFEW:1234Gh", long_options, NULL)) != -1) {
             switch (c) {
                 case 'm': model_path = optarg; break;
                 case 'w': weights_path = optarg; break;
@@ -8729,6 +8777,7 @@ int main(int argc, char **argv) {
                 case '2': g_use_2bit = 1; break;
                 case '3': g_use_q3_experts = 1; break;
                 case '1': g_use_qjl_experts = 1; break;
+                case '4': g_use_ternary_experts = 1; break;
                 case 'G': gpu_linear_attn_enabled = 1; break;
                 case 'D': g_pred_enabled = 1; break;
                 case 'Z':
@@ -8755,6 +8804,10 @@ int main(int argc, char **argv) {
         }
         if (g_use_qjl_experts && (g_use_2bit || g_use_q3_experts)) {
             fprintf(stderr, "ERROR: --qjl-experts is mutually exclusive with --2bit and --q3-experts\n");
+            return 1;
+        }
+        if (g_use_ternary_experts && (g_use_2bit || g_use_q3_experts || g_use_qjl_experts)) {
+            fprintf(stderr, "ERROR: --ternary-experts is mutually exclusive with other expert format flags\n");
             return 1;
         }
 
@@ -8956,7 +9009,7 @@ int main(int argc, char **argv) {
         }
 
         // ---- Auto-detect 2-bit experts ----
-        if (!g_use_2bit && !g_use_q3_experts && !g_use_qjl_experts) {
+        if (!g_use_2bit && !g_use_q3_experts && !g_use_qjl_experts && !g_use_ternary_experts) {
             char probe[1024];
             snprintf(probe, sizeof(probe), "%s/packed_experts_2bit/layer_00.bin", model_path);
             int pfd = open(probe, O_RDONLY);
@@ -9019,7 +9072,15 @@ int main(int argc, char **argv) {
             char path[1024];
             layer_fds[i] = -1;
 
-            if (g_use_qjl_experts) {
+            if (g_use_ternary_experts) {
+                snprintf(path, sizeof(path), "%s/packed_experts_ternary/layer_%02d.bin", model_path, i);
+                layer_fds[i] = open(path, O_RDONLY);
+                if (layer_fds[i] < 0) {
+                    fprintf(stderr, "ERROR: ternary expert file not found: %s\n", path);
+                    fprintf(stderr, "       Run: python3 autoresearch/pack_experts_ternary.py --model %s\n", model_path);
+                    return 1;
+                }
+            } else if (g_use_qjl_experts) {
                 snprintf(path, sizeof(path), "%s/packed_experts_QJL/layer_%02d.bin", model_path, i);
                 layer_fds[i] = open(path, O_RDONLY);
             } else if (g_use_q3_experts) {
@@ -9098,6 +9159,10 @@ int main(int argc, char **argv) {
         } else if (g_use_qjl_experts) {
             printf("[qjl] %d/%d QJL-1bit layers loaded (%d bytes/expert)\n",
                    expert_layers_available, NUM_LAYERS, EXPERT_SIZE_QJL);
+        } else if (g_use_ternary_experts) {
+            printf("[ternary] %d/%d ternary-2bit layers loaded (%d bytes/expert, %.2f MB/expert)\n",
+                   expert_layers_available, NUM_LAYERS, EXPERT_SIZE_TERNARY,
+                   EXPERT_SIZE_TERNARY / 1024.0 / 1024.0);
         } else if (g_use_2bit && layers_4bit > 0) {
             printf("[mixed-quant] %d layers at 2-bit, %d layers at 4-bit\n", layers_2bit, layers_4bit);
         }
@@ -9106,7 +9171,7 @@ int main(int argc, char **argv) {
         {
             char lz4_probe[1024];
             snprintf(lz4_probe, sizeof(lz4_probe), "%s/packed_experts_lz4/layer_00.bin", model_path);
-            if (!g_use_2bit && !g_use_q3_experts && !g_use_qjl_experts && access(lz4_probe, R_OK) == 0) {
+            if (!g_use_2bit && !g_use_q3_experts && !g_use_qjl_experts && !g_use_ternary_experts && access(lz4_probe, R_OK) == 0) {
                 int lz4_layers = 0;
                 for (int i = 0; i < NUM_LAYERS; i++) {
                     char lz4_path[1024];
