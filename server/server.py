@@ -100,7 +100,9 @@ def build_qwen_prompt(messages: list[dict]) -> str:
         else:
             parts.append(f"<|im_start|>{role}\n{content}<|im_end|>")
 
-    parts.append("<|im_start|>assistant")
+    # Append assistant cue with empty <think> block to suppress chain-of-thought.
+    # Qwen3.5 interprets <think>\n\n</think> as "thinking complete, answer directly."
+    parts.append("<|im_start|>assistant\n<think>\n\n</think>")
     return "\n".join(parts)
 
 
@@ -249,7 +251,14 @@ async def _stream_generation(
     yield _chunk(req_id, created, model, {"role": "assistant", "content": ""}, None)
 
     try:
+        first = True
         async for text in _read_tokens():
+            if first:
+                # Strip leading newlines produced by the empty <think></think> block
+                text = text.lstrip("\n")
+                first = False
+                if not text:
+                    continue
             yield _chunk(req_id, created, model, {"content": text}, None)
     except Exception as exc:
         log.error("Stream error: %s", exc)

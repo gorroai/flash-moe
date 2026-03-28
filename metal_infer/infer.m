@@ -5847,7 +5847,7 @@ static void build_layer_cache(WeightFile *wf) {
     }
 
     layer_cache_built = 1;
-    printf("[cache] Pre-computed weight pointers for %d layers\n", NUM_LAYERS);
+    fprintf(stderr, "[cache] Pre-computed weight pointers for %d layers\n", NUM_LAYERS);
 }
 
 // ============================================================================
@@ -9332,6 +9332,17 @@ int main(int argc, char **argv) {
             return 1;
         }
 
+        // In --stdin mode, redirect stdout → stderr for all init/diagnostic output so that
+        // the server's token-read loop receives only generated tokens, not setup chatter.
+        // We restore stdout just before entering stdin_loop(), which uses write(STDOUT_FILENO)
+        // directly for tokens and the \x00 end marker.
+        int saved_stdout_fd = -1;
+        if (stdin_mode) {
+            fflush(stdout);
+            saved_stdout_fd = dup(STDOUT_FILENO);
+            dup2(STDERR_FILENO, STDOUT_FILENO);
+        }
+
         // Build default paths — check <model_path>/ first, then legacy locations
         char default_weights[1024], default_manifest[1024], default_vocab[1024];
 
@@ -9784,6 +9795,13 @@ int main(int argc, char **argv) {
 
         // ---- Stdin mode: persistent JSON-over-stdin IPC (never returns) ----
         if (stdin_mode) {
+            // Restore stdout for token output (was redirected to stderr during init)
+            if (saved_stdout_fd >= 0) {
+                fflush(stdout);
+                dup2(saved_stdout_fd, STDOUT_FILENO);
+                close(saved_stdout_fd);
+                saved_stdout_fd = -1;
+            }
             reset_delta_net_state();
             stdin_loop(wf, vocab,
                        layer_states, kv_caches,
