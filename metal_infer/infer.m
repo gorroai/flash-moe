@@ -8932,6 +8932,231 @@ static void serve_loop(
 }
 
 // ============================================================================
+// --stdin mode: persistent process IPC
+// Loads the model once, then reads newline-delimited JSON requests from stdin:
+//   {"prompt":"<full qwen chat text>","max_tokens":<N>}
+// Generates tokens to stdout (one fflush per token), then writes a null byte
+// \x00 as end-of-response marker.  Loops until stdin closes (EOF).
+//
+// This eliminates model cold-start for the FastAPI wrapper: the wrapper keeps
+// one infer process alive and pipes requests through it.
+// ============================================================================
+
+// Simple JSON field extractors for stdin protocol
+static char *stdin_extract_prompt(const char *buf) {
+    const char *p = strstr(buf, "\"prompt\"");
+    if (!p) return NULL;
+    p += 8;
+    while (*p == ' ' || *p == ':') p++;
+    if (*p != '"') return NULL;
+    p++;  // skip opening quote
+    // Measure length (handle escapes)
+    int len = 0;
+    const char *q = p;
+    while (*q && !(*q == '"' && (q == p || *(q-1) != '\\'))) { len++; q++; }
+    char *out = malloc(len + 1);
+    if (!out) return NULL;
+    char *w = out;
+    while (p < q) {
+        if (*p == '\\' && *(p+1)) {
+            p++;
+            switch (*p) {
+                case 'n':  *w++ = '\n'; break;
+                case 't':  *w++ = '\t'; break;
+                case '"':  *w++ = '"';  break;
+                case '\\': *w++ = '\\'; break;
+                default:   *w++ = '\\'; *w++ = *p; break;
+            }
+            p++;
+        } else {
+            *w++ = *p++;
+        }
+    }
+    *w = '\0';
+    return out;
+}
+
+static int stdin_extract_max_tokens(const char *buf, int def) {
+    const char *p = strstr(buf, "\"max_tokens\"");
+    if (!p) return def;
+    p = strchr(p, ':');
+    if (!p) return def;
+    return atoi(p + 1);
+}
+
+static void stdin_loop(
+    WeightFile *wf, Vocabulary *vocab,
+    void **layer_states, KVCache **kv_caches,
+    void **layer_mmaps, int *layer_fds,
+    float *hidden, float *logits,
+    uint16_t *final_norm_w, int K)
+{
+    fprintf(stderr, "[stdin] Ready — waiting for JSON requests on stdin\n");
+    fflush(stderr);
+
+    // Pre-compute state-reset sizes (same as serve_loop)
+    size_t conv_state_size = (CONV_KERNEL_SIZE - 1) * LINEAR_CONV_DIM * sizeof(float);
+    size_t ssm_state_size  = LINEAR_NUM_V_HEADS * LINEAR_VALUE_DIM * LINEAR_KEY_DIM * sizeof(float);
+
+    // Line buffer for reading stdin (up to 512 KB per request)
+    static char line_buf[524288];
+
+    while (fgets(line_buf, sizeof(line_buf), stdin)) {
+        // Skip blank lines
+        char *p = line_buf;
+        while (*p == '\n' || *p == '\r' || *p == ' ') p++;
+        if (*p == '\0') continue;
+
+        char *prompt_text_req = stdin_extract_prompt(line_buf);
+        int   max_tokens_req  = stdin_extract_max_tokens(line_buf, 512);
+
+        if (!prompt_text_req || prompt_text_req[0] == '\0') {
+            fprintf(stderr, "[stdin] ERROR: missing or empty 'prompt' field\n");
+            free(prompt_text_req);
+            write(STDOUT_FILENO, "\x00", 1);
+            fflush(stdout);
+            continue;
+        }
+
+        fprintf(stderr, "[stdin] request: max_tokens=%d prompt_chars=%zu\n",
+                max_tokens_req, strlen(prompt_text_req));
+
+        // ---- Reset all state for a fresh generation ----
+        for (int i = 0; i < NUM_LAYERS; i++) {
+            if (kv_caches[i])   kv_caches[i]->len = 0;
+            if (layer_states[i]) {
+                LinearAttnState *s = (LinearAttnState *)layer_states[i];
+                memset(s->conv_state, 0, conv_state_size);
+                memset(s->ssm_state,  0, ssm_state_size);
+            }
+        }
+        reset_delta_net_state();
+        if (g_pred_enabled) { g_pred_valid = 0; g_pred_generating = 0; }
+
+        // ---- Encode prompt ----
+        PromptTokens *pt = encode_prompt_text_to_tokens(prompt_text_req);
+        free(prompt_text_req);
+        if (!pt) {
+            fprintf(stderr, "[stdin] ERROR: prompt encoding failed\n");
+            write(STDOUT_FILENO, "\x00", 1);
+            fflush(stdout);
+            continue;
+        }
+
+        // ---- Batch prefill ----
+        int pos = 0;
+        float *embed_batch = NULL;
+        if (pt->count > 1) {
+            embed_batch = malloc((size_t)pt->count * HIDDEN_DIM * sizeof(float));
+            for (int i = 0; i < pt->count; i++)
+                embed_lookup(wf, pt->ids[i], embed_batch + (size_t)i * HIDDEN_DIM);
+        }
+        // Intermediate prefill tokens
+        for (int i = 0; i < pt->count - 1; i++) {
+            if (embed_batch)
+                memcpy(hidden, embed_batch + (size_t)i * HIDDEN_DIM, HIDDEN_DIM * sizeof(float));
+            else
+                embed_lookup(wf, pt->ids[i], hidden);
+            for (int layer = 0; layer < NUM_LAYERS; layer++) {
+                int is_full = ((layer + 1) % FULL_ATTN_INTERVAL == 0);
+                fused_layer_forward(wf, layer, hidden,
+                    is_full ? kv_caches[layer] : NULL,
+                    is_full ? NULL : layer_states[layer],
+                    pos,
+                    layer_mmaps[layer] != MAP_FAILED ? layer_mmaps[layer] : NULL,
+                    K, layer_fds[layer]);
+            }
+            discard_deferred_experts();
+            pos++;
+        }
+        // Last prefill token
+        {
+            if (embed_batch)
+                memcpy(hidden, embed_batch + (size_t)(pt->count - 1) * HIDDEN_DIM, HIDDEN_DIM * sizeof(float));
+            else
+                embed_lookup(wf, pt->ids[0], hidden);
+            for (int layer = 0; layer < NUM_LAYERS; layer++) {
+                int is_full = ((layer + 1) % FULL_ATTN_INTERVAL == 0);
+                fused_layer_forward(wf, layer, hidden,
+                    is_full ? kv_caches[layer] : NULL,
+                    is_full ? NULL : layer_states[layer],
+                    pos,
+                    layer_mmaps[layer] != MAP_FAILED ? layer_mmaps[layer] : NULL,
+                    K, layer_fds[layer]);
+            }
+            complete_deferred_experts();
+            pos++;
+        }
+        if (embed_batch) { free(embed_batch); embed_batch = NULL; }
+        free(pt); pt = NULL;
+
+        // ---- First token (final norm + LM head) ----
+        if (final_norm_w) {
+            float *normed = malloc(HIDDEN_DIM * sizeof(float));
+            cpu_rms_norm(hidden, final_norm_w, normed, HIDDEN_DIM, RMS_NORM_EPS);
+            memcpy(hidden, normed, HIDDEN_DIM * sizeof(float));
+            free(normed);
+        }
+        lm_head_forward(wf, hidden, logits);
+        int next_token = cpu_argmax(logits, VOCAB_SIZE);
+
+        // Print first token
+        const char *tok_str = decode_token(vocab, next_token);
+        printf("%s", tok_str);
+        fflush(stdout);
+
+        int in_think    = (next_token == THINK_START_TOKEN) ? 1 : 0;
+        int think_tokens = 0;
+
+        if (g_pred_enabled) { g_pred_generating = 1; g_pred_valid = 0; }
+
+        // ---- Auto-regressive generation ----
+        for (int gen = 1; gen < max_tokens_req; gen++) {
+            // EOS check
+            if (next_token == EOS_TOKEN_1 || next_token == EOS_TOKEN_2) break;
+
+            if (next_token == THINK_START_TOKEN) in_think = 1;
+            if (next_token == THINK_END_TOKEN)   in_think = 0;
+            if (in_think) think_tokens++;
+            if (in_think && g_think_budget > 0 && think_tokens >= g_think_budget)
+                next_token = THINK_END_TOKEN;
+
+            embed_lookup(wf, next_token, hidden);
+            for (int layer = 0; layer < NUM_LAYERS; layer++) {
+                int is_full = ((layer + 1) % FULL_ATTN_INTERVAL == 0);
+                fused_layer_forward(wf, layer, hidden,
+                    is_full ? kv_caches[layer] : NULL,
+                    is_full ? NULL : layer_states[layer],
+                    pos,
+                    layer_mmaps[layer] != MAP_FAILED ? layer_mmaps[layer] : NULL,
+                    K, layer_fds[layer]);
+            }
+            complete_deferred_experts();
+            pos++;
+
+            if (final_norm_w) {
+                float *normed = malloc(HIDDEN_DIM * sizeof(float));
+                cpu_rms_norm(hidden, final_norm_w, normed, HIDDEN_DIM, RMS_NORM_EPS);
+                memcpy(hidden, normed, HIDDEN_DIM * sizeof(float));
+                free(normed);
+            }
+            lm_head_forward(wf, hidden, logits);
+            next_token = cpu_argmax(logits, VOCAB_SIZE);
+
+            printf("%s", decode_token(vocab, next_token));
+            fflush(stdout);
+        }
+
+        // ---- End-of-response marker ----
+        write(STDOUT_FILENO, "\x00", 1);
+        fflush(stdout);
+        fprintf(stderr, "[stdin] response done (pos=%d)\n", pos);
+    }
+
+    fprintf(stderr, "[stdin] stdin closed — exiting\n");
+}
+
+// ============================================================================
 
 static void print_usage(const char *prog) {
     printf("Usage: %s [options]\n", prog);
@@ -8971,6 +9196,7 @@ static void print_usage(const char *prog) {
     printf("  --nax                Enable NAX tensor matmul for LM head (M5+, slower for single-token)\n");
     printf("  --no-nax             Disable NAX (default)\n");
     printf("  --serve PORT         Run HTTP server (OpenAI-compatible API)\n");
+    printf("  --stdin              Persistent IPC: read JSON prompts from stdin, stream tokens to stdout\n");
     printf("  --help               This message\n");
 }
 
@@ -8996,6 +9222,7 @@ int main(int argc, char **argv) {
         int cache_entries = 0;  // default 0: trust OS page cache (38% faster than Metal LRU)
         int malloc_cache_entries = 0;  // 0 = disabled (override with --malloc-cache)
         int serve_port = 0;  // 0 = disabled, >0 = HTTP serve mode
+        int stdin_mode = 0;  // --stdin: persistent JSON-over-stdin IPC
 
         static struct option long_options[] = {
             {"model",         required_argument, 0, 'm'},
@@ -9035,12 +9262,13 @@ int main(int argc, char **argv) {
             {"stream",        no_argument,       0, 'O'},
             {"nax",           no_argument,       0, 'X'},
             {"no-nax",        no_argument,       0, 'x'},
+            {"stdin",         no_argument,       0, 'i'},
             {"help",          no_argument,       0, 'h'},
             {0, 0, 0, 0}
         };
 
         int c;
-        while ((c = getopt_long(argc, argv, "m:w:j:I:A:N:J:K:U:V:Y:v:p:P:t:k:C:M:R:B:LSTFEW:1234Gh", long_options, NULL)) != -1) {
+        while ((c = getopt_long(argc, argv, "m:w:j:I:A:N:J:K:U:V:Y:v:p:P:t:k:C:M:R:B:LSTFEW:1234Ghi", long_options, NULL)) != -1) {
             switch (c) {
                 case 'm': model_path = optarg; break;
                 case 'w': weights_path = optarg; break;
@@ -9085,6 +9313,7 @@ int main(int argc, char **argv) {
                 case 'O': g_stream_mode = 1; break;
                 case 'X': g_nax_disabled = 0; break;  // --nax: enable
                 case 'x': g_nax_disabled = 1; break;  // --no-nax: disable
+                case 'i': stdin_mode = 1; break;       // --stdin: persistent IPC mode
                 case 'h': print_usage(argv[0]); return 0;
                 default:  print_usage(argv[0]); return 1;
             }
@@ -9549,6 +9778,17 @@ int main(int argc, char **argv) {
                        (void **)layer_mmaps, layer_fds,
                        hidden, logits, final_norm_w, K);
             // serve_loop never returns, but cleanup just in case
+            free(hidden); free(logits);
+            return 0;
+        }
+
+        // ---- Stdin mode: persistent JSON-over-stdin IPC (never returns) ----
+        if (stdin_mode) {
+            reset_delta_net_state();
+            stdin_loop(wf, vocab,
+                       layer_states, kv_caches,
+                       (void **)layer_mmaps, layer_fds,
+                       hidden, logits, final_norm_w, K);
             free(hidden); free(logits);
             return 0;
         }
