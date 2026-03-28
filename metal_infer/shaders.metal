@@ -869,6 +869,108 @@ kernel void dequant_matvec_4bit_v3(
 
 
 // ============================================================================
+// Kernel 1e: Fused multi-projection v3 — Exp41
+// ============================================================================
+// Fuses N projections (N=2..4) from the same weight buffer into a single
+// dispatch, replacing N separate encoders with one.
+// Each TG handles ROWS_PER_TG=8 output rows from one projection. The tgid
+// determines which projection (via tg_base4) and which row tile within it.
+// This allows the GPU scheduler to interleave TGs from all projections in a
+// single wave pool instead of running them strictly sequentially.
+// Weight, scale, bias buffers are bound at byte offset 0; per-projection
+// element offsets are supplied as constants.
+//
+// Projection i occupies TGs [tg_base4[i] .. tg_base4[i+1]).
+// tg_base4[0]=0, tg_base4[1]=ceil(out_dim[0]/8), etc.
+// For unused slots (i >= num_projs), out_dim4[i] = 0 so those TGs return.
+
+kernel void dequant_matvec_4bit_v3_multi(
+    device const uint32_t* W_buf    [[buffer(0)]],  // wf_buf (uint32 view, offset 0)
+    device const uint16_t* S_buf    [[buffer(1)]],  // wf_buf (uint16 view, offset 0)
+    device const uint16_t* B_buf    [[buffer(2)]],  // wf_buf (uint16 view, offset 0)
+    device const float*    x        [[buffer(3)]],  // buf_input
+    device float*          out0     [[buffer(4)]],  // output for proj 0
+    device float*          out1     [[buffer(5)]],  // output for proj 1
+    device float*          out2     [[buffer(6)]],  // output for proj 2
+    device float*          out3     [[buffer(7)]],  // output for proj 3
+    constant uint4&        w_off4   [[buffer(8)]],  // per-proj W offset in uint32 elem from buf base
+    constant uint4&        s_off4   [[buffer(9)]],  // per-proj S offset in uint16 elem from buf base
+    constant uint4&        b_off4   [[buffer(10)]], // per-proj B offset in uint16 elem from buf base
+    constant uint4&        out_dim4 [[buffer(11)]], // out_dim per proj (0 = unused)
+    constant uint4&        tg_base4 [[buffer(12)]], // first TG index for each proj: [0, tgs0, tgs0+tgs1, ...]
+    constant uint&         in_dim   [[buffer(13)]],
+    constant uint&         group_size [[buffer(14)]],
+    uint tgid   [[threadgroup_position_in_grid]],
+    uint lid    [[thread_position_in_threadgroup]],
+    uint simd_lane  [[thread_index_in_simdgroup]],
+    uint simd_group [[simdgroup_index_in_threadgroup]]
+) {
+    // Determine which projection this TG belongs to.
+    // tg_base4 = [0, tgs0, tgs0+tgs1, tgs0+tgs1+tgs2]
+    uint proj = 0;
+    if      (tgid >= tg_base4[3]) proj = 3;
+    else if (tgid >= tg_base4[2]) proj = 2;
+    else if (tgid >= tg_base4[1]) proj = 1;
+
+    uint local_tg = tgid - tg_base4[proj];
+    uint row = local_tg * ROWS_PER_TG + simd_group;
+
+    // Note: unused proj slots have out_dim4[proj]=0; those TGs exit after barrier.
+
+    uint packed_cols = in_dim / 8;
+    uint num_groups  = in_dim / group_size;
+
+    // Load x into threadgroup shared memory. ALL threads participate before barrier.
+    threadgroup float x_shared[4096];
+    for (uint i = lid; i < in_dim; i += 256)
+        x_shared[i] = x[i];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (row >= out_dim4[proj]) return;
+
+    // Per-projection weight/scale/bias row pointers using element offsets.
+    device const uint32_t* w_row = W_buf + w_off4[proj] + row * packed_cols;
+    device const uint16_t* s_row = S_buf + s_off4[proj] + row * num_groups;
+    device const uint16_t* b_row = B_buf + b_off4[proj] + row * num_groups;
+
+    float acc = 0.0f;
+    for (uint col = simd_lane; col < packed_cols; col += 32) {
+        uint g = col / (group_size / 8);
+        float scale = bf16_to_f32(s_row[g]);
+        float bias  = bf16_to_f32(b_row[g]);
+        uint32_t packed = w_row[col];
+        uint x_base = col * 8;
+
+        float sx0 = scale * x_shared[x_base + 0];  float bx0 = bias * x_shared[x_base + 0];
+        float sx1 = scale * x_shared[x_base + 1];  float bx1 = bias * x_shared[x_base + 1];
+        float sx2 = scale * x_shared[x_base + 2];  float bx2 = bias * x_shared[x_base + 2];
+        float sx3 = scale * x_shared[x_base + 3];  float bx3 = bias * x_shared[x_base + 3];
+        float sx4 = scale * x_shared[x_base + 4];  float bx4 = bias * x_shared[x_base + 4];
+        float sx5 = scale * x_shared[x_base + 5];  float bx5 = bias * x_shared[x_base + 5];
+        float sx6 = scale * x_shared[x_base + 6];  float bx6 = bias * x_shared[x_base + 6];
+        float sx7 = scale * x_shared[x_base + 7];  float bx7 = bias * x_shared[x_base + 7];
+
+        acc += fma(float((packed >>  0) & 0xF), sx0, bx0);
+        acc += fma(float((packed >>  4) & 0xF), sx1, bx1);
+        acc += fma(float((packed >>  8) & 0xF), sx2, bx2);
+        acc += fma(float((packed >> 12) & 0xF), sx3, bx3);
+        acc += fma(float((packed >> 16) & 0xF), sx4, bx4);
+        acc += fma(float((packed >> 20) & 0xF), sx5, bx5);
+        acc += fma(float((packed >> 24) & 0xF), sx6, bx6);
+        acc += fma(float((packed >> 28) & 0xF), sx7, bx7);
+    }
+
+    float sum = simd_sum(acc);
+    if (simd_lane == 0) {
+        if      (proj == 0) out0[row] = sum;
+        else if (proj == 1) out1[row] = sum;
+        else if (proj == 2) out2[row] = sum;
+        else                out3[row] = sum;
+    }
+}
+
+
+// ============================================================================
 // Kernel 1f: 4-bit dequant matvec with LUT (eliminates uint→float conversions)
 // ============================================================================
 // Instead of converting each nibble to float (expensive conversion instruction),

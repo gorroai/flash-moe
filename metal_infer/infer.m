@@ -2031,6 +2031,7 @@ typedef struct {
     id<MTLCommandQueue>         queue;
     id<MTLLibrary>              library;
     id<MTLComputePipelineState> matvec_v3;
+    id<MTLComputePipelineState> matvec_v3_multi;  // Exp41: fused multi-projection
     id<MTLComputePipelineState> matvec_v5;  // LUT dequant variant
     id<MTLComputePipelineState> matvec_fast;  // for in_dim > 4096
     id<MTLComputePipelineState> matvec_2bit;     // 2-bit expert dequant kernel
@@ -2196,6 +2197,7 @@ static MetalCtx *metal_setup(void) {
     };
 
     ctx->matvec_v3     = makePipe(@"dequant_matvec_4bit_v3");
+    ctx->matvec_v3_multi = makePipe(@"dequant_matvec_4bit_v3_multi");
     ctx->matvec_v5     = makePipe(@"dequant_matvec_4bit_v5");  // LUT variant (no uint→float conversions)
     ctx->matvec_fast   = makePipe(@"dequant_matvec_4bit_fast");
     ctx->wht_scramble    = makePipe(@"qjl_wht_scramble");              // QJL Pass 1
@@ -2985,12 +2987,85 @@ static void gpu_batch_matvec(
 // command buffer and commits once, eliminating per-dispatch overhead.
 // ============================================================================
 
+// Exp41: Fused multi-projection encode
+// Must match ROWS_PER_TG in shaders.metal
+#define ROWS_PER_TG 8
+// Combines all N projections (N=2..4, all MLX4/WF, in_dim<=4096) into a single kernel
+// dispatch so the GPU scheduler can interleave TGs from different projections concurrently.
+// Returns 1 if the fused path was used, 0 if fallback to gpu_encode_batch_matvec is needed.
+static int gpu_encode_batch_matvec_fused(
+    MetalCtx *ctx,
+    id<MTLCommandBuffer> cmdbuf,
+    BatchMatvecSpec *specs, int num_specs
+) {
+    if (!ctx->matvec_v3_multi || !ctx->wf_buf || num_specs < 2 || num_specs > 4) return 0;
+    const char *wf_base = (const char *)[ctx->wf_buf contents];
+    for (int i = 0; i < num_specs; i++) {
+        if (specs[i].kind != MATVEC_KIND_MLX4) return 0;
+        if (specs[i].source != MATVEC_SOURCE_WF) return 0;
+        if (specs[i].in_dim > 4096) return 0;
+        if (!specs[i].W || !specs[i].scales || !specs[i].biases) return 0;
+    }
+
+    uint32_t w_off4[4] = {0,0,0,0}, s_off4[4] = {0,0,0,0}, b_off4[4] = {0,0,0,0};
+    uint32_t out_dim4[4] = {0,0,0,0};
+    uint32_t tg_base4[4] = {0,0,0,0};
+    uint32_t total_tgs = 0;
+    for (int i = 0; i < num_specs; i++) {
+        BatchMatvecSpec *s = &specs[i];
+        tg_base4[i] = total_tgs;
+        w_off4[i] = (uint32_t)(((const char *)s->W      - wf_base) / sizeof(uint32_t));
+        s_off4[i] = (uint32_t)(((const char *)s->scales - wf_base) / sizeof(uint16_t));
+        b_off4[i] = (uint32_t)(((const char *)s->biases - wf_base) / sizeof(uint16_t));
+        out_dim4[i] = s->out_dim;
+        total_tgs += (s->out_dim + ROWS_PER_TG - 1) / ROWS_PER_TG;
+    }
+    // Fill unused slots with total_tgs as sentinel so kernel proj determination is correct
+    for (int i = num_specs; i < 4; i++)
+        tg_base4[i] = total_tgs;
+
+    id<MTLBuffer> out_bufs[4] = {nil, nil, nil, nil};
+    for (int i = 0; i < num_specs; i++)
+        out_bufs[i] = ctx->batch_out[specs[i].batch_slot];
+    for (int i = num_specs; i < 4; i++)
+        out_bufs[i] = out_bufs[0];  // pad unused slots (writes guarded by out_dim4=0)
+
+    uint32_t in_dim = specs[0].in_dim;
+    uint32_t group_size = specs[0].group_size;
+
+    id<MTLComputeCommandEncoder> enc = [cmdbuf computeCommandEncoder];
+    [enc setComputePipelineState:ctx->matvec_v3_multi];
+    [enc setBuffer:ctx->wf_buf    offset:0 atIndex:0];  // W_buf (uint32 view)
+    [enc setBuffer:ctx->wf_buf    offset:0 atIndex:1];  // S_buf (uint16 view)
+    [enc setBuffer:ctx->wf_buf    offset:0 atIndex:2];  // B_buf (uint16 view)
+    [enc setBuffer:ctx->buf_input offset:0 atIndex:3];
+    [enc setBuffer:out_bufs[0]   offset:0 atIndex:4];
+    [enc setBuffer:out_bufs[1]   offset:0 atIndex:5];
+    [enc setBuffer:out_bufs[2]   offset:0 atIndex:6];
+    [enc setBuffer:out_bufs[3]   offset:0 atIndex:7];
+    [enc setBytes:w_off4    length:sizeof(w_off4)    atIndex:8];
+    [enc setBytes:s_off4    length:sizeof(s_off4)    atIndex:9];
+    [enc setBytes:b_off4    length:sizeof(b_off4)    atIndex:10];
+    [enc setBytes:out_dim4  length:sizeof(out_dim4)  atIndex:11];
+    [enc setBytes:tg_base4  length:sizeof(tg_base4)  atIndex:12];
+    [enc setBytes:&in_dim   length:sizeof(in_dim)    atIndex:13];
+    [enc setBytes:&group_size length:sizeof(group_size) atIndex:14];
+    [enc setThreadgroupMemoryLength:in_dim * sizeof(float) atIndex:0];
+    [enc dispatchThreadgroups:MTLSizeMake(total_tgs, 1, 1)
+        threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+    [enc endEncoding];
+    return 1;
+}
+
 // Encode N matmuls into cmdbuf. Input must already be in ctx->buf_input.
 static void gpu_encode_batch_matvec(
     MetalCtx *ctx,
     id<MTLCommandBuffer> cmdbuf,
     BatchMatvecSpec *specs, int num_specs
 ) {
+    // Exp41: try fused single-dispatch path first (all MLX4/WF, in_dim<=4096)
+    if (gpu_encode_batch_matvec_fused(ctx, cmdbuf, specs, num_specs)) return;
+
     for (int i = 0; i < num_specs; i++) {
         BatchMatvecSpec *s = &specs[i];
         id<MTLBuffer> o_buf = ctx->batch_out[s->batch_slot];
