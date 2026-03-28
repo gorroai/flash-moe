@@ -2032,6 +2032,7 @@ typedef struct {
     id<MTLLibrary>              library;
     id<MTLComputePipelineState> matvec_v3;
     id<MTLComputePipelineState> matvec_v3_multi;  // Exp41: fused multi-projection
+    id<MTLComputePipelineState> full_attn_qk;    // Exp42: full-attn QK deinterleave+norm+RoPE+KV-append
     id<MTLComputePipelineState> matvec_v5;  // LUT dequant variant
     id<MTLComputePipelineState> matvec_fast;  // for in_dim > 4096
     id<MTLComputePipelineState> matvec_2bit;     // 2-bit expert dequant kernel
@@ -2198,6 +2199,7 @@ static MetalCtx *metal_setup(void) {
 
     ctx->matvec_v3     = makePipe(@"dequant_matvec_4bit_v3");
     ctx->matvec_v3_multi = makePipe(@"dequant_matvec_4bit_v3_multi");
+    ctx->full_attn_qk    = makePipe(@"full_attn_qk_process");
     ctx->matvec_v5     = makePipe(@"dequant_matvec_4bit_v5");  // LUT variant (no uint→float conversions)
     ctx->matvec_fast   = makePipe(@"dequant_matvec_4bit_fast");
     ctx->wht_scramble    = makePipe(@"qjl_wht_scramble");              // QJL Pass 1
@@ -6064,13 +6066,16 @@ static void fused_layer_forward(
     double t_layer_start = 0, t0 = 0, t1 = 0;
     if (g_timing_enabled) { t_layer_start = now_ms(); }
     int pred_started = 0;  // set to 1 if we started prediction preads during CMD1_wait
-    id<MTLCommandBuffer> cmd2_pre = nil;  // Exp27: pre-encoded CMD2 (GDN fast path)
+    id<MTLCommandBuffer> cmd2_pre = nil;  // Exp27/Exp42: pre-encoded CMD2
     int pre_encoded_cmd2 = 0;
+    int pre_encoded_full_attn = 0;        // Exp42: full_attn_qk kernel was added to CMD1
 
     init_layer_scratch();
     if (!layer_cache_built) build_layer_cache(wf);
     LayerWeightCache *lc = &layer_cache[layer_idx];
     int is_full = (kv != NULL);
+    // fa_idx: index into buf_kv_k/v arrays (full-attn layer ordinal, -1 if GDN)
+    int fa_idx = is_full ? ((layer_idx + 1) / FULL_ATTN_INTERVAL - 1) : -1;
 
     // =====================================================================
     // PHASE 1: Deferred completion + CMD1 (attention projections)
@@ -6246,6 +6251,43 @@ static void fused_layer_forward(
             gpu_linear_attn = 1;
         }
 
+        // Exp42: full-attn QK processing encoder — deinterleave Q, RMSNorm, RoPE, KV-append.
+        // Runs sequentially after the Q/K/V projection encoders within CMD1 (Metal serial queue).
+        // Fills buf_attn_q/gate and buf_kv_k/v so CMD2 can be pre-encoded without CPU intervention.
+        // Only enabled when GPU attention is active (kv->len >= 32) and Q/K norm weights available.
+        if (is_full && g_metal->full_attn_qk && !attn_specs_have_q8 &&
+            fa_idx >= 0 && fa_idx < NUM_FULL_ATTN_LAYERS &&
+            lc->q_norm_w && lc->k_norm_w &&
+            g_metal->buf_attn_q && g_metal->buf_attn_gate &&
+            g_metal->buf_kv_k[fa_idx] && g_metal->buf_kv_v[fa_idx] &&
+            kv && kv->len >= 32 && kv->len < GPU_KV_SEQ) {
+
+            uint32_t cp = (uint32_t)kv->len;  // KV cache write position
+            uint32_t rp = (uint32_t)pos;       // RoPE position = kv->len in generation
+            uint32_t ss = (uint32_t)GPU_KV_SEQ;
+            NSUInteger q_norm_off = (NSUInteger)((const char *)lc->q_norm_w - (const char *)[g_metal->wf_buf contents]);
+            NSUInteger k_norm_off = (NSUInteger)((const char *)lc->k_norm_w - (const char *)[g_metal->wf_buf contents]);
+
+            id<MTLComputeCommandEncoder> enc = [cmd1 computeCommandEncoder];
+            [enc setComputePipelineState:g_metal->full_attn_qk];
+            [enc setBuffer:g_metal->batch_out[0]      offset:0          atIndex:0];
+            [enc setBuffer:g_metal->batch_out[1]      offset:0          atIndex:1];
+            [enc setBuffer:g_metal->batch_out[2]      offset:0          atIndex:2];
+            [enc setBuffer:g_metal->wf_buf            offset:q_norm_off atIndex:3];
+            [enc setBuffer:g_metal->wf_buf            offset:k_norm_off atIndex:4];
+            [enc setBuffer:g_metal->buf_attn_q        offset:0          atIndex:5];
+            [enc setBuffer:g_metal->buf_attn_gate     offset:0          atIndex:6];
+            [enc setBuffer:g_metal->buf_kv_k[fa_idx]  offset:0          atIndex:7];
+            [enc setBuffer:g_metal->buf_kv_v[fa_idx]  offset:0          atIndex:8];
+            [enc setBytes:&cp length:4 atIndex:9];
+            [enc setBytes:&rp length:4 atIndex:10];
+            [enc setBytes:&ss length:4 atIndex:11];
+            [enc dispatchThreadgroups:MTLSizeMake(NUM_ATTN_HEADS + NUM_KV_HEADS, 1, 1)
+                threadsPerThreadgroup:MTLSizeMake(HEAD_DIM, 1, 1)];
+            [enc endEncoding];
+            pre_encoded_full_attn = 1;
+        }
+
         [cmd1 commit];
 
         // Exp27: Pre-encode CMD2 for GDN linear-attn layers.
@@ -6347,6 +6389,178 @@ static void fused_layer_forward(
                     { lc->sg_w,   lc->sg_s,   lc->sg_b,   s_shared_gate, (uint32_t)SHARED_INTERMEDIATE,  HIDDEN_DIM, GROUP_SIZE, 1, MATVEC_KIND_MLX4, 0 },
                     { lc->su_w,   lc->su_s,   lc->su_b,   s_shared_up,   (uint32_t)SHARED_INTERMEDIATE,  HIDDEN_DIM, GROUP_SIZE, 2, MATVEC_KIND_MLX4, 0 },
                     { lc->seg_w,  lc->seg_s,  lc->seg_b,  s_gate_scores, 1,                             HIDDEN_DIM, GROUP_SIZE, 3, MATVEC_KIND_MLX4, 0 },
+                };
+                gpu_encode_batch_matvec(g_metal, cmd2_pre, moe_pre, 4);
+            }
+
+            [cmd2_pre commit];
+            pre_encoded_cmd2 = 1;
+        }
+
+        // Exp42: Pre-encode CMD2 for full-attention layers.
+        // full_attn_qk_process kernel (already in CMD1) fills buf_attn_q/gate/kv,
+        // so CMD2's GPU attention kernels can start without waiting for CPU Q/K processing.
+        // Same GPU serial queue guarantee: CMD1(N)[includes full_attn_qk] → CMD2(N).
+        // Uses buf_moe_hidden as residual (same as GDN path: residual = CMD3(N-1) output).
+        if (!pre_encoded_cmd2 && pre_encoded_full_attn &&
+            !full_attn_force_cmd2_fallback() &&
+            lc->o_w && lc->o_s && lc->o_b && lc->o_kind == MATVEC_KIND_MLX4 &&
+            lc->gate_w && lc->gate_s && lc->gate_b &&
+            lc->sg_w && lc->sg_s && lc->sg_b &&
+            lc->su_w && lc->su_s && lc->su_b &&
+            lc->seg_w && lc->seg_s && lc->seg_b &&
+            lc->post_attn_norm_w &&
+            g_metal->wf_buf && g_metal->matvec_fast &&
+            g_metal->residual_add && g_metal->rms_norm_sum &&
+            g_metal->rms_norm_apply_bf16 &&
+            g_metal->attn_scores_pipe && g_metal->attn_softmax_pipe &&
+            g_metal->attn_values_pipe && g_metal->sigmoid_gate_pipe) {
+
+            cmd2_pre = [g_metal->queue commandBuffer];
+
+            // sl = sequence length AFTER appending the current token's K/V
+            uint32_t sl = (uint32_t)(kv->len + 1);
+            uint32_t seq_stride = (uint32_t)GPU_KV_SEQ;
+            float    scale = 1.0f / sqrtf((float)HEAD_DIM);
+            uint32_t hd    = (uint32_t)HEAD_DIM;
+            uint32_t kvd   = (uint32_t)(NUM_KV_HEADS * HEAD_DIM);
+            uint32_t hpkv  = (uint32_t)(NUM_ATTN_HEADS / NUM_KV_HEADS);
+
+            // Enc A1: attn_scores_batched
+            {
+                id<MTLComputeCommandEncoder> enc = [cmd2_pre computeCommandEncoder];
+                [enc setComputePipelineState:g_metal->attn_scores_pipe];
+                [enc setBuffer:g_metal->buf_attn_q       offset:0 atIndex:0];
+                [enc setBuffer:g_metal->buf_kv_k[fa_idx] offset:0 atIndex:1];
+                [enc setBuffer:g_metal->buf_attn_scores  offset:0 atIndex:2];
+                [enc setBytes:&hd         length:4 atIndex:3];
+                [enc setBytes:&kvd        length:4 atIndex:4];
+                [enc setBytes:&sl         length:4 atIndex:5];
+                [enc setBytes:&seq_stride length:4 atIndex:6];
+                [enc setBytes:&scale      length:4 atIndex:7];
+                [enc setBytes:&hpkv       length:4 atIndex:8];
+                [enc setBytes:&sl         length:4 atIndex:9];
+                uint32_t total_tgs = sl * (uint32_t)NUM_ATTN_HEADS;
+                [enc dispatchThreadgroups:MTLSizeMake(total_tgs, 1, 1)
+                    threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+                [enc endEncoding];
+            }
+            // Enc A2: attn_softmax_batched
+            {
+                id<MTLComputeCommandEncoder> enc = [cmd2_pre computeCommandEncoder];
+                [enc setComputePipelineState:g_metal->attn_softmax_pipe];
+                [enc setBuffer:g_metal->buf_attn_scores offset:0 atIndex:0];
+                [enc setBytes:&sl          length:4 atIndex:1];
+                [enc setBytes:&seq_stride  length:4 atIndex:2];
+                [enc dispatchThreadgroups:MTLSizeMake(NUM_ATTN_HEADS, 1, 1)
+                    threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+                [enc endEncoding];
+            }
+            // Enc A3: attn_values_batched
+            {
+                id<MTLComputeCommandEncoder> enc = [cmd2_pre computeCommandEncoder];
+                [enc setComputePipelineState:g_metal->attn_values_pipe];
+                [enc setBuffer:g_metal->buf_attn_scores  offset:0 atIndex:0];
+                [enc setBuffer:g_metal->buf_kv_v[fa_idx] offset:0 atIndex:1];
+                [enc setBuffer:g_metal->buf_attn_out     offset:0 atIndex:2];
+                [enc setBytes:&hd         length:4 atIndex:3];
+                [enc setBytes:&kvd        length:4 atIndex:4];
+                [enc setBytes:&sl         length:4 atIndex:5];
+                [enc setBytes:&seq_stride length:4 atIndex:6];
+                [enc setBytes:&hpkv       length:4 atIndex:7];
+                uint32_t total_threads = (uint32_t)(HEAD_DIM * NUM_ATTN_HEADS);
+                uint32_t val_tgs = (total_threads + 255) / 256;
+                [enc dispatchThreadgroups:MTLSizeMake(val_tgs, 1, 1)
+                    threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+                [enc endEncoding];
+            }
+            // Enc A4: sigmoid_gate (buf_attn_out *= sigmoid(buf_attn_gate))
+            {
+                uint32_t qdim = (uint32_t)(NUM_ATTN_HEADS * HEAD_DIM);
+                uint32_t g_tgs = (qdim + 255) / 256;
+                id<MTLComputeCommandEncoder> enc = [cmd2_pre computeCommandEncoder];
+                [enc setComputePipelineState:g_metal->sigmoid_gate_pipe];
+                [enc setBuffer:g_metal->buf_attn_out  offset:0 atIndex:0];
+                [enc setBuffer:g_metal->buf_attn_gate offset:0 atIndex:1];
+                [enc setBytes:&qdim length:4 atIndex:2];
+                [enc dispatchThreadgroups:MTLSizeMake(g_tgs, 1, 1)
+                    threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+                [enc endEncoding];
+            }
+            // Enc 5: o_proj (buf_attn_out → buf_output); in_dim = NUM_ATTN_HEADS * HEAD_DIM
+            {
+                NSUInteger w_off = (NSUInteger)((const char *)lc->o_w - (const char *)[g_metal->wf_buf contents]);
+                NSUInteger s_off = (NSUInteger)((const char *)lc->o_s - (const char *)[g_metal->wf_buf contents]);
+                NSUInteger b_off = (NSUInteger)((const char *)lc->o_b - (const char *)[g_metal->wf_buf contents]);
+                uint32_t o_out = (uint32_t)HIDDEN_DIM;
+                uint32_t o_in  = (uint32_t)(NUM_ATTN_HEADS * HEAD_DIM);
+                uint32_t o_gs  = (uint32_t)GROUP_SIZE;
+                id<MTLComputeCommandEncoder> enc = [cmd2_pre computeCommandEncoder];
+                [enc setComputePipelineState:g_metal->matvec_fast];
+                [enc setBuffer:g_metal->wf_buf       offset:w_off atIndex:0];
+                [enc setBuffer:g_metal->wf_buf       offset:s_off atIndex:1];
+                [enc setBuffer:g_metal->wf_buf       offset:b_off atIndex:2];
+                [enc setBuffer:g_metal->buf_attn_out offset:0     atIndex:3];
+                [enc setBuffer:g_metal->buf_output   offset:0     atIndex:4];
+                [enc setBytes:&o_out length:4 atIndex:5];
+                [enc setBytes:&o_in  length:4 atIndex:6];
+                [enc setBytes:&o_gs  length:4 atIndex:7];
+                [enc dispatchThreadgroups:MTLSizeMake(o_out, 1, 1)
+                    threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+                [enc endEncoding];
+            }
+            // Enc 6: residual_add (buf_moe_hidden + buf_output → buf_h_mid)
+            // buf_moe_hidden holds CMD3(N-1) combine output = residual in fast path
+            {
+                uint32_t dim = (uint32_t)HIDDEN_DIM;
+                uint32_t tgs = (dim + 255) / 256;
+                id<MTLComputeCommandEncoder> enc = [cmd2_pre computeCommandEncoder];
+                [enc setComputePipelineState:g_metal->residual_add];
+                [enc setBuffer:g_metal->buf_moe_hidden offset:0 atIndex:0];
+                [enc setBuffer:g_metal->buf_output     offset:0 atIndex:1];
+                [enc setBuffer:g_metal->buf_h_mid      offset:0 atIndex:2];
+                [enc setBytes:&dim length:4 atIndex:3];
+                [enc dispatchThreadgroups:MTLSizeMake(tgs, 1, 1)
+                    threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+                [enc endEncoding];
+            }
+            // Enc 7: rms_norm_sum_sq
+            {
+                uint32_t dim = (uint32_t)HIDDEN_DIM;
+                id<MTLComputeCommandEncoder> enc = [cmd2_pre computeCommandEncoder];
+                [enc setComputePipelineState:g_metal->rms_norm_sum];
+                [enc setBuffer:g_metal->buf_h_mid  offset:0 atIndex:0];
+                [enc setBuffer:g_metal->buf_sum_sq offset:0 atIndex:1];
+                [enc setBytes:&dim length:4 atIndex:2];
+                [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1)
+                    threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+                [enc endEncoding];
+            }
+            // Enc 8: rms_norm_apply_bf16 (buf_h_mid → buf_input)
+            {
+                NSUInteger norm_off = (NSUInteger)((const char *)lc->post_attn_norm_w - (const char *)[g_metal->wf_buf contents]);
+                uint32_t dim = (uint32_t)HIDDEN_DIM;
+                float eps = RMS_NORM_EPS;
+                uint32_t tgs = (dim + 255) / 256;
+                id<MTLComputeCommandEncoder> enc = [cmd2_pre computeCommandEncoder];
+                [enc setComputePipelineState:g_metal->rms_norm_apply_bf16];
+                [enc setBuffer:g_metal->buf_h_mid  offset:0        atIndex:0];
+                [enc setBuffer:g_metal->wf_buf     offset:norm_off atIndex:1];
+                [enc setBuffer:g_metal->buf_sum_sq offset:0        atIndex:2];
+                [enc setBuffer:g_metal->buf_input  offset:0        atIndex:3];
+                [enc setBytes:&dim length:4 atIndex:4];
+                [enc setBytes:&eps length:4 atIndex:5];
+                [enc dispatchThreadgroups:MTLSizeMake(tgs, 1, 1)
+                    threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+                [enc endEncoding];
+            }
+            // Encs 9-12: routing gate + shared expert projections (reads buf_input)
+            {
+                BatchMatvecSpec moe_pre[4] = {
+                    { lc->gate_w, lc->gate_s, lc->gate_b, s_gate_scores, (uint32_t)NUM_EXPERTS,         HIDDEN_DIM, GROUP_SIZE, 0, MATVEC_KIND_MLX4, 0 },
+                    { lc->sg_w,   lc->sg_s,   lc->sg_b,   s_shared_gate, (uint32_t)SHARED_INTERMEDIATE,  HIDDEN_DIM, GROUP_SIZE, 1, MATVEC_KIND_MLX4, 0 },
+                    { lc->su_w,   lc->su_s,   lc->su_b,   s_shared_up,   (uint32_t)SHARED_INTERMEDIATE,  HIDDEN_DIM, GROUP_SIZE, 2, MATVEC_KIND_MLX4, 0 },
+                    { lc->seg_w,  lc->seg_s,  lc->seg_b,  s_gate_scores, 1,                              HIDDEN_DIM, GROUP_SIZE, 3, MATVEC_KIND_MLX4, 0 },
                 };
                 gpu_encode_batch_matvec(g_metal, cmd2_pre, moe_pre, 4);
             }
@@ -6692,8 +6906,9 @@ static void fused_layer_forward(
         memcpy(kv->k_cache + cache_pos * kv_dim, k_out, kv_dim * sizeof(float));
         memcpy(kv->v_cache + cache_pos * kv_dim, v_out, kv_dim * sizeof(float));
 
-        int fa_idx = (layer_idx + 1) / FULL_ATTN_INTERVAL - 1;
-        if (g_metal && g_metal->attn_scores_pipe && fa_idx >= 0 && fa_idx < NUM_FULL_ATTN_LAYERS) {
+        // GPU KV mirror: skip if Exp42 full_attn_qk kernel already wrote these
+        if (!pre_encoded_full_attn &&
+            g_metal && g_metal->attn_scores_pipe && fa_idx >= 0 && fa_idx < NUM_FULL_ATTN_LAYERS) {
             memcpy((float *)[g_metal->buf_kv_k[fa_idx] contents] + cache_pos * kv_dim,
                    k_out, kv_dim * sizeof(float));
             memcpy((float *)[g_metal->buf_kv_v[fa_idx] contents] + cache_pos * kv_dim,
@@ -6715,10 +6930,12 @@ static void fused_layer_forward(
                               kv->len >= 32 && kv->len < GPU_KV_SEQ);
 
         if (gpu_attn_ready) {
-            // Copy Q and gate to GPU; attention dispatches will be in CMD2
-            memcpy([g_metal->buf_attn_q contents], q, q_dim * sizeof(float));
-            memcpy([g_metal->buf_attn_gate contents], q_gate, q_dim * sizeof(float));
-            // attn_out_for_oproj will be set to NULL below — CMD2 reads buf_attn_out
+            // Copy Q and gate to GPU — skip if Exp42 kernel already filled these
+            if (!pre_encoded_full_attn) {
+                memcpy([g_metal->buf_attn_q    contents], q,      q_dim * sizeof(float));
+                memcpy([g_metal->buf_attn_gate contents], q_gate, q_dim * sizeof(float));
+            }
+            // attn_out_for_oproj = NULL signals CMD2 to use GPU buf_attn_out
         } else {
             // CPU fallback
             for (int h = 0; h < NUM_ATTN_HEADS; h++) {

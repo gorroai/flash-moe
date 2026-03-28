@@ -2009,3 +2009,95 @@ kernel void moe_combine_residual(
 
     hidden_out[tid] = h_mid[tid] + moe + shared_gate * shared_out[tid];
 }
+
+
+// ============================================================================
+// Kernel: full_attn_qk_process  (Exp42)
+// ============================================================================
+// Fuses Q/K deinterleave + per-head RMSNorm + partial RoPE + KV cache append
+// into a single CMD1 encoder for full-attention layers.
+// After this runs, buf_attn_q/gate and buf_kv_k/v are ready for a pre-encoded
+// CMD2 GPU attention dispatch — eliminating the ~30µs CPU submission gap.
+//
+// Dispatch: (NUM_ATTN_HEADS + NUM_KV_HEADS) = 34 TGs × HEAD_DIM = 256 threads
+//   TG 0..31  : Q heads — deinterleave, RMSNorm(q_norm_w), partial RoPE → buf_attn_q/gate
+//   TG 32..33 : K/V heads — K: RMSNorm(k_norm_w) + partial RoPE → buf_kv_k;
+//                            V: copy as-is → buf_kv_v
+//
+// RoPE convention (MLX non-traditional): pairs are (x[i], x[i + half])
+//   where half = ROTARY_DIM / 2 = 32; only first ROTARY_DIM=64 dims are rotated.
+// ============================================================================
+
+kernel void full_attn_qk_process(
+    device const float    *q_proj      [[buffer(0)]],   // batch_out[0]: [QHEADS*HDIM*2] interleaved q/q_gate
+    device const float    *k_proj      [[buffer(1)]],   // batch_out[1]: [KVHEADS*HDIM]
+    device const float    *v_proj      [[buffer(2)]],   // batch_out[2]: [KVHEADS*HDIM]
+    device const uint16_t *q_norm_w    [[buffer(3)]],   // [HDIM] bf16 per-dim norm weights for Q
+    device const uint16_t *k_norm_w    [[buffer(4)]],   // [HDIM] bf16 per-dim norm weights for K
+    device float          *buf_attn_q  [[buffer(5)]],   // [QHEADS*HDIM] float out: normed+RoPE'd Q
+    device float          *buf_attn_gate[[buffer(6)]],  // [QHEADS*HDIM] float out: Q gate (raw, no norm)
+    device float          *buf_kv_k    [[buffer(7)]],   // [seq_stride*kv_dim] append at cache_pos
+    device float          *buf_kv_v    [[buffer(8)]],   // [seq_stride*kv_dim] append at cache_pos
+    constant uint         &cache_pos   [[buffer(9)]],   // KV cache write position
+    constant uint         &rope_pos    [[buffer(10)]],  // RoPE position (= cache_pos in generation)
+    constant uint         &seq_stride  [[buffer(11)]],  // GPU_KV_SEQ (buf stride between positions)
+    uint tgid [[threadgroup_position_in_grid]],
+    uint lid  [[thread_position_in_threadgroup]]
+) {
+    // Architecture constants — must match #defines in infer.m
+    const uint QHEADS   = 32;          // NUM_ATTN_HEADS
+    const uint KVHEADS  = 2;           // NUM_KV_HEADS
+    const uint HDIM     = 256;         // HEAD_DIM
+    const uint ROT_HALF = 32;          // ROTARY_DIM / 2  (only first 64 dims rotated, in pairs of 32)
+    const float THETA   = 10000000.0f; // ROPE_THETA
+    const float ROT_DIM = 64.0f;       // ROTARY_DIM (float for freq computation)
+
+    threadgroup float vals[256];  // scratch: one element per thread (1 KB)
+    threadgroup float sum_sq;     // RMSNorm reduction result
+
+    bool is_q = (tgid < QHEADS);
+    uint kv_h = tgid - QHEADS;   // only valid when !is_q
+
+    // ---- Load head into threadgroup scratch ----
+    if (is_q) {
+        vals[lid] = q_proj[tgid * HDIM * 2 + lid];  // first HDIM of interleaved pair
+    } else {
+        vals[lid] = k_proj[kv_h * HDIM + lid];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // ---- RMSNorm (per-head, with learned weights) ----
+    if (lid == 0) {
+        float s = 0.0f;
+        for (uint i = 0; i < HDIM; i++) s += vals[i] * vals[i];
+        sum_sq = s;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float inv_rms = rsqrt(sum_sq / float(HDIM) + 1e-6f);
+    float w = bf16_to_f32(is_q ? q_norm_w[lid] : k_norm_w[lid]);
+    vals[lid] = vals[lid] * inv_rms * w;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // ---- Partial RoPE: rotate pairs (vals[i], vals[i+ROT_HALF]) for i < ROT_HALF ----
+    if (lid < ROT_HALF) {
+        float freq  = 1.0f / pow(THETA, float(2 * lid) / ROT_DIM);
+        float angle = float(rope_pos) * freq;
+        float cs = cos(angle), sn = sin(angle);
+        float v0 = vals[lid], v1 = vals[lid + ROT_HALF];
+        vals[lid]           = v0 * cs - v1 * sn;
+        vals[lid + ROT_HALF] = v0 * sn + v1 * cs;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // ---- Write outputs ----
+    if (is_q) {
+        buf_attn_q   [tgid * HDIM + lid] = vals[lid];
+        // Q gate: second HDIM of interleaved pair — no RMSNorm, no RoPE
+        buf_attn_gate[tgid * HDIM + lid] = q_proj[tgid * HDIM * 2 + HDIM + lid];
+    } else {
+        const uint kv_dim = KVHEADS * HDIM;
+        uint out_off = cache_pos * kv_dim + kv_h * HDIM;
+        buf_kv_k[out_off + lid] = vals[lid];                     // normed + RoPE'd K
+        buf_kv_v[out_off + lid] = v_proj[kv_h * HDIM + lid];    // V unchanged
+    }
+}
