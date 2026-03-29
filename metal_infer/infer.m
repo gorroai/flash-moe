@@ -1982,18 +1982,44 @@ static void apply_repetition_penalty(float *logits, int vocab_size,
                                      const Vocabulary *vocab)
 {
     if (penalty <= 1.0f || n_recent <= 0) return;
+    // Walk the unique word-initial tokens in the window.
+    // For each unique token, apply penalty^min(count, 2):
+    //   count=1 → penalty^1 = 1.3   (seen once — mild suppression)
+    //   count=2+ → penalty^2 = 1.69 (repeated — strong enough to break loops)
+    // Capping at 2 prevents the 1.3^5=3.71 compound that caused suffix hallucination
+    // on long lists while still breaking hard repetition loops.
     for (int i = 0; i < n_recent; i++) {
         int tok = recent_tokens[i];
         if (tok < 0 || tok >= vocab_size) continue;
-        // Skip BPE continuation pieces — only penalize word-initial tokens
-        // (those whose decoded form starts with a space).
+        // Skip BPE continuation pieces — only penalize word-initial tokens.
         if (tok < vocab->num_tokens && vocab->tokens[tok]) {
             if (vocab->tokens[tok][0] != ' ') continue;
         }
+        // Deduplicate first-occurrence check: skip if already processed
+        int already = 0;
+        for (int j = 0; j < i; j++) {
+            if (recent_tokens[j] == tok) { already = 1; break; }
+        }
+        if (already) continue;
+
+        // Count occurrences in window, capped at 3:
+        //   count=1 → 1.3   (seen once — mild suppression)
+        //   count=2 → 1.69  (repeated — stronger)
+        //   count=3+ → 2.20 (hard loop — break it)
+        int count = 0;
+        for (int j = i; j < n_recent; j++) {
+            if (recent_tokens[j] == tok) {
+                count++;
+                if (count >= 3) break;
+            }
+        }
+        float eff_penalty = penalty;
+        for (int p = 1; p < count; p++) eff_penalty *= penalty;
+
         if (logits[tok] > 0.0f)
-            logits[tok] /= penalty;
+            logits[tok] /= eff_penalty;
         else
-            logits[tok] *= penalty;
+            logits[tok] *= eff_penalty;
     }
 }
 
@@ -2008,6 +2034,63 @@ static int cpu_argmax(const float *x, int dim) {
         }
     }
     return best;
+}
+
+// Top-K temperature sampling.
+// Builds the top-K logit entries, applies temperature softmax, samples.
+// Falls back to greedy argmax when temp <= 0 or k <= 1.
+static int cpu_sample_topk(const float *logits, int vocab_size, float temp, int k) {
+    if (temp <= 0.0f || k <= 1) return cpu_argmax(logits, vocab_size);
+    if (k > vocab_size) k = vocab_size;
+
+    // Collect top-K indices via a running min-heap (simple array, k<=64)
+    int   top_ids [64];
+    float top_vals[64];
+    int   filled = 0;
+    int   min_pos = 0;   // position of current minimum in top_ids/top_vals
+
+    for (int i = 0; i < vocab_size; i++) {
+        float v = logits[i];
+        if (filled < k) {
+            top_ids [filled] = i;
+            top_vals[filled] = v;
+            filled++;
+            if (filled == k) {
+                // Find initial min
+                min_pos = 0;
+                for (int j = 1; j < k; j++)
+                    if (top_vals[j] < top_vals[min_pos]) min_pos = j;
+            }
+        } else if (v > top_vals[min_pos]) {
+            top_ids [min_pos] = i;
+            top_vals[min_pos] = v;
+            // Refresh min position
+            min_pos = 0;
+            for (int j = 1; j < k; j++)
+                if (top_vals[j] < top_vals[min_pos]) min_pos = j;
+        }
+    }
+
+    // Temperature softmax over top-K
+    float max_val = top_vals[0];
+    for (int j = 1; j < filled; j++)
+        if (top_vals[j] > max_val) max_val = top_vals[j];
+
+    float probs[64];
+    float sum = 0.0f;
+    for (int j = 0; j < filled; j++) {
+        probs[j] = expf((top_vals[j] - max_val) / temp);
+        sum += probs[j];
+    }
+
+    // Sample
+    float r = ((float)rand() / (float)RAND_MAX) * sum;
+    float cumsum = 0.0f;
+    for (int j = 0; j < filled; j++) {
+        cumsum += probs[j];
+        if (r <= cumsum) return top_ids[j];
+    }
+    return top_ids[filled - 1];
 }
 
 // SiLU activation
@@ -9119,9 +9202,14 @@ static void stdin_loop(
         if (embed_batch) { free(embed_batch); embed_batch = NULL; }
         free(pt); pt = NULL;
 
-        // ---- Repetition penalty state ----
-#define REP_WINDOW   128
+        // ---- Sampling config ----
+#define REP_WINDOW   32    // short window: targets immediate loops, not distant repetition
 #define REP_PENALTY  1.3f
+#define SAMPLE_TEMP  0.0f    // 0 = greedy argmax (temperature disabled)
+#define SAMPLE_TOPK  50      // top-K when temperature > 0
+        srand((unsigned int)time(NULL));
+
+        // ---- Repetition penalty state ----
         int recent_tokens[REP_WINDOW];
         int recent_head = 0;
         int recent_fill = 0;
@@ -9134,6 +9222,7 @@ static void stdin_loop(
             memcpy(hidden, normed, HIDDEN_DIM * sizeof(float));
             free(normed);
         }
+        lm_head_forward(wf, hidden, logits);
         apply_repetition_penalty(logits, VOCAB_SIZE, recent_tokens, recent_fill, REP_PENALTY, vocab);
         // Mask EOS tokens at position 0: a zero-length response is never valid.
         // Also mask token 0 ('!') which the model spuriously generates as a
@@ -9141,7 +9230,7 @@ static void stdin_loop(
         logits[0]          = -1e9f;
         logits[EOS_TOKEN_1] = -1e9f;
         logits[EOS_TOKEN_2] = -1e9f;
-        int next_token = cpu_argmax(logits, VOCAB_SIZE);
+        int next_token = cpu_sample_topk(logits, VOCAB_SIZE, SAMPLE_TEMP, SAMPLE_TOPK);
 
         // Track token in recent window
         recent_tokens[recent_head] = next_token;
@@ -9194,7 +9283,7 @@ static void stdin_loop(
             }
             lm_head_forward(wf, hidden, logits);
             apply_repetition_penalty(logits, VOCAB_SIZE, recent_tokens, recent_fill, REP_PENALTY, vocab);
-            next_token = cpu_argmax(logits, VOCAB_SIZE);
+            next_token = cpu_sample_topk(logits, VOCAB_SIZE, SAMPLE_TEMP, SAMPLE_TOPK);
 
             // Track token in recent window
             recent_tokens[recent_head] = next_token;
