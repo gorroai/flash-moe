@@ -1971,14 +1971,25 @@ static float cross_entropy_loss(const float *logits, int vocab_size, int target_
 // Repetition penalty — divide positive logits / multiply negative logits for
 // each token that appears in the recent_tokens window.  penalty > 1.0 discourages
 // repeating recently seen tokens (1.0 = no effect).
+//
+// Only word-initial tokens (decoded string starts with ' ') are penalized.
+// BPE continuation pieces (e.g. "ally", "ed", "ing", "tion") must flow freely
+// or multi-token words get truncated — e.g. " minim"+"ally" would lose "ally"
+// if it appeared anywhere in the recent window.
 static void apply_repetition_penalty(float *logits, int vocab_size,
                                      const int *recent_tokens, int n_recent,
-                                     float penalty)
+                                     float penalty,
+                                     const Vocabulary *vocab)
 {
     if (penalty <= 1.0f || n_recent <= 0) return;
     for (int i = 0; i < n_recent; i++) {
         int tok = recent_tokens[i];
         if (tok < 0 || tok >= vocab_size) continue;
+        // Skip BPE continuation pieces — only penalize word-initial tokens
+        // (those whose decoded form starts with a space).
+        if (tok < vocab->num_tokens && vocab->tokens[tok]) {
+            if (vocab->tokens[tok][0] != ' ') continue;
+        }
         if (logits[tok] > 0.0f)
             logits[tok] /= penalty;
         else
@@ -9123,7 +9134,7 @@ static void stdin_loop(
             memcpy(hidden, normed, HIDDEN_DIM * sizeof(float));
             free(normed);
         }
-        apply_repetition_penalty(logits, VOCAB_SIZE, recent_tokens, recent_fill, REP_PENALTY);
+        apply_repetition_penalty(logits, VOCAB_SIZE, recent_tokens, recent_fill, REP_PENALTY, vocab);
         int next_token = cpu_argmax(logits, VOCAB_SIZE);
 
         // Track token in recent window
@@ -9173,7 +9184,7 @@ static void stdin_loop(
                 free(normed);
             }
             lm_head_forward(wf, hidden, logits);
-            apply_repetition_penalty(logits, VOCAB_SIZE, recent_tokens, recent_fill, REP_PENALTY);
+            apply_repetition_penalty(logits, VOCAB_SIZE, recent_tokens, recent_fill, REP_PENALTY, vocab);
             next_token = cpu_argmax(logits, VOCAB_SIZE);
 
             // Track token in recent window
