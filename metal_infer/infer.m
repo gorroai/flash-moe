@@ -9101,12 +9101,13 @@ static void stdin_loop(
         int next_token = cpu_argmax(logits, VOCAB_SIZE);
 
         // Print first token
-        const char *tok_str = decode_token(vocab, next_token);
-        printf("%s", tok_str);
-        fflush(stdout);
-
         int in_think    = (next_token == THINK_START_TOKEN) ? 1 : 0;
         int think_tokens = 0;
+        const char *tok_str = decode_token(vocab, next_token);
+        if (!in_think) {
+            printf("%s", tok_str);
+            fflush(stdout);
+        }
 
         if (g_pred_enabled) { g_pred_generating = 1; g_pred_valid = 0; }
 
@@ -9143,8 +9144,10 @@ static void stdin_loop(
             lm_head_forward(wf, hidden, logits);
             next_token = cpu_argmax(logits, VOCAB_SIZE);
 
-            printf("%s", decode_token(vocab, next_token));
-            fflush(stdout);
+            if (!in_think) {
+                printf("%s", decode_token(vocab, next_token));
+                fflush(stdout);
+            }
         }
 
         // ---- End-of-response marker ----
