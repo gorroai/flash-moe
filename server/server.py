@@ -366,7 +366,7 @@ async def chat_completions(request: Request):
 
     messages   = body.get("messages") or []
     model      = body.get("model", MODEL_ID)
-    max_tokens = int(body.get("max_tokens") or body.get("max_completion_tokens") or 8192)
+    max_tokens = min(int(body.get("max_tokens") or body.get("max_completion_tokens") or 2048), 8192)
     do_stream  = body.get("stream", False)
 
     if not messages:

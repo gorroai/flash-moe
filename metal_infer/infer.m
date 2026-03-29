@@ -1968,6 +1968,24 @@ static float cross_entropy_loss(const float *logits, int vocab_size, int target_
     return -log_prob;  // NLL (positive)
 }
 
+// Repetition penalty — divide positive logits / multiply negative logits for
+// each token that appears in the recent_tokens window.  penalty > 1.0 discourages
+// repeating recently seen tokens (1.0 = no effect).
+static void apply_repetition_penalty(float *logits, int vocab_size,
+                                     const int *recent_tokens, int n_recent,
+                                     float penalty)
+{
+    if (penalty <= 1.0f || n_recent <= 0) return;
+    for (int i = 0; i < n_recent; i++) {
+        int tok = recent_tokens[i];
+        if (tok < 0 || tok >= vocab_size) continue;
+        if (logits[tok] > 0.0f)
+            logits[tok] /= penalty;
+        else
+            logits[tok] *= penalty;
+    }
+}
+
 // Argmax
 static int cpu_argmax(const float *x, int dim) {
     int best = 0;
@@ -9090,6 +9108,14 @@ static void stdin_loop(
         if (embed_batch) { free(embed_batch); embed_batch = NULL; }
         free(pt); pt = NULL;
 
+        // ---- Repetition penalty state ----
+#define REP_WINDOW   128
+#define REP_PENALTY  1.3f
+        int recent_tokens[REP_WINDOW];
+        int recent_head = 0;
+        int recent_fill = 0;
+        memset(recent_tokens, -1, sizeof(recent_tokens));
+
         // ---- First token (final norm + LM head) ----
         if (final_norm_w) {
             float *normed = malloc(HIDDEN_DIM * sizeof(float));
@@ -9097,8 +9123,13 @@ static void stdin_loop(
             memcpy(hidden, normed, HIDDEN_DIM * sizeof(float));
             free(normed);
         }
-        lm_head_forward(wf, hidden, logits);
+        apply_repetition_penalty(logits, VOCAB_SIZE, recent_tokens, recent_fill, REP_PENALTY);
         int next_token = cpu_argmax(logits, VOCAB_SIZE);
+
+        // Track token in recent window
+        recent_tokens[recent_head] = next_token;
+        recent_head = (recent_head + 1) % REP_WINDOW;
+        if (recent_fill < REP_WINDOW) recent_fill++;
 
         // Print first token
         int in_think    = (next_token == THINK_START_TOKEN) ? 1 : 0;
@@ -9142,7 +9173,13 @@ static void stdin_loop(
                 free(normed);
             }
             lm_head_forward(wf, hidden, logits);
+            apply_repetition_penalty(logits, VOCAB_SIZE, recent_tokens, recent_fill, REP_PENALTY);
             next_token = cpu_argmax(logits, VOCAB_SIZE);
+
+            // Track token in recent window
+            recent_tokens[recent_head] = next_token;
+            recent_head = (recent_head + 1) % REP_WINDOW;
+            if (recent_fill < REP_WINDOW) recent_fill++;
 
             if (!in_think) {
                 printf("%s", decode_token(vocab, next_token));
