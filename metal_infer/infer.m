@@ -310,7 +310,7 @@ static uint8_t g_qjl_d_shared[NUM_LAYERS][QJL_D_SHARED_BYTES];  // D diagonal fo
 static uint8_t g_qjl_d_down[NUM_LAYERS][QJL_D_DOWN_BYTES];      // D diagonal for down (in_dim=1024)
 static int g_cache_telemetry_enabled = 0;  // enabled by --cache-telemetry flag
 static int g_cache_io_split = 4;  // enabled by --cache-io-split N: split each routed expert pread into N page-aligned chunks
-static int g_think_budget = 2048; // max thinking tokens before force-emitting </think>
+static int g_think_budget = 512;  // max thinking tokens before force-emitting </think>
 static int g_stream_mode = 0;    // --stream: clean output only, no progress/stats
 static int g_nax_disabled = 1;   // NAX disabled by default (slower for M=1 decode); --nax to enable
 
@@ -9135,6 +9135,12 @@ static void stdin_loop(
             free(normed);
         }
         apply_repetition_penalty(logits, VOCAB_SIZE, recent_tokens, recent_fill, REP_PENALTY, vocab);
+        // Mask EOS tokens at position 0: a zero-length response is never valid.
+        // Also mask token 0 ('!') which the model spuriously generates as a
+        // preamble artifact after the empty <think></think> prefix.
+        logits[0]          = -1e9f;
+        logits[EOS_TOKEN_1] = -1e9f;
+        logits[EOS_TOKEN_2] = -1e9f;
         int next_token = cpu_argmax(logits, VOCAB_SIZE);
 
         // Track token in recent window
@@ -9161,8 +9167,11 @@ static void stdin_loop(
             if (next_token == THINK_START_TOKEN) in_think = 1;
             if (next_token == THINK_END_TOKEN)   in_think = 0;
             if (in_think) think_tokens++;
-            if (in_think && g_think_budget > 0 && think_tokens >= g_think_budget)
+            if (in_think && g_think_budget > 0 && think_tokens >= g_think_budget) {
                 next_token = THINK_END_TOKEN;
+                in_think = 0;  // must clear here: cpu_argmax below overwrites next_token
+                               // so the loop-top "if (THINK_END_TOKEN) in_think=0" never fires
+            }
 
             embed_lookup(wf, next_token, hidden);
             for (int layer = 0; layer < NUM_LAYERS; layer++) {

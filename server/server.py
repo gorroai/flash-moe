@@ -254,7 +254,7 @@ async def _stream_generation(
         first = True
         async for text in _read_tokens():
             if first:
-                # Strip leading newlines produced by the empty <think></think> block
+                # Strip leading newlines (post-think separator).
                 text = text.lstrip("\n")
                 first = False
                 if not text:
