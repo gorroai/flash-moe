@@ -1,0 +1,70 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1180" height="760" viewBox="0 0 1180 760" role="img" aria-labelledby="title desc">
+  <title id="title">GGUF QKV Bridge Checkpoint</title>
+  <desc id="desc">Checkpoint for the corrected GGUF Q8_0 linear-attention QKV overlay in Flash-MoE.</desc>
+  <defs>
+    <style>
+      .bg { fill: #f6f3ed; }
+      .panel { fill: #fffdf9; stroke: #d7cfc2; stroke-width: 2; }
+      .title { fill: #1f1f1f; font: 700 30px Helvetica, Arial, sans-serif; }
+      .subtitle { fill: #5b554d; font: 400 16px Helvetica, Arial, sans-serif; }
+      .section { fill: #2f2a24; font: 700 20px Helvetica, Arial, sans-serif; }
+      .tableh { fill: #4a433b; font: 700 13px Helvetica, Arial, sans-serif; }
+      .table { fill: #2f2a24; font: 400 13px Helvetica, Arial, sans-serif; }
+      .value { fill: #1f1f1f; font: 700 13px Helvetica, Arial, sans-serif; }
+      .small { fill: #6b645c; font: 400 13px Helvetica, Arial, sans-serif; }
+    </style>
+  </defs>
+
+  <rect class="bg" x="0" y="0" width="1180" height="760"/>
+  <text class="title" x="56" y="62">GGUF QKV Bridge Checkpoint</text>
+  <text class="subtitle" x="56" y="92">QKV is the first validated resident attention-family GGUF bridge. This snapshot reflects the post-fix GPU-backed local path.</text>
+
+  <rect class="panel" x="44" y="122" width="1092" height="594" rx="18"/>
+
+  <text class="section" x="72" y="162">Summary</text>
+  <text class="small" x="72" y="186">Date: 2026-03-20</text>
+  <text class="small" x="72" y="206">Status: linear-attention QKV is validated; the whole persistent attention family is not finished yet.</text>
+  <text class="small" x="72" y="226">Scope: persistent tensors only. Streamed experts and shared experts remain out of scope.</text>
+  <text class="small" x="72" y="246">Bridge: GGUF tiled V rows -> Flash-MoE grouped V rows, with GGUF Q8_0 blocks preserved exactly.</text>
+
+  <rect x="72" y="270" width="1036" height="36" fill="#efe7db" rx="8"/>
+  <text class="tableh" x="92" y="293">Configuration</text>
+  <text class="tableh" x="420" y="293">Short PPL</text>
+  <text class="tableh" x="530" y="293">Full PPL</text>
+  <text class="tableh" x="640" y="293">Decode tok/s</text>
+  <text class="tableh" x="790" y="293">Prefill tok/s</text>
+  <text class="tableh" x="934" y="293">Takeaway</text>
+
+  <rect x="72" y="316" width="1036" height="40" fill="#fffaf2"/>
+  <text class="table" x="92" y="341">4-bit baseline</text>
+  <text class="value" x="420" y="341">5.51</text>
+  <text class="value" x="530" y="341">3.64</text>
+  <text class="value" x="640" y="341">6.84</text>
+  <text class="value" x="790" y="341">2.29</text>
+  <text class="table" x="934" y="341">Exact local smoke CLI, no overlays</text>
+
+  <rect x="72" y="362" width="1036" height="52" fill="#f8efe1"/>
+  <text class="table" x="92" y="387">4-bit + GGUF Q8_0 QKV only</text>
+  <text class="value" x="420" y="387">5.33</text>
+  <text class="value" x="530" y="387">rerun pending</text>
+  <text class="value" x="640" y="387">8.39</text>
+  <text class="value" x="790" y="387">3.41</text>
+  <text class="table" x="934" y="387">Exact local smoke CLI after GPU-path fix</text>
+  <text class="small" x="92" y="407">Short-PPL throughput: 5.48 tok/s</text>
+
+  <rect x="72" y="420" width="1036" height="52" fill="#fffaf2"/>
+  <text class="table" x="92" y="445">4-bit + GGUF Q8_0 QKV, direct 64-token generation</text>
+  <text class="value" x="420" y="445">n/a</text>
+  <text class="value" x="530" y="445">n/a</text>
+  <text class="value" x="640" y="445">4.51</text>
+  <text class="value" x="790" y="445">1.85</text>
+  <text class="table" x="934" y="445">Direct prompt benchmark after the same fix</text>
+  <text class="small" x="92" y="465">Prompt: "Explain quantum computing in one concise paragraph."</text>
+
+  <text class="section" x="72" y="516">Status and Next Step</text>
+  <text class="small" x="72" y="540">Finished: `attn_qkv.weight` is now a valid resident GGUF Q8_0 overlay for Qwen3.5 linear attention.</text>
+  <text class="small" x="72" y="562">Important fix: the checked-in path was accidentally sending `Q8_0` batch specs through the CPU; that GPU path bug is now fixed.</text>
+  <text class="small" x="72" y="584">Not finished: the whole persistent attention family is still in progress, and the raw full-attention q/k/v/o sweep is not a kept result.</text>
+  <text class="small" x="72" y="606">Next resident-only target: `attn_output.weight`.</text>
+  <text class="small" x="72" y="646">Source logs: direct local `infer` runs plus `autoresearch/logs/smoke.log`, `autoresearch/logs/generation.log`, `autoresearch/logs/ppl.log`</text>
+</svg>

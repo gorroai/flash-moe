@@ -1,0 +1,142 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1320" height="940" viewBox="0 0 1320 940" role="img" aria-labelledby="title desc">
+  <title id="title">GGUF Streamed Q3 And Shared Expert Checkpoint</title>
+  <desc id="desc">Checkpoint for the routed streamed GGUF Q3 expert migration and the current shared-expert status. Routed experts are fully converted to exact GGUF bytes. Shared experts remain a separate mostly-Q8_0 family that is not scripted yet.</desc>
+  <defs>
+    <style>
+      .bg { fill: #f5f1e8; }
+      .panel { fill: #fffdf8; stroke: #d7cebe; stroke-width: 2; }
+      .title { fill: #1f1f1f; font: 700 30px Helvetica, Arial, sans-serif; }
+      .subtitle { fill: #5c554c; font: 400 16px Helvetica, Arial, sans-serif; }
+      .section { fill: #2d2924; font: 700 20px Helvetica, Arial, sans-serif; }
+      .tableh { fill: #4a433b; font: 700 13px Helvetica, Arial, sans-serif; }
+      .table { fill: #2f2a24; font: 400 13px Helvetica, Arial, sans-serif; }
+      .value { fill: #1f1f1f; font: 700 13px Helvetica, Arial, sans-serif; }
+      .label { fill: #2f2a24; font: 600 15px Helvetica, Arial, sans-serif; }
+      .small { fill: #6b645c; font: 400 13px Helvetica, Arial, sans-serif; }
+      .axis { stroke: #b8aea0; stroke-width: 1.4; }
+      .grid { stroke: #e3ddd4; stroke-width: 1; }
+      .good { fill: #dff2e7; }
+      .warn { fill: #fff4e7; }
+      .note { fill: #f1ebe0; }
+      .barA { fill: #cf6d31; }
+      .barB { fill: #2e8b71; }
+      .barC { fill: #1f6f5b; }
+    </style>
+  </defs>
+
+  <rect class="bg" x="0" y="0" width="1320" height="940"/>
+  <text class="title" x="56" y="62">GGUF Streamed Q3 And Shared Expert Checkpoint</text>
+  <text class="subtitle" x="56" y="92">2026-03-20. Routed streamed experts are now on exact GGUF bytes. Shared experts remain a separate mostly-`Q8_0` family with no converter script yet.</text>
+
+  <rect class="panel" x="44" y="122" width="1232" height="782" rx="18"/>
+
+  <text class="section" x="72" y="162">Summary</text>
+  <text class="small" x="72" y="186">Scope: streamed routed experts and the shared-expert planning state. Resident overlays are tracked in the resident checkpoint SVGs.</text>
+
+  <rect x="72" y="214" width="1176" height="36" fill="#efe7db" rx="8"/>
+  <text class="tableh" x="92" y="237">Configuration</text>
+  <text class="tableh" x="360" y="237">Full 2k PPL</text>
+  <text class="tableh" x="470" y="237">2k tok/s</text>
+  <text class="tableh" x="570" y="237">200 tok/s avg</text>
+  <text class="tableh" x="690" y="237">Expert I/O avg</text>
+  <text class="tableh" x="824" y="237">Status</text>
+  <text class="tableh" x="904" y="237">Notes</text>
+
+  <rect class="warn" x="72" y="258" width="1176" height="38"/>
+  <text class="table" x="92" y="283">4-bit baseline</text>
+  <text class="value" x="360" y="283">3.64</text>
+  <text class="value" x="470" y="283">8.58</text>
+  <text class="value" x="570" y="283">9.46</text>
+  <text class="value" x="690" y="283">50.6 ms</text>
+  <text class="value" x="824" y="283">Baseline</text>
+  <text class="table" x="904" y="283">Native MLX packed experts, clean serial timing reference</text>
+
+  <rect class="good" x="72" y="296" width="1176" height="38"/>
+  <text class="table" x="92" y="321">Q3-GGUF routed experts</text>
+  <text class="value" x="360" y="321">3.81</text>
+  <text class="value" x="470" y="321">10.11</text>
+  <text class="value" x="570" y="321">11.15</text>
+  <text class="value" x="690" y="321">37.15 ms</text>
+  <text class="value" x="824" y="321">Keep</text>
+  <text class="table" x="904" y="321">59 normal layers plus 1 outlier, exact GGUF bytes on disk</text>
+
+  <rect class="good" x="72" y="334" width="1176" height="38"/>
+  <text class="table" x="92" y="359">Q3-GGUF routed experts + GGUF LM head</text>
+  <text class="value" x="360" y="359">3.79</text>
+  <text class="value" x="470" y="359">10.14</text>
+  <text class="table" x="570" y="359">n/a</text>
+  <text class="table" x="690" y="359">n/a</text>
+  <text class="value" x="824" y="359">Keep</text>
+  <text class="table" x="904" y="359">Best measured full-PPL quality on the streamed-Q3 path so far</text>
+
+  <text class="section" x="72" y="418">Full 2k PPL</text>
+  <line class="axis" x1="250" y1="456" x2="690" y2="456"/>
+  <line class="grid" x1="250" y1="456" x2="250" y2="590"/>
+  <line class="grid" x1="360" y1="456" x2="360" y2="590"/>
+  <line class="grid" x1="470" y1="456" x2="470" y2="590"/>
+  <line class="grid" x1="580" y1="456" x2="580" y2="590"/>
+  <line class="grid" x1="690" y1="456" x2="690" y2="590"/>
+  <text class="small" x="246" y="610">0.0</text>
+  <text class="small" x="352" y="610">1.0</text>
+  <text class="small" x="462" y="610">2.0</text>
+  <text class="small" x="572" y="610">3.0</text>
+  <text class="small" x="682" y="610">4.0</text>
+
+  <text class="label" x="72" y="484">4-bit baseline</text>
+  <rect class="barA" x="250" y="468" width="400" height="20" rx="10"/>
+  <text class="value" x="660" y="484">3.64</text>
+
+  <text class="label" x="72" y="528">Q3-GGUF experts</text>
+  <rect class="barB" x="250" y="512" width="419" height="20" rx="10"/>
+  <text class="value" x="679" y="528">3.81</text>
+
+  <text class="label" x="72" y="572">Q3-GGUF + GGUF LM head</text>
+  <rect class="barC" x="250" y="556" width="417" height="20" rx="10"/>
+  <text class="value" x="677" y="572">3.79</text>
+
+  <text class="section" x="740" y="418">Full 2k Throughput</text>
+  <line class="axis" x1="910" y1="456" x2="1220" y2="456"/>
+  <line class="grid" x1="910" y1="456" x2="910" y2="590"/>
+  <line class="grid" x1="987" y1="456" x2="987" y2="590"/>
+  <line class="grid" x1="1064" y1="456" x2="1064" y2="590"/>
+  <line class="grid" x1="1141" y1="456" x2="1141" y2="590"/>
+  <line class="grid" x1="1218" y1="456" x2="1218" y2="590"/>
+  <text class="small" x="906" y="610">0</text>
+  <text class="small" x="980" y="610">3</text>
+  <text class="small" x="1057" y="610">6</text>
+  <text class="small" x="1134" y="610">9</text>
+  <text class="small" x="1208" y="610">12</text>
+
+  <text class="label" x="740" y="484">4-bit baseline</text>
+  <rect class="barA" x="910" y="468" width="222" height="20" rx="10"/>
+  <text class="value" x="1142" y="484">8.58</text>
+
+  <text class="label" x="740" y="528">Q3-GGUF experts</text>
+  <rect class="barB" x="910" y="512" width="261" height="20" rx="10"/>
+  <text class="value" x="1181" y="528">10.11</text>
+
+  <text class="label" x="740" y="572">Q3-GGUF + GGUF LM head</text>
+  <rect class="barC" x="910" y="556" width="262" height="20" rx="10"/>
+  <text class="value" x="1182" y="572">10.14</text>
+
+  <text class="section" x="72" y="664">Routed Expert Layout</text>
+  <rect class="note" x="72" y="690" width="560" height="176" rx="16"/>
+  <text class="small" x="96" y="722">Finished streamed layout in `packed_experts_Q3/`:</text>
+  <text class="small" x="96" y="750">1. Normal layers `0-26, 28-59`:</text>
+  <text class="small" x="116" y="774">`gate = IQ3_XXS`, `up = IQ3_XXS`, `down = IQ4_XS`</text>
+  <text class="small" x="96" y="802">2. Outlier layer `27`:</text>
+  <text class="small" x="116" y="826">`gate = IQ4_XS`, `up = IQ4_XS`, `down = Q5_K`</text>
+  <text class="small" x="96" y="854">All GGUF block sizes are preserved exactly. The temporary native 4-bit `down_proj` fallback is gone.</text>
+
+  <text class="section" x="660" y="664">Shared Experts</text>
+  <rect class="note" x="660" y="690" width="588" height="176" rx="16"/>
+  <text class="small" x="684" y="722">Current shared-expert family from the GGUF sweep:</text>
+  <text class="small" x="684" y="750">`ffn_gate_shexp.weight`: `Q8_0 x59`, `BF16 x1`</text>
+  <text class="small" x="684" y="778">`ffn_up_shexp.weight`: `Q8_0 x59`, `BF16 x1`</text>
+  <text class="small" x="684" y="806">`ffn_down_shexp.weight`: `Q8_0 x59`, `BF16 x1`</text>
+  <text class="small" x="684" y="834">Status: not scripted yet. Shared experts should be brought up as their own experiment family, separate from routed experts.</text>
+  <text class="small" x="684" y="862">Checkpoint: docs/gguf-q3-streamed-shared-checkpoint.svg</text>
+
+  <rect class="note" x="72" y="886" width="1176" height="18" rx="8"/>
+  <text class="small" x="92" y="900">Source metrics: docs/gguf-hybrid-bringup-log.md and docs/q3-vs-4bit-clean-timing-report.md. Full-PPL throughput uses `ppl_tokens_2k.bin`. Clean 200-token averages come from the serial timing rerun.</text>
+</svg>

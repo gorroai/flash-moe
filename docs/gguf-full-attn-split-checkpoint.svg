@@ -1,0 +1,118 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1180" height="760" viewBox="0 0 1180 760" role="img" aria-labelledby="title desc">
+  <title id="title">GGUF Full-Attention Kept Checkpoint</title>
+  <desc id="desc">Resident full-attention Q8_0 block checkpoint for Flash-MoE after the fused CMD2 repair. The q plus k plus v plus o block is now valid on smoke, short PPL, and full 2k-token PPL.</desc>
+  <defs>
+    <style>
+      .bg { fill: #f5f1e8; }
+      .panel { fill: #fffdf8; stroke: #d7cebe; stroke-width: 2; }
+      .title { fill: #1f1f1f; font: 700 30px Helvetica, Arial, sans-serif; }
+      .subtitle { fill: #5c554c; font: 400 16px Helvetica, Arial, sans-serif; }
+      .section { fill: #2d2924; font: 700 20px Helvetica, Arial, sans-serif; }
+      .tableh { fill: #4a433b; font: 700 13px Helvetica, Arial, sans-serif; }
+      .table { fill: #2f2a24; font: 400 13px Helvetica, Arial, sans-serif; }
+      .value { fill: #1f1f1f; font: 700 13px Helvetica, Arial, sans-serif; }
+      .small { fill: #6b645c; font: 400 13px Helvetica, Arial, sans-serif; }
+      .label { fill: #2f2a24; font: 600 15px Helvetica, Arial, sans-serif; }
+      .axis { stroke: #b8aea0; stroke-width: 1.5; }
+      .grid { stroke: #e3ddd4; stroke-width: 1; }
+      .good { fill: #e8f6ee; }
+      .warn { fill: #fff4e7; }
+      .bad { fill: #faece9; }
+    </style>
+  </defs>
+
+  <rect class="bg" x="0" y="0" width="1180" height="760"/>
+  <text class="title" x="56" y="62">GGUF Full-Attention Kept Checkpoint</text>
+  <text class="subtitle" x="56" y="92">2026-03-20. Resident Q8_0 full-attention block repaired in Flash-MoE: smoke sane, short PPL 5.28, full 2k-token PPL 3.48.</text>
+
+  <rect class="panel" x="44" y="122" width="1092" height="594" rx="18"/>
+
+  <text class="section" x="72" y="162">Summary</text>
+  <text class="small" x="72" y="186">Scope: resident full-attention tensors only. Shared experts and streamed experts remain out of scope.</text>
+  <text class="small" x="72" y="206">Kept path: CPU attention plus fused CMD2 with GGUF Q8_0 o_proj. The GPU-attention fast path for GGUF o_proj remains disabled.</text>
+
+  <rect x="72" y="236" width="1036" height="36" fill="#efe7db" rx="8"/>
+  <text class="tableh" x="92" y="259">Configuration</text>
+  <text class="tableh" x="310" y="259">Smoke</text>
+  <text class="tableh" x="410" y="259">Decode tok/s</text>
+  <text class="tableh" x="536" y="259">Prefill tok/s</text>
+  <text class="tableh" x="662" y="259">Short PPL</text>
+  <text class="tableh" x="770" y="259">2k PPL</text>
+  <text class="tableh" x="870" y="259">Status</text>
+  <text class="tableh" x="964" y="259">Notes</text>
+
+  <rect class="good" x="72" y="280" width="1036" height="38"/>
+  <text class="table" x="92" y="305">Full-attn q+k+v+o</text>
+  <text class="value" x="310" y="305">Sane</text>
+  <text class="value" x="410" y="305">6.04</text>
+  <text class="value" x="536" y="305">1.53</text>
+  <text class="value" x="662" y="305">5.28</text>
+  <text class="value" x="770" y="305">3.48</text>
+  <text class="value" x="870" y="305">Keep</text>
+  <text class="table" x="964" y="305">Repaired fused CMD2 path</text>
+
+  <rect class="good" x="72" y="318" width="1036" height="38"/>
+  <text class="table" x="92" y="343">Full-attn q+k+v only</text>
+  <text class="value" x="310" y="343">Sane</text>
+  <text class="value" x="410" y="343">6.05</text>
+  <text class="value" x="536" y="343">2.37</text>
+  <text class="value" x="662" y="343">5.29</text>
+  <text class="table" x="770" y="343">n/a</text>
+  <text class="value" x="870" y="343">Keep</text>
+  <text class="table" x="964" y="343">Earlier correctness checkpoint</text>
+
+  <rect class="bad" x="72" y="356" width="1036" height="38"/>
+  <text class="table" x="92" y="381">Full-attn o only</text>
+  <text class="value" x="310" y="381">Broken</text>
+  <text class="value" x="410" y="381">8.86</text>
+  <text class="value" x="536" y="381">3.54</text>
+  <text class="table" x="662" y="381">17990.40</text>
+  <text class="table" x="770" y="381">n/a</text>
+  <text class="value" x="870" y="381">Discard</text>
+  <text class="table" x="964" y="381">Useful only for debugging history</text>
+
+  <rect class="warn" x="72" y="394" width="1036" height="38"/>
+  <text class="table" x="92" y="419">4-bit baseline</text>
+  <text class="value" x="310" y="419">Reference</text>
+  <text class="table" x="410" y="419">n/a</text>
+  <text class="table" x="536" y="419">n/a</text>
+  <text class="value" x="662" y="419">5.51</text>
+  <text class="value" x="770" y="419">3.64</text>
+  <text class="value" x="870" y="419">Baseline</text>
+  <text class="table" x="964" y="419">Recorded prior checkpoint</text>
+
+  <text class="section" x="72" y="486">Quality</text>
+  <line class="axis" x1="230" y1="524" x2="640" y2="524"/>
+  <line class="grid" x1="230" y1="524" x2="230" y2="648"/>
+  <line class="grid" x1="312" y1="524" x2="312" y2="648"/>
+  <line class="grid" x1="394" y1="524" x2="394" y2="648"/>
+  <line class="grid" x1="476" y1="524" x2="476" y2="648"/>
+  <line class="grid" x1="558" y1="524" x2="558" y2="648"/>
+  <line class="grid" x1="640" y1="524" x2="640" y2="648"/>
+  <text class="small" x="226" y="668">0</text>
+  <text class="small" x="304" y="668">1.5</text>
+  <text class="small" x="386" y="668">3.0</text>
+  <text class="small" x="468" y="668">4.5</text>
+  <text class="small" x="550" y="668">6.0</text>
+  <text class="small" x="632" y="668">7.5</text>
+
+  <text class="label" x="72" y="550">4-bit baseline short PPL</text>
+  <rect x="230" y="534" width="301" height="20" fill="#cf6d31" rx="10"/>
+  <text class="value" x="541" y="550">5.51</text>
+
+  <text class="label" x="72" y="590">Full-attn q+k+v+o short PPL</text>
+  <rect x="230" y="574" width="289" height="20" fill="#1f8d70" rx="10"/>
+  <text class="value" x="529" y="590">5.28</text>
+
+  <text class="label" x="72" y="630">Full-attn q+k+v+o 2k PPL</text>
+  <rect x="230" y="614" width="190" height="20" fill="#1a6d57" rx="10"/>
+  <text class="value" x="430" y="630">3.48</text>
+
+  <text class="section" x="720" y="486">Takeaways</text>
+  <text class="small" x="720" y="522">1. The kept fix was runtime-side, not a missing Qwen3.5 GGUF tensor reorder.</text>
+  <text class="small" x="720" y="548">2. GGUF Q8_0 o_proj now works inside fused CMD2.</text>
+  <text class="small" x="720" y="574">3. Long-context quality holds once the GGUF path avoids the unvalidated GPU-attention branch.</text>
+  <text class="small" x="720" y="600">4. Speed is lower than the native 4-bit path, so the next job is optimization, not correctness.</text>
+  <text class="small" x="720" y="640">Checkpoint: docs/gguf-full-attn-split-checkpoint.svg</text>
+  <text class="small" x="720" y="666">Notebook: docs/gguf-hybrid-bringup-log.md</text>
+</svg>

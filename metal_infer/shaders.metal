@@ -6,9 +6,6 @@
  *   2. dequant_matvec_4bit_fast: SIMD-optimized with simd_sum reduction
  *   3. dequant_matvec_4bit_v3: Fully optimized — tiled threadgroup, vector loads,
  *      coalesced access, shared input cache. Target: <0.1ms per matmul.
- *   3b. dequant_matvec_8bit: Optional affine 8-bit override kernel for routed down_proj sidecars
- *   3c. dequant_matvec_q8_0: Dense/shared int8 + fp16-scale matvec (block_size=32)
- *   3d. matvec_f32: Dense/shared fp32 matvec for preserved gate/router weights
  *   4. swiglu_fused / swiglu_fused_vec4: SwiGLU activation
  *   5. weighted_sum: combine expert outputs with routing weights
  *   6. rms_norm: RMS normalization
@@ -30,6 +27,7 @@
 
 #include <metal_stdlib>
 using namespace metal;
+#include "gguf_iq_shared.h"
 
 // ============================================================================
 // BFloat16 helpers
@@ -41,6 +39,316 @@ inline float bf16_to_f32(uint16_t bf16) {
 
 inline uint16_t f32_to_bf16(float f) {
     return uint16_t(as_type<uint>(f) >> 16);
+}
+
+inline float f16_to_f32(ushort fp16_bits) {
+    return float(as_type<half>(fp16_bits));
+}
+
+#define GGUF_QK8_0 32
+#define GGUF_QK_K FLASH_MOE_GGUF_QK_K
+#define GGUF_Q8_MAX_IN_DIM 8192
+
+struct GGUFBlockQ8_0 {
+    ushort d;
+    char   qs[GGUF_QK8_0];
+};
+
+struct GGUFBlockQ6K {
+    uchar ql[GGUF_QK_K/2];
+    uchar qh[GGUF_QK_K/4];
+    char  scales[GGUF_QK_K/16];
+    ushort d;
+};
+
+static inline uchar2 flash_moe_get_scale_min_k4(uint j, device const uchar *q) {
+    return j < 4 ? uchar2{uchar(q[j] & 63), uchar(q[j + 4] & 63)}
+                 : uchar2{uchar((q[j + 4] & 0xF) | ((q[j - 4] >> 6) << 4)),
+                          uchar((q[j + 4] >> 4) | ((q[j - 0] >> 6) << 4))};
+}
+
+kernel void dequant_matvec_iq3_xxs(
+    device const GGUFBlockIQ3XXS* W [[buffer(0)]],
+    device const uint16_t*        unused_scales [[buffer(1)]],
+    device const uint16_t*        unused_biases [[buffer(2)]],
+    device const float*           x [[buffer(3)]],
+    device float*                 out [[buffer(4)]],
+    constant uint&                out_dim [[buffer(5)]],
+    constant uint&                in_dim [[buffer(6)]],
+    constant uint&                unused_group_size [[buffer(7)]],
+    threadgroup char*             shmem [[threadgroup(0)]],
+    uint                          tgid [[threadgroup_position_in_grid]],
+    ushort                        tiisg [[thread_index_in_simdgroup]],
+    ushort                        sgitg [[simdgroup_index_in_threadgroup]]
+) {
+    (void)unused_scales;
+    (void)unused_biases;
+    (void)unused_group_size;
+
+    constexpr ushort NR0 = 4;
+    constexpr ushort NSG = 2;
+
+    const uint first_row = (tgid * NSG + sgitg) * NR0;
+    if (first_row >= out_dim) return;
+
+    const uint blocks_per_row = in_dim / GGUF_QK_K;
+    const uint nb32_total = blocks_per_row * (GGUF_QK_K / 32);
+    device const GGUFBlockIQ3XXS* row_blocks = W + first_row * blocks_per_row;
+
+    threadgroup uint*  svalues = reinterpret_cast<threadgroup uint*>(shmem);
+    threadgroup uchar* ssigns  = reinterpret_cast<threadgroup uchar*>(svalues + 256);
+
+    const uint grid_pos = (32u * sgitg + tiisg) * 4u;
+    for (uint i = 0; i < 4; ++i) {
+        svalues[grid_pos + i] = flash_moe_iq3xxs_grid[grid_pos + i];
+    }
+    const uint sign_pos = (32u * sgitg + tiisg) * 2u;
+    for (uint i = 0; i < 2; ++i) {
+        ssigns[sign_pos + i] = flash_moe_ksigns_iq2xs[sign_pos + i];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float yl[32];
+    float sumf[NR0] = {0.0f, 0.0f, 0.0f, 0.0f};
+
+    device const float* x_block = x + 32 * tiisg;
+
+    for (uint ib32 = tiisg; ib32 < nb32_total; ib32 += 32) {
+        for (uint i = 0; i < 32; ++i) {
+            yl[i] = x_block[i];
+        }
+
+        const uint bi = ib32 / (GGUF_QK_K / 32);
+        const uint sub = ib32 % (GGUF_QK_K / 32);
+
+        device const GGUFBlockIQ3XXS* xr = row_blocks + bi;
+        for (ushort row = 0; row < NR0 && first_row + row < out_dim; ++row) {
+            device const GGUFBlockIQ3XXS& blk = xr[row * blocks_per_row];
+            device const uchar* q3 = blk.qs + 8 * sub;
+            device const ushort* gas = reinterpret_cast<device const ushort*>(blk.qs + GGUF_QK_K / 4) + 2 * sub;
+            const uint aux32 = uint(gas[0]) | (uint(gas[1]) << 16);
+            const float d = f16_to_f32(blk.d) * (0.5f + float(aux32 >> 28));
+
+            float2 sum = float2(0.0f);
+            for (uint l = 0; l < 4; ++l) {
+                const threadgroup uchar* grid1 = reinterpret_cast<threadgroup uchar*>(svalues + q3[2 * l + 0]);
+                const threadgroup uchar* grid2 = reinterpret_cast<threadgroup uchar*>(svalues + q3[2 * l + 1]);
+                const uchar signs = ssigns[(aux32 >> (7 * l)) & 127];
+
+                for (uint j = 0; j < 4; ++j) {
+                    sum[0] += yl[8 * l + j + 0] * float(grid1[j]) * ((signs & flash_moe_kmask_iq2xs[j + 0]) ? -1.0f : 1.0f);
+                    sum[1] += yl[8 * l + j + 4] * float(grid2[j]) * ((signs & flash_moe_kmask_iq2xs[j + 4]) ? -1.0f : 1.0f);
+                }
+            }
+            sumf[row] += d * (sum[0] + sum[1]);
+        }
+
+        x_block += 32 * 32;
+    }
+
+    for (ushort row = 0; row < NR0 && first_row + row < out_dim; ++row) {
+        const float sum = simd_sum(sumf[row]);
+        if (tiisg == 0) {
+            out[first_row + row] = sum * 0.5f;
+        }
+    }
+}
+
+kernel void dequant_matvec_iq4_xs(
+    device const GGUFBlockIQ4XS* W [[buffer(0)]],
+    device const uint16_t*       unused_scales [[buffer(1)]],
+    device const uint16_t*       unused_biases [[buffer(2)]],
+    device const float*          x [[buffer(3)]],
+    device float*                out [[buffer(4)]],
+    constant uint&               out_dim [[buffer(5)]],
+    constant uint&               in_dim [[buffer(6)]],
+    constant uint&               unused_group_size [[buffer(7)]],
+    threadgroup char*            shmem [[threadgroup(0)]],
+    uint                         tgid [[threadgroup_position_in_grid]],
+    ushort                       tiisg [[thread_index_in_simdgroup]],
+    ushort                       sgitg [[simdgroup_index_in_threadgroup]]
+) {
+    (void)unused_scales;
+    (void)unused_biases;
+    (void)unused_group_size;
+
+    constexpr ushort NR0 = 2;
+    constexpr ushort NSG = 2;
+
+    const uint first_row = (tgid * NSG + sgitg) * NR0;
+    if (first_row >= out_dim) return;
+
+    threadgroup float * shmem_f32 = reinterpret_cast<threadgroup float *>(shmem);
+    const uint blocks_per_row = in_dim / GGUF_QK_K;
+
+    const ushort ix = tiisg / 16;  // 0 or 1
+    const ushort it = tiisg % 16;  // 0..15
+    const ushort ib = it / 2;
+    const ushort il = it % 2;
+
+    shmem_f32[tiisg] = flash_moe_kvalues_iq4nl_f[tiisg % 16];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float4 yl[4];
+    float sumf[NR0] = {0.0f, 0.0f};
+    device const float * yb = x + ix * GGUF_QK_K + ib * 32 + il * 8;
+
+    uint2 aux32;
+    thread const uchar * q8 = reinterpret_cast<thread const uchar *>(&aux32);
+
+    for (uint bi = ix; bi < blocks_per_row; bi += 2) {
+        device const float4 * y4 = reinterpret_cast<device const float4 *>(yb);
+        yl[0] = y4[0];
+        yl[1] = y4[4];
+        yl[2] = y4[1];
+        yl[3] = y4[5];
+
+        for (ushort row = 0; row < NR0 && first_row + row < out_dim; ++row) {
+            device const GGUFBlockIQ4XS & blk = W[(first_row + row) * blocks_per_row + bi];
+            device const uint * q4 = reinterpret_cast<device const uint *>(blk.qs + 16 * ib + 8 * il);
+
+            float4 acc1 = float4(0.0f);
+            float4 acc2 = float4(0.0f);
+
+            aux32[0] = q4[0] & 0x0f0f0f0f;
+            aux32[1] = (q4[0] >> 4) & 0x0f0f0f0f;
+            float4 qf1 = float4(shmem_f32[q8[0]], shmem_f32[q8[1]], shmem_f32[q8[2]], shmem_f32[q8[3]]);
+            float4 qf2 = float4(shmem_f32[q8[4]], shmem_f32[q8[5]], shmem_f32[q8[6]], shmem_f32[q8[7]]);
+            acc1 += yl[0] * qf1;
+            acc2 += yl[1] * qf2;
+
+            aux32[0] = q4[1] & 0x0f0f0f0f;
+            aux32[1] = (q4[1] >> 4) & 0x0f0f0f0f;
+            qf1 = float4(shmem_f32[q8[0]], shmem_f32[q8[1]], shmem_f32[q8[2]], shmem_f32[q8[3]]);
+            qf2 = float4(shmem_f32[q8[4]], shmem_f32[q8[5]], shmem_f32[q8[6]], shmem_f32[q8[7]]);
+            acc1 += yl[2] * qf1;
+            acc2 += yl[3] * qf2;
+
+            acc1 += acc2;
+
+            const int ls = int((blk.scales_l[ib / 2] >> (4 * (ib % 2))) & 0xF) |
+                           (int((blk.scales_h >> (2 * ib)) & 0x3) << 4);
+            sumf[row] += f16_to_f32(blk.d) * float(ls - 32) *
+                         (acc1[0] + acc1[1] + acc1[2] + acc1[3]);
+        }
+
+        yb += 2 * GGUF_QK_K;
+    }
+
+    for (ushort row = 0; row < NR0 && first_row + row < out_dim; ++row) {
+        const float sum = simd_sum(sumf[row]);
+        if (tiisg == 0) {
+            out[first_row + row] = sum;
+        }
+    }
+}
+
+static inline uchar2 flash_moe_get_scale_min_k4_just2(uint j, device const uchar *q) {
+    if (j < 4) {
+        return uchar2{uchar(q[j + 0] & 63), uchar(q[j + 4] & 63)};
+    }
+    return uchar2{
+        uchar((q[j + 4] & 0xF) | ((q[j - 4] & 0xC0) >> 2)),
+        uchar((q[j + 4] >> 4) | ((q[j - 0] & 0xC0) >> 2))
+    };
+}
+
+kernel void dequant_matvec_q5_k(
+    device const GGUFBlockQ5K* W [[buffer(0)]],
+    device const uint16_t*     unused_scales [[buffer(1)]],
+    device const uint16_t*     unused_biases [[buffer(2)]],
+    device const float*        x [[buffer(3)]],
+    device float*              out [[buffer(4)]],
+    constant uint&             out_dim [[buffer(5)]],
+    constant uint&             in_dim [[buffer(6)]],
+    constant uint&             unused_group_size [[buffer(7)]],
+    uint                       tgid [[threadgroup_position_in_grid]],
+    ushort                     tiisg [[thread_index_in_simdgroup]],
+    ushort                     sgitg [[simdgroup_index_in_threadgroup]]
+) {
+    (void)unused_scales;
+    (void)unused_biases;
+    (void)unused_group_size;
+
+    constexpr ushort NSG = 2;
+
+    const uint row = tgid * NSG + sgitg;
+    if (row >= out_dim) return;
+
+    const uint blocks_per_row = in_dim / GGUF_QK_K;
+    device const GGUFBlockQ5K * row_blocks = W + row * blocks_per_row;
+
+    const short tid = tiisg / 4;
+    const short ix  = tiisg % 4;
+    const short iq  = tid / 4;
+    const short ir  = tid % 4;
+    const short l0  = 8 * ir;
+    const short q_offset = 32 * iq + l0;
+    const short y_offset = 64 * iq + l0;
+
+    const uchar hm1 = uchar(1u << (2 * iq));
+    const uchar hm2 = uchar(hm1 << 1);
+    const uchar hm3 = uchar(hm1 << 4);
+    const uchar hm4 = uchar(hm2 << 4);
+
+    uint16_t sc16[4];
+    thread const uchar * sc8 = reinterpret_cast<thread const uchar *>(sc16);
+    float sumf = 0.0f;
+    device const float * y1 = x + ix * GGUF_QK_K + y_offset;
+
+    for (uint bi = ix; bi < blocks_per_row; bi += 4) {
+        device const GGUFBlockQ5K &blk = row_blocks[bi];
+        device const uchar * q1 = blk.qs + q_offset;
+        device const uchar * qh = blk.qh + l0;
+        device const ushort * a = reinterpret_cast<device const ushort *>(blk.scales) + iq;
+
+        device const float * y2 = y1 + 128;
+        float4 sumy = float4(0.0f);
+        float yl[16];
+        float yh[16];
+        for (short l = 0; l < 8; ++l) {
+            yl[l + 0] = y1[l + 0];  sumy[0] += yl[l + 0];
+            yl[l + 8] = y1[l + 32]; sumy[1] += yl[l + 8];
+            yh[l + 0] = y2[l + 0];  sumy[2] += yh[l + 0];
+            yh[l + 8] = y2[l + 32]; sumy[3] += yh[l + 8];
+        }
+
+        sc16[0] = a[0] & 0x3f3f;
+        sc16[1] = a[2] & 0x3f3f;
+        sc16[2] = ((a[4] >> 0) & 0x0f0f) | ((a[0] & 0xc0c0) >> 2);
+        sc16[3] = ((a[4] >> 4) & 0x0f0f) | ((a[2] & 0xc0c0) >> 2);
+
+        float4 acc1 = {0.0f};
+        float4 acc2 = {0.0f};
+        device const uchar * q2 = q1 + 64;
+        for (short l = 0; l < 8; ++l) {
+            const uchar h = qh[l];
+            acc1[0] += yl[l + 0] * float(q1[l] & 0x0F);
+            acc1[1] += yl[l + 8] * float(q1[l] & 0xF0);
+            acc1[2] += yh[l + 0] * float(q2[l] & 0x0F);
+            acc1[3] += yh[l + 8] * float(q2[l] & 0xF0);
+            acc2[0] += (h & hm1) ? yl[l + 0] : 0.0f;
+            acc2[1] += (h & hm2) ? yl[l + 8] : 0.0f;
+            acc2[2] += (h & hm3) ? yh[l + 0] : 0.0f;
+            acc2[3] += (h & hm4) ? yh[l + 8] : 0.0f;
+        }
+
+        const float d = f16_to_f32(blk.d);
+        const float minv = f16_to_f32(blk.dmin);
+        sumf += d * (float(sc8[0]) * (acc1[0]         + 16.0f * acc2[0]) +
+                     float(sc8[1]) * (acc1[1] / 16.0f + 16.0f * acc2[1]) +
+                     float(sc8[4]) * (acc1[2]         + 16.0f * acc2[2]) +
+                     float(sc8[5]) * (acc1[3] / 16.0f + 16.0f * acc2[3])) -
+                minv * (sumy[0] * float(sc8[2]) + sumy[1] * float(sc8[3]) +
+                        sumy[2] * float(sc8[6]) + sumy[3] * float(sc8[7]));
+
+        y1 += 4 * GGUF_QK_K;
+    }
+
+    const float sum = simd_sum(sumf);
+    if (tiisg == 0) {
+        out[row] = sum;
+    }
 }
 
 
@@ -166,103 +474,220 @@ kernel void dequant_matvec_4bit_fast(
 }
 
 // ============================================================================
-// Optional affine 8-bit dequant matvec
-// Used for model-configured down_proj override sidecars.
-// Layout:
-//   weights: [out_dim, in_dim] uint8
-//   scales:  [out_dim, in_dim/group_size] bf16
-//   biases:  [out_dim, in_dim/group_size] bf16
+// QJL 1-bit expert kernels — Exp34 (QJL experiment)
+//
+// Two-pass streaming-expert dequant:
+//   Pass 1 — qjl_wht_scramble:
+//       Computes WHT(D ⊙ x) into a device buffer.
+//       D is a fixed per-layer diagonal ∈ {-1,+1}^d (packed bits).
+//       TG shared mem = in_dim × 4 bytes.  1 TG × 256 threads.
+//
+//   Pass 2 — dequant_matvec_1bit_qjl:
+//       out_i = (π/2/d) · norm_i · Σ_j q_{ij} · x''_j
+//       Loads x'' into TG shared memory (matvec_v3 style) to avoid repeated
+//       device reads across rows.  1 TG per output row × 64 threads.
+//       Batched FP32 accumulation every 128 elements.
 // ============================================================================
 
-kernel void dequant_matvec_8bit(
-    device const uchar*  W_q8       [[buffer(0)]],
-    device const uint16_t* scales   [[buffer(1)]],
-    device const uint16_t* biases   [[buffer(2)]],
-    device const float*    x        [[buffer(3)]],
-    device float*          out      [[buffer(4)]],
-    constant uint&         out_dim  [[buffer(5)]],
-    constant uint&         in_dim   [[buffer(6)]],
-    constant uint&         group_size [[buffer(7)]],
-    uint tid [[thread_position_in_grid]]
+kernel void qjl_wht_scramble(
+    device const float*   x      [[buffer(0)]],
+    device const uint8_t* D_bits [[buffer(1)]],  // packed {0,1} bits, in_dim/8 bytes
+    device float*         out    [[buffer(2)]],
+    constant uint&        in_dim [[buffer(3)]],
+    threadgroup float*    shared [[threadgroup(0)]],  // in_dim floats
+    uint lid     [[thread_position_in_threadgroup]],
+    uint tg_size [[threads_per_threadgroup]]
 ) {
-    if (tid >= out_dim) return;
+    uint d = in_dim;
 
-    uint num_groups = in_dim / group_size;
-    device const uchar* w_row = W_q8 + tid * in_dim;
-    device const uint16_t* s_row = scales + tid * num_groups;
-    device const uint16_t* b_row = biases + tid * num_groups;
+    // Load D⊙x into threadgroup memory
+    for (uint i = lid; i < d; i += tg_size) {
+        uint byte_idx = i >> 3;
+        uint bit_idx  = i & 7;
+        float d_sign  = ((D_bits[byte_idx] >> bit_idx) & 1) ? 1.0f : -1.0f;
+        shared[i] = d_sign * x[i];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    float acc = 0.0f;
-    for (uint g = 0; g < num_groups; g++) {
-        float scale = bf16_to_f32(s_row[g]);
-        float bias  = bf16_to_f32(b_row[g]);
-        uint base = g * group_size;
-        for (uint i = 0; i < group_size; i++) {
-            acc += (float(w_row[base + i]) * scale + bias) * x[base + i];
+    // In-place Walsh-Hadamard butterfly (stride doubling)
+    for (uint stride = 1; stride < d; stride <<= 1) {
+        for (uint i = lid; i < d >> 1; i += tg_size) {
+            uint group = i / stride;
+            uint pos   = i % stride;
+            uint a_idx = group * (stride << 1) + pos;
+            uint b_idx = a_idx + stride;
+            float a = shared[a_idx];
+            float b = shared[b_idx];
+            shared[a_idx] = a + b;
+            shared[b_idx] = a - b;
         }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 
-    out[tid] = acc;
+    // Write WHT result to device memory
+    for (uint i = lid; i < d; i += tg_size) {
+        out[i] = shared[i];
+    }
+}
+
+kernel void dequant_matvec_1bit_qjl(
+    device const uint8_t* signs   [[buffer(0)]],  // packed bits: out_dim × in_dim/8 bytes
+    device const float*   norms   [[buffer(1)]],  // L2 norms: out_dim floats
+    device const float*   x_trans [[buffer(2)]],  // WHT(D⊙x): in_dim floats
+    device float*         out     [[buffer(3)]],
+    constant uint&        out_dim [[buffer(4)]],
+    constant uint&        in_dim  [[buffer(5)]],
+    threadgroup float*    x_shared [[threadgroup(0)]],  // in_dim floats
+    uint tgid    [[threadgroup_position_in_grid]],
+    uint lid     [[thread_position_in_threadgroup]],
+    uint tg_size [[threads_per_threadgroup]]
+) {
+    uint d = in_dim;
+
+    // Load x_trans into shared memory cooperatively (matvec_v3 pattern)
+    for (uint i = lid; i < d; i += tg_size) {
+        x_shared[i] = x_trans[i];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (tgid >= out_dim) return;
+
+    uint n_bytes = d >> 3;
+    device const uint8_t* row = signs + (uint)tgid * n_bytes;
+    float acc = 0.0f;
+    float batch = 0.0f;
+    uint bcnt = 0;
+
+    for (uint b = lid; b < n_bytes; b += tg_size) {
+        uint8_t w = row[b];
+        uint base = b << 3;
+        // 8-wide unroll: ±x based on sign bit
+        batch += ((w & 0x01) ? x_shared[base+0] : -x_shared[base+0]);
+        batch += ((w & 0x02) ? x_shared[base+1] : -x_shared[base+1]);
+        batch += ((w & 0x04) ? x_shared[base+2] : -x_shared[base+2]);
+        batch += ((w & 0x08) ? x_shared[base+3] : -x_shared[base+3]);
+        batch += ((w & 0x10) ? x_shared[base+4] : -x_shared[base+4]);
+        batch += ((w & 0x20) ? x_shared[base+5] : -x_shared[base+5]);
+        batch += ((w & 0x40) ? x_shared[base+6] : -x_shared[base+6]);
+        batch += ((w & 0x80) ? x_shared[base+7] : -x_shared[base+7]);
+        // Flush batch accumulator every 128 elements (16 byte-iterations)
+        if (++bcnt == 16) { acc += batch; batch = 0.0f; bcnt = 0; }
+    }
+    acc += batch;
+
+    // SIMD tree reduction
+    threadgroup float simd_buf[32];
+    float simd_val = simd_sum(acc);
+    uint simd_lane  = lid % 32;
+    uint simd_group = lid / 32;
+    uint n_simd     = (tg_size + 31) / 32;
+    if (simd_lane == 0) simd_buf[simd_group] = simd_val;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (simd_group == 0 && simd_lane < n_simd) {
+        float v = simd_sum(simd_buf[simd_lane]);
+        if (simd_lane == 0) {
+            float scale = (M_PI_F / 2.0f) * norms[tgid] / (float)d;
+            out[tgid] = v * scale;
+        }
+    }
 }
 
 // ============================================================================
-// Dense/shared Q8_0-style dequant matvec
-// Layout:
-//   weights: [out_dim, in_dim] int8
-//   scales:  [out_dim, in_dim/block_size] fp16
-//   value = int8 * scale
+// GGUF Q8_0 matvec for resident tensors
+// Reuses the same tiled shape as the 4-bit kernel: 8 rows per threadgroup.
 // ============================================================================
 
 kernel void dequant_matvec_q8_0(
-    device const char*     W_q8       [[buffer(0)]],
-    device const half*     scales     [[buffer(1)]],
-    device const float*    x          [[buffer(2)]],
-    device float*          out        [[buffer(3)]],
-    constant uint&         out_dim    [[buffer(4)]],
-    constant uint&         in_dim     [[buffer(5)]],
-    constant uint&         block_size [[buffer(6)]],
-    uint gid [[thread_position_in_grid]]
+    device const GGUFBlockQ8_0* W      [[buffer(0)]],
+    device const float*         x      [[buffer(1)]],
+    device float*               out    [[buffer(2)]],
+    constant uint&              out_dim [[buffer(3)]],
+    constant uint&              in_dim  [[buffer(4)]],
+    uint tgid   [[threadgroup_position_in_grid]],
+    uint lid    [[thread_position_in_threadgroup]],
+    uint simd_lane  [[thread_index_in_simdgroup]],
+    uint simd_group [[simdgroup_index_in_threadgroup]]
 ) {
-    if (gid >= out_dim) return;
+    const uint row = tgid * 8 + simd_group;
+    const uint blocks_per_row = in_dim / GGUF_QK8_0;
 
-    uint num_blocks = in_dim / block_size;
-    device const char* w_row = W_q8 + gid * in_dim;
-    device const half* s_row = scales + gid * num_blocks;
+    threadgroup float x_shared[GGUF_Q8_MAX_IN_DIM];
+    for (uint i = lid; i < in_dim; i += 256) {
+        x_shared[i] = x[i];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
 
+    if (row >= out_dim) return;
+
+    device const GGUFBlockQ8_0* row_blocks = W + row * blocks_per_row;
     float acc = 0.0f;
-    for (uint b = 0; b < num_blocks; b++) {
-        float scale = float(s_row[b]);
-        uint base = b * block_size;
-        for (uint i = 0; i < block_size; i++) {
-            acc += float(w_row[base + i]) * scale * x[base + i];
+
+    for (uint bi = simd_lane; bi < blocks_per_row; bi += 32) {
+        device const GGUFBlockQ8_0& blk = row_blocks[bi];
+        const float d = f16_to_f32(blk.d);
+        const uint base = bi * GGUF_QK8_0;
+        for (uint i = 0; i < GGUF_QK8_0; i++) {
+            acc += d * float(blk.qs[i]) * x_shared[base + i];
         }
     }
 
-    out[gid] = acc;
+    const float sum = simd_sum(acc);
+    if (simd_lane == 0) {
+        out[row] = sum;
+    }
 }
 
 // ============================================================================
-// Dense/shared F32 matvec
-// Layout:
-//   weights: [out_dim, in_dim] float
+// GGUF Q6_K matvec for resident tensors
+// One SIMD group handles one output row exactly, preserving GGUF block layout.
 // ============================================================================
 
-kernel void matvec_f32(
-    device const float*    W          [[buffer(0)]],
-    device const float*    x          [[buffer(1)]],
-    device float*          out        [[buffer(2)]],
-    constant uint&         out_dim    [[buffer(3)]],
-    constant uint&         in_dim     [[buffer(4)]],
-    uint gid [[thread_position_in_grid]]
+kernel void dequant_matvec_q6_k(
+    device const GGUFBlockQ6K* W      [[buffer(0)]],
+    device const float*        x      [[buffer(1)]],
+    device float*              out    [[buffer(2)]],
+    constant uint&             out_dim [[buffer(3)]],
+    constant uint&             in_dim  [[buffer(4)]],
+    uint3 tgpig [[threadgroup_position_in_grid]],
+    ushort lane [[thread_index_in_simdgroup]]
 ) {
-    if (gid >= out_dim) return;
+    const uint row = tgpig.x;
+    if (row >= out_dim) return;
 
-    device const float* w_row = W + gid * in_dim;
+    const uint blocks_per_row = in_dim / GGUF_QK_K;
+    device const GGUFBlockQ6K* row_blocks = W + row * blocks_per_row;
+
     float acc = 0.0f;
-    for (uint i = 0; i < in_dim; i++) {
-        acc += w_row[i] * x[i];
+
+    for (uint bi = 0; bi < blocks_per_row; ++bi) {
+        device const GGUFBlockQ6K& blk = row_blocks[bi];
+        const float d = f16_to_f32(blk.d);
+        device const float* x_block = x + bi * GGUF_QK_K;
+
+        for (uint part = 0; part < GGUF_QK_K; part += 128) {
+            device const uchar* ql = blk.ql + part / 2;
+            device const uchar* qh = blk.qh + part / 4;
+            device const char* sc = blk.scales + part / 16;
+
+            const uint is = lane / 16;
+            const uchar qh_lane = qh[lane];
+            const int q1 = int((ql[lane +  0] & 0xF) | (((qh_lane >> 0) & 0x3) << 4)) - 32;
+            const int q2 = int((ql[lane + 32] & 0xF) | (((qh_lane >> 2) & 0x3) << 4)) - 32;
+            const int q3 = int((ql[lane +  0] >> 4) | (((qh_lane >> 4) & 0x3) << 4)) - 32;
+            const int q4 = int((ql[lane + 32] >> 4) | (((qh_lane >> 6) & 0x3) << 4)) - 32;
+
+            const uint base = part + lane;
+            acc += d * float(sc[is + 0]) * float(q1) * x_block[base +  0];
+            acc += d * float(sc[is + 2]) * float(q2) * x_block[base + 32];
+            acc += d * float(sc[is + 4]) * float(q3) * x_block[base + 64];
+            acc += d * float(sc[is + 6]) * float(q4) * x_block[base + 96];
+        }
     }
-    out[gid] = acc;
+
+    const float sum = simd_sum(acc);
+    if (lane == 0) {
+        out[row] = sum;
+    }
 }
 
 // ============================================================================
@@ -444,6 +869,108 @@ kernel void dequant_matvec_4bit_v3(
 
 
 // ============================================================================
+// Kernel 1e: Fused multi-projection v3 — Exp41
+// ============================================================================
+// Fuses N projections (N=2..4) from the same weight buffer into a single
+// dispatch, replacing N separate encoders with one.
+// Each TG handles ROWS_PER_TG=8 output rows from one projection. The tgid
+// determines which projection (via tg_base4) and which row tile within it.
+// This allows the GPU scheduler to interleave TGs from all projections in a
+// single wave pool instead of running them strictly sequentially.
+// Weight, scale, bias buffers are bound at byte offset 0; per-projection
+// element offsets are supplied as constants.
+//
+// Projection i occupies TGs [tg_base4[i] .. tg_base4[i+1]).
+// tg_base4[0]=0, tg_base4[1]=ceil(out_dim[0]/8), etc.
+// For unused slots (i >= num_projs), out_dim4[i] = 0 so those TGs return.
+
+kernel void dequant_matvec_4bit_v3_multi(
+    device const uint32_t* W_buf    [[buffer(0)]],  // wf_buf (uint32 view, offset 0)
+    device const uint16_t* S_buf    [[buffer(1)]],  // wf_buf (uint16 view, offset 0)
+    device const uint16_t* B_buf    [[buffer(2)]],  // wf_buf (uint16 view, offset 0)
+    device const float*    x        [[buffer(3)]],  // buf_input
+    device float*          out0     [[buffer(4)]],  // output for proj 0
+    device float*          out1     [[buffer(5)]],  // output for proj 1
+    device float*          out2     [[buffer(6)]],  // output for proj 2
+    device float*          out3     [[buffer(7)]],  // output for proj 3
+    constant uint4&        w_off4   [[buffer(8)]],  // per-proj W offset in uint32 elem from buf base
+    constant uint4&        s_off4   [[buffer(9)]],  // per-proj S offset in uint16 elem from buf base
+    constant uint4&        b_off4   [[buffer(10)]], // per-proj B offset in uint16 elem from buf base
+    constant uint4&        out_dim4 [[buffer(11)]], // out_dim per proj (0 = unused)
+    constant uint4&        tg_base4 [[buffer(12)]], // first TG index for each proj: [0, tgs0, tgs0+tgs1, ...]
+    constant uint&         in_dim   [[buffer(13)]],
+    constant uint&         group_size [[buffer(14)]],
+    uint tgid   [[threadgroup_position_in_grid]],
+    uint lid    [[thread_position_in_threadgroup]],
+    uint simd_lane  [[thread_index_in_simdgroup]],
+    uint simd_group [[simdgroup_index_in_threadgroup]]
+) {
+    // Determine which projection this TG belongs to.
+    // tg_base4 = [0, tgs0, tgs0+tgs1, tgs0+tgs1+tgs2]
+    uint proj = 0;
+    if      (tgid >= tg_base4[3]) proj = 3;
+    else if (tgid >= tg_base4[2]) proj = 2;
+    else if (tgid >= tg_base4[1]) proj = 1;
+
+    uint local_tg = tgid - tg_base4[proj];
+    uint row = local_tg * ROWS_PER_TG + simd_group;
+
+    // Note: unused proj slots have out_dim4[proj]=0; those TGs exit after barrier.
+
+    uint packed_cols = in_dim / 8;
+    uint num_groups  = in_dim / group_size;
+
+    // Load x into threadgroup shared memory. ALL threads participate before barrier.
+    threadgroup float x_shared[4096];
+    for (uint i = lid; i < in_dim; i += 256)
+        x_shared[i] = x[i];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (row >= out_dim4[proj]) return;
+
+    // Per-projection weight/scale/bias row pointers using element offsets.
+    device const uint32_t* w_row = W_buf + w_off4[proj] + row * packed_cols;
+    device const uint16_t* s_row = S_buf + s_off4[proj] + row * num_groups;
+    device const uint16_t* b_row = B_buf + b_off4[proj] + row * num_groups;
+
+    float acc = 0.0f;
+    for (uint col = simd_lane; col < packed_cols; col += 32) {
+        uint g = col / (group_size / 8);
+        float scale = bf16_to_f32(s_row[g]);
+        float bias  = bf16_to_f32(b_row[g]);
+        uint32_t packed = w_row[col];
+        uint x_base = col * 8;
+
+        float sx0 = scale * x_shared[x_base + 0];  float bx0 = bias * x_shared[x_base + 0];
+        float sx1 = scale * x_shared[x_base + 1];  float bx1 = bias * x_shared[x_base + 1];
+        float sx2 = scale * x_shared[x_base + 2];  float bx2 = bias * x_shared[x_base + 2];
+        float sx3 = scale * x_shared[x_base + 3];  float bx3 = bias * x_shared[x_base + 3];
+        float sx4 = scale * x_shared[x_base + 4];  float bx4 = bias * x_shared[x_base + 4];
+        float sx5 = scale * x_shared[x_base + 5];  float bx5 = bias * x_shared[x_base + 5];
+        float sx6 = scale * x_shared[x_base + 6];  float bx6 = bias * x_shared[x_base + 6];
+        float sx7 = scale * x_shared[x_base + 7];  float bx7 = bias * x_shared[x_base + 7];
+
+        acc += fma(float((packed >>  0) & 0xF), sx0, bx0);
+        acc += fma(float((packed >>  4) & 0xF), sx1, bx1);
+        acc += fma(float((packed >>  8) & 0xF), sx2, bx2);
+        acc += fma(float((packed >> 12) & 0xF), sx3, bx3);
+        acc += fma(float((packed >> 16) & 0xF), sx4, bx4);
+        acc += fma(float((packed >> 20) & 0xF), sx5, bx5);
+        acc += fma(float((packed >> 24) & 0xF), sx6, bx6);
+        acc += fma(float((packed >> 28) & 0xF), sx7, bx7);
+    }
+
+    float sum = simd_sum(acc);
+    if (simd_lane == 0) {
+        if      (proj == 0) out0[row] = sum;
+        else if (proj == 1) out1[row] = sum;
+        else if (proj == 2) out2[row] = sum;
+        else                out3[row] = sum;
+    }
+}
+
+
+// ============================================================================
 // Kernel 1f: 4-bit dequant matvec with LUT (eliminates uint→float conversions)
 // ============================================================================
 // Instead of converting each nibble to float (expensive conversion instruction),
@@ -522,6 +1049,91 @@ kernel void dequant_matvec_4bit_v5(
 
 // ============================================================================
 // Kernel 1e: 2-bit affine dequant matvec (same structure as v3)
+// ============================================================================
+// Ternary 2-bit dequant matvec (Exp35)
+// ============================================================================
+//
+// Packs 16 x ternary values per uint32 (2 bits each):
+//   0b00 = 0, 0b01 = +1, 0b10 = -1
+// Symmetric quantization (no bias): val = ternary_code * scale
+// group_size = 128 (vs 64 for 4-bit): n_groups = in_dim / 128
+// packed_cols = in_dim / 16
+//
+// Dequant formula:
+//   bits = (packed >> (i*2)) & 0x3
+//   ternary_val = float(int(bits&1) - int((bits>>1)&1))
+//     bits=00 → 0-0=0, bits=01 → 1-0=+1, bits=10 → 0-1=-1, bits=11 → 0 (unused)
+//   output += ternary_val * scale * x[col*16 + i]
+//
+// Same threadgroup structure as dequant_matvec_2bit: 256 threads / 8 SIMD groups / 8 rows per TG.
+// buffer(2) is a dummy (unused) — present for uniform dispatch with other kernels.
+
+kernel void dequant_matvec_ternary(
+    device const uint32_t* W_packed   [[buffer(0)]],  // [out_dim, in_dim/16] 2-bit ternary
+    device const uint16_t* scales     [[buffer(1)]],  // [out_dim, num_groups] bf16, symmetric
+    device const uint16_t* unused_buf [[buffer(2)]],  // unused (uniform dispatch padding)
+    device const float*    x          [[buffer(3)]],  // [in_dim]
+    device float*          out        [[buffer(4)]],  // [out_dim]
+    constant uint&         out_dim    [[buffer(5)]],
+    constant uint&         in_dim     [[buffer(6)]],
+    constant uint&         group_size [[buffer(7)]],
+    uint tgid       [[threadgroup_position_in_grid]],
+    uint lid        [[thread_position_in_threadgroup]],
+    uint simd_lane  [[thread_index_in_simdgroup]],
+    uint simd_group [[simdgroup_index_in_threadgroup]]
+) {
+    uint row = tgid * ROWS_PER_TG + simd_group;
+    uint packed_cols = in_dim / 16;   // uint32 words per row
+    uint num_groups  = in_dim / group_size;  // groups per row (group_size=128)
+
+    // Cache x in threadgroup memory (max in_dim = HIDDEN_DIM = 4096)
+    threadgroup float x_shared[4096];
+    for (uint i = lid; i < in_dim; i += 256) {
+        x_shared[i] = x[i];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (row >= out_dim) return;
+
+    device const uint32_t* w_row = W_packed + row * packed_cols;
+    device const uint16_t* s_row = scales   + row * num_groups;
+
+    float acc = 0.0f;
+
+    // group_size/16 = 128/16 = 8 packed words per group
+    for (uint col = simd_lane; col < packed_cols; col += 32) {
+        uint g = col / (group_size / 16);   // group index
+        float scale = bf16_to_f32(s_row[g]);
+
+        uint32_t packed = w_row[col];
+        uint x_base = col * 16;
+
+        // Decode 16 ternary values. Encoding: 00=0, 01=+1, 10=-1
+        // ternary_val = float(int(bits&1) - int((bits>>1)&1))
+        acc += float(int((packed >>  0) & 1u) - int((packed >>  1) & 1u)) * scale * x_shared[x_base +  0];
+        acc += float(int((packed >>  2) & 1u) - int((packed >>  3) & 1u)) * scale * x_shared[x_base +  1];
+        acc += float(int((packed >>  4) & 1u) - int((packed >>  5) & 1u)) * scale * x_shared[x_base +  2];
+        acc += float(int((packed >>  6) & 1u) - int((packed >>  7) & 1u)) * scale * x_shared[x_base +  3];
+        acc += float(int((packed >>  8) & 1u) - int((packed >>  9) & 1u)) * scale * x_shared[x_base +  4];
+        acc += float(int((packed >> 10) & 1u) - int((packed >> 11) & 1u)) * scale * x_shared[x_base +  5];
+        acc += float(int((packed >> 12) & 1u) - int((packed >> 13) & 1u)) * scale * x_shared[x_base +  6];
+        acc += float(int((packed >> 14) & 1u) - int((packed >> 15) & 1u)) * scale * x_shared[x_base +  7];
+        acc += float(int((packed >> 16) & 1u) - int((packed >> 17) & 1u)) * scale * x_shared[x_base +  8];
+        acc += float(int((packed >> 18) & 1u) - int((packed >> 19) & 1u)) * scale * x_shared[x_base +  9];
+        acc += float(int((packed >> 20) & 1u) - int((packed >> 21) & 1u)) * scale * x_shared[x_base + 10];
+        acc += float(int((packed >> 22) & 1u) - int((packed >> 23) & 1u)) * scale * x_shared[x_base + 11];
+        acc += float(int((packed >> 24) & 1u) - int((packed >> 25) & 1u)) * scale * x_shared[x_base + 12];
+        acc += float(int((packed >> 26) & 1u) - int((packed >> 27) & 1u)) * scale * x_shared[x_base + 13];
+        acc += float(int((packed >> 28) & 1u) - int((packed >> 29) & 1u)) * scale * x_shared[x_base + 14];
+        acc += float(int((packed >> 30) & 1u) - int((packed >> 31) & 1u)) * scale * x_shared[x_base + 15];
+    }
+
+    float sum = simd_sum(acc);
+    if (simd_lane == 0) {
+        out[row] = sum;
+    }
+}
+
+
 // ============================================================================
 // Packs 16 x 2-bit values per uint32. Each value is 0-3, dequantized as:
 //   val = uint2 * scale + bias (same affine quantization, just 2-bit range)
@@ -1396,4 +2008,96 @@ kernel void moe_combine_residual(
     if (K > 7) moe += params[7] * expert_out7[tid];
 
     hidden_out[tid] = h_mid[tid] + moe + shared_gate * shared_out[tid];
+}
+
+
+// ============================================================================
+// Kernel: full_attn_qk_process  (Exp42)
+// ============================================================================
+// Fuses Q/K deinterleave + per-head RMSNorm + partial RoPE + KV cache append
+// into a single CMD1 encoder for full-attention layers.
+// After this runs, buf_attn_q/gate and buf_kv_k/v are ready for a pre-encoded
+// CMD2 GPU attention dispatch — eliminating the ~30µs CPU submission gap.
+//
+// Dispatch: (NUM_ATTN_HEADS + NUM_KV_HEADS) = 34 TGs × HEAD_DIM = 256 threads
+//   TG 0..31  : Q heads — deinterleave, RMSNorm(q_norm_w), partial RoPE → buf_attn_q/gate
+//   TG 32..33 : K/V heads — K: RMSNorm(k_norm_w) + partial RoPE → buf_kv_k;
+//                            V: copy as-is → buf_kv_v
+//
+// RoPE convention (MLX non-traditional): pairs are (x[i], x[i + half])
+//   where half = ROTARY_DIM / 2 = 32; only first ROTARY_DIM=64 dims are rotated.
+// ============================================================================
+
+kernel void full_attn_qk_process(
+    device const float    *q_proj      [[buffer(0)]],   // batch_out[0]: [QHEADS*HDIM*2] interleaved q/q_gate
+    device const float    *k_proj      [[buffer(1)]],   // batch_out[1]: [KVHEADS*HDIM]
+    device const float    *v_proj      [[buffer(2)]],   // batch_out[2]: [KVHEADS*HDIM]
+    device const uint16_t *q_norm_w    [[buffer(3)]],   // [HDIM] bf16 per-dim norm weights for Q
+    device const uint16_t *k_norm_w    [[buffer(4)]],   // [HDIM] bf16 per-dim norm weights for K
+    device float          *buf_attn_q  [[buffer(5)]],   // [QHEADS*HDIM] float out: normed+RoPE'd Q
+    device float          *buf_attn_gate[[buffer(6)]],  // [QHEADS*HDIM] float out: Q gate (raw, no norm)
+    device float          *buf_kv_k    [[buffer(7)]],   // [seq_stride*kv_dim] append at cache_pos
+    device float          *buf_kv_v    [[buffer(8)]],   // [seq_stride*kv_dim] append at cache_pos
+    constant uint         &cache_pos   [[buffer(9)]],   // KV cache write position
+    constant uint         &rope_pos    [[buffer(10)]],  // RoPE position (= cache_pos in generation)
+    constant uint         &seq_stride  [[buffer(11)]],  // GPU_KV_SEQ (buf stride between positions)
+    uint tgid [[threadgroup_position_in_grid]],
+    uint lid  [[thread_position_in_threadgroup]]
+) {
+    // Architecture constants — must match #defines in infer.m
+    const uint QHEADS   = 32;          // NUM_ATTN_HEADS
+    const uint KVHEADS  = 2;           // NUM_KV_HEADS
+    const uint HDIM     = 256;         // HEAD_DIM
+    const uint ROT_HALF = 32;          // ROTARY_DIM / 2  (only first 64 dims rotated, in pairs of 32)
+    const float THETA   = 10000000.0f; // ROPE_THETA
+    const float ROT_DIM = 64.0f;       // ROTARY_DIM (float for freq computation)
+
+    threadgroup float vals[256];  // scratch: one element per thread (1 KB)
+    threadgroup float sum_sq;     // RMSNorm reduction result
+
+    bool is_q = (tgid < QHEADS);
+    uint kv_h = tgid - QHEADS;   // only valid when !is_q
+
+    // ---- Load head into threadgroup scratch ----
+    if (is_q) {
+        vals[lid] = q_proj[tgid * HDIM * 2 + lid];  // first HDIM of interleaved pair
+    } else {
+        vals[lid] = k_proj[kv_h * HDIM + lid];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // ---- RMSNorm (per-head, with learned weights) ----
+    if (lid == 0) {
+        float s = 0.0f;
+        for (uint i = 0; i < HDIM; i++) s += vals[i] * vals[i];
+        sum_sq = s;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float inv_rms = rsqrt(sum_sq / float(HDIM) + 1e-6f);
+    float w = bf16_to_f32(is_q ? q_norm_w[lid] : k_norm_w[lid]);
+    vals[lid] = vals[lid] * inv_rms * w;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // ---- Partial RoPE: rotate pairs (vals[i], vals[i+ROT_HALF]) for i < ROT_HALF ----
+    if (lid < ROT_HALF) {
+        float freq  = 1.0f / pow(THETA, float(2 * lid) / ROT_DIM);
+        float angle = float(rope_pos) * freq;
+        float cs = cos(angle), sn = sin(angle);
+        float v0 = vals[lid], v1 = vals[lid + ROT_HALF];
+        vals[lid]           = v0 * cs - v1 * sn;
+        vals[lid + ROT_HALF] = v0 * sn + v1 * cs;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // ---- Write outputs ----
+    if (is_q) {
+        buf_attn_q   [tgid * HDIM + lid] = vals[lid];
+        // Q gate: second HDIM of interleaved pair — no RMSNorm, no RoPE
+        buf_attn_gate[tgid * HDIM + lid] = q_proj[tgid * HDIM * 2 + HDIM + lid];
+    } else {
+        const uint kv_dim = KVHEADS * HDIM;
+        uint out_off = cache_pos * kv_dim + kv_h * HDIM;
+        buf_kv_k[out_off + lid] = vals[lid];                     // normed + RoPE'd K
+        buf_kv_v[out_off + lid] = v_proj[kv_h * HDIM + lid];    // V unchanged
+    }
 }
