@@ -62,6 +62,9 @@ flash_moe.aux
 flash_moe.out
 flash_moe.log
 
+# Release assets (distributed via GitHub releases, not repo)
+flash-moe-m5-max-optimization.pdf
+
 # Backup / duplicate files
 *_org.py
 *_org.json
