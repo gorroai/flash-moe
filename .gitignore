@@ -43,3 +43,27 @@ metal_infer/routing_data.bin
 metal_infer/nax_bench
 metal_infer/nax_bench.ir
 autoresearch/gguf
+
+# Paper source and LaTeX build artifacts (keep only final PDFs)
+paper/*.tex
+paper/*.aux
+paper/*.out
+paper/*.log
+paper/*.bbl
+paper/*.blg
+paper/*.toc
+paper/*.fls
+paper/*.fdb_latexmk
+paper/*.synctex.gz
+
+# Root-level LaTeX artifacts from out-of-tree builds
+arxiv_draft.*
+flash_moe.aux
+flash_moe.out
+flash_moe.log
+
+# Backup / duplicate files
+*_org.py
+*_org.json
+*_org.md
+*.orig.md
