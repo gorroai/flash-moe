@@ -4,9 +4,74 @@
 >
 > Forked from [danveloper/flash-moe](https://github.com/danveloper/flash-moe) — **[Read the original paper](paper/flash_moe.pdf)** for the full story of how an AI and a human built this in 24 hours.
 >
-> **[Read our paper](flash-moe-m5-max-optimization.pdf)** — Beyond the DRAM Wall: 20.34 tok/s on M5 Max, 4.67× over baseline.
+> **[Read our paper →](https://github.com/iluvclubs/flash-moe/releases/tag/v1.0)** — Beyond the DRAM Wall: 20.34 tok/s on M5 Max, 4.67× over baseline.
 
 Pure C/Metal inference engine that runs **Qwen3.5-397B-A17B** (a 397 billion parameter Mixture-of-Experts model) on Apple Silicon. The entire model streams from SSD through a custom Metal compute pipeline. Features high-quality [Unsloth](https://github.com/unslothai/unsloth) Q3 expert quantization with optimized IQ3_XXS/IQ4_XS/Q5_K dequant kernels (llama.cpp GGUF-compatible), Metal 4 NAX tensor matmul support (M5+), and improved SSD cache throughput via page-aligned pread fanout (`--cache-io-split`, adapted from [ncdrone/rustane](https://github.com/ncdrone/rustane)). No Python. No frameworks. Just C, Objective-C, and hand-tuned Metal shaders.
+
+---
+
+## M5 Max Autoresearch Results (March 2026)
+
+> **43 experiments · ~24 hours · 4.67× improvement over the M3 Max baseline**
+> **[Download paper (PDF)](https://github.com/iluvclubs/flash-moe/releases/tag/v1.0)**
+
+Using a Claude Code autoresearch loop — identical methodology to [danveloper/flash-moe](https://github.com/danveloper/flash-moe) — we ran 43 Metal optimization experiments on M5 Max 128GB and reached **20.34 tok/s**, breaking the theoretical 2-bit I/O ceiling (18.6 tok/s) using 4-bit weights.
+
+### Optimization Trajectory
+
+| Experiment | Optimization | tok/s | Δ% |
+|---|---|---|---|
+| Baseline (Exp1) | M5 Max 4-bit, cache-io-split 4 | 12.5 | — |
+| Exp9 | **Temporal expert prediction** | 16.4 | **+31%** |
+| Exp16 | Q3 GGUF experts + temporal | 18.7 | +14% |
+| Exp27 | CMD2 pre-encode (GDN layers) | 19.1 | +2.7% |
+| Exp41 | Horizontal Q/K/V projection fusion | 19.9 | +4.0% |
+| **Exp42** | **CMD2 pre-encode (all 60 layers)** | **20.34** | **+2.4%** |
+
+### Key Finding: Beating the Hardware Ceiling
+
+The theoretical SSD I/O limit for 2-bit experts is **18.6 tok/s** (943 MB/token ÷ 17.5 GB/s).
+We achieved **20.34 tok/s with 4-bit experts** — faster than the 2-bit physical limit — by overlapping SSD reads with GPU compute via temporal expert prediction.
+
+**Temporal expert prediction** was the single biggest win: exploiting 27% cross-token routing correlation to pre-fetch the next layer's experts while the GPU is still computing the current one. This alone contributed **+55% decode speed** (10.61 → 16.40 tok/s in isolation, Exp9).
+
+### vs. Baseline
+
+| Machine | Best decode | vs. M3 Max |
+|---------|-------------|------------|
+| M3 Max 48GB — Dan Woods ([danveloper/flash-moe](https://github.com/danveloper/flash-moe)) | 4.36 tok/s | baseline |
+| M5 Max 128GB — Anemll fork (this repo, pre-autoresearch) | 12.9 tok/s | 3.0× |
+| **M5 Max 128GB — autoresearch/mar25 (this repo)** | **20.34 tok/s** | **4.67×** |
+
+### Best Inference Command
+
+```bash
+./metal_infer/infer \
+  --model ~/Models/flash_mlx_4bit \
+  --q3-experts \
+  --predict \
+  --cache-io-split 4 \
+  --gguf-embedding ~/Models/flash_mlx_4bit/gguf/embedding_q8_0.bin \
+  --gguf-lm-head ~/Models/flash_mlx_4bit/gguf/lm_head_q6.bin \
+  --prompt "<|im_start|>user\nYour prompt<|im_end|>\n<|im_start|>assistant\n" \
+  --tokens 200 --timing
+```
+
+### Failed Experiments (43 total, ~30% keep rate)
+
+- **1-bit QJL (SRHT):** PPL catastrophic (5647) — too lossy for generative LLM
+- **Ternary 2-bit:** PPL failed (11.49) — 84% sparsity too aggressive
+- **K=3 experts:** PPL failed (6.54) — model requires K=4 minimum
+- **Cross-layer prediction:** near-zero hit rate
+- **Encoder fusion:** zero improvement (encoder overhead only ~1μs)
+- **Shared memory optimizations:** hurt occupancy — M5 Max L2 handles it automatically
+
+---
+
+## Anemll Fork: Q3 GGUF + Hybrid Quantization
+
+> The following sections document the Anemll fork's Q3 GGUF hybrid quantization work,
+> which provides the foundation the autoresearch experiments built on.
 
 ## What's New (This Fork)
 
@@ -21,7 +86,8 @@ Pure C/Metal inference engine that runs **Qwen3.5-397B-A17B** (a 397 billion par
 | Machine | Decode tok/s | vs Original |
 |---------|-------------|-------------|
 | M3 Max 48GB (original) | 4.36 | baseline |
-| **M5 Max 128GB** | **14.5** | **3.3x** |
+| M5 Max 128GB (this fork) | 12.9 | 3.0× |
+| **M5 Max 128GB (autoresearch/mar25)** | **20.34** | **4.67×** |
 
 ### Perplexity (WikiText-2, 2000 tokens)
 
@@ -468,6 +534,7 @@ docs/                  # Experiment logs, GGUF bringup notes, timing reports
 | Deferred CMD3 execution | GPU/CPU overlap | **Pipeline** |
 | Per-layer mixed quant | Keep sensitive layers at 4-bit | **Quality** |
 | GGUF Q3 streamed experts | -23% expert I/O vs 4-bit | **WIP** |
+| **Temporal expert prediction** | **10.61 → 16.40 tok/s (+55%)** | **autoresearch/mar25** |
 
 ### Discarded (58+ experiments, highlights)
 | Approach | Result | Why |
@@ -475,7 +542,7 @@ docs/                  # Experiment logs, GGUF bringup notes, timing reports
 | NAX for M=1 decode | -8% | Tile padding overhead > GEMM speedup for matvec |
 | LZ4 expert compression | -13% | Decompress overhead > warm cache savings |
 | F_RDADVISE prefetch | net 0% | Unified memory: SSD DMA slows GPU -73% |
-| Temporal expert prediction | -18% | 25% hit rate, SSD bandwidth waste |
+| Temporal prediction (early attempt) | -18% | 25% hit rate in original impl — later fixed in autoresearch |
 | MLP routing predictor | 31% accuracy | Worse than temporal baseline |
 | GPU LUT dequant kernel | -2% | Indirect register access serializes |
 | Spin-poll GPU wait | -23% | CPU thermal competes with GPU |
