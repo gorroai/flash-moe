@@ -1,20 +1,15 @@
-# GorroAI Pro — Qwen3.5-397B Flash-MoE on M5 Max
-## UPDATED: Full benchmark complete, HTTP wrapper phase added
+# Flash-MoE Autoresearch — Qwen3.5-397B on M5 Max
 ## Claude Code Project Instructions
 
 ---
 
 ## Project Overview
 
-This is a scientific benchmarking and commercial deployment project running
+This is a scientific benchmarking and autoresearch project running
 Qwen3.5-397B-A17B (a 397 billion parameter Mixture-of-Experts model) locally
 on an Apple M5 Max MacBook Pro using the flash-moe inference engine.
 
-**End goal:** Deploy as GorroAI Pro — a premium tier of the existing GorroAI
-API (api.gorroai.com), offering frontier-level local inference with no cloud,
-no data leaving the machine, HIPAA-friendly positioning.
-
-**Immediate goal:** Complete benchmarking, publish results to r/LocalLLaMA
+**Goal:** Complete benchmarking, publish results to r/LocalLLaMA
 and X (@Saboo_Shubham_), credit prior authors, establish M5 Max as the
 fastest flash-moe benchmark publicly documented.
 
@@ -73,12 +68,6 @@ All paths are on the local machine, not in this repo.
 ~/flash-moe/metal_infer/infer   # main inference binary
 ~/flash-moe/metal_infer/chat    # chat binary (optional, build with make chat)
 ```
-
-**GorroAI (existing production service):**
-- llama-server serving MiniMax M2.5 230B at ~62 tok/s
-- Cloudflare tunnel at api.gorroai.com
-- LaunchAgents: com.gorroai.llama.plist, com.gorroai.cloudflared.plist
-- Pause before running flash-moe benchmarks to free Metal/GPU resources
 
 ---
 
@@ -155,37 +144,7 @@ similar to how Dan Woods built the original (90 experiments, 19% hit rate).
 
 ---
 
-## Future Phase: GorroAI Pro Deployment
-
-**Architecture:**
-- Separate endpoint from existing GorroAI (do NOT mix with llama-server)
-- Smart routing: simple queries → MiniMax 230B (fast), complex → Qwen 397B
-- Time-based fallback: Qwen 397B at night (low traffic), MiniMax during peak
-- New RapidAPI listing: "GorroAI Pro — 397B Local Inference"
-
-**Pricing angle:**
-- Standard: MiniMax 230B, current pricing
-- Pro: Qwen3.5-397B, premium tier, privacy-first positioning
-- Target market: healthcare developers (HIPAA), legal tech, privacy-conscious devs
-
-**Key differentiator:**
-Owner is a physician → unique credibility for HIPAA-friendly local AI API pitch.
-
----
-
 ## Commands Reference
-
-**Pause GorroAI before benchmarking:**
-```bash
-launchctl unload ~/Library/LaunchAgents/com.gorroai.llama.plist
-launchctl unload ~/Library/LaunchAgents/com.gorroai.cloudflared.plist
-```
-
-**Resume GorroAI after benchmarking:**
-```bash
-launchctl load ~/Library/LaunchAgents/com.gorroai.llama.plist
-launchctl load ~/Library/LaunchAgents/com.gorroai.cloudflared.plist
-```
 
 **Base 4-bit inference:**
 ```bash
@@ -244,39 +203,14 @@ flash-moe/
 - This is a replication + extension study. Always credit Dan Woods and Anemll fork.
 - Be transparent that Anemll fork already documented M5 Max numbers in README.
 - Our contribution: independent verification + first public Reddit post with
-  M5 Max results + commercial deployment pathway documentation.
+  M5 Max results + autoresearch optimization findings.
 - Future autoresearch phase is original contribution.
 - Code quality ceiling is Qwen3.5 model-level (not runtime) per Allen Lee's benchmarks.
   Sonnet 4.6 still wins on code quality. Be honest about this in posts.
 
 ---
 
-## CRITICAL WARNINGS (Added after painful experience)
-
-### Do NOT run two llama-server instances simultaneously
-The LaunchAgent auto-starts on reboot. If you manually start a second
-llama-server, both load the 230B model and you get GPU OOM errors.
-Always check first:
-```bash
-ps aux | grep llama-server
-```
-Kill all before starting a new one:
-```bash
-pkill -f llama-server
-```
-
-### Do NOT run flash-moe and MiniMax simultaneously
-They cannot share GPU memory on 128GB. Always pause GorroAI first:
-```bash
-launchctl unload ~/Library/LaunchAgents/com.gorroai.llama.plist
-launchctl unload ~/Library/LaunchAgents/com.gorroai.cloudflared.plist
-```
-Restore after benchmarking:
-```bash
-launchctl kickstart -k gui/$(id -u)/com.gorroai.llama
-launchctl kickstart -k gui/$(id -u)/com.gorroai.cloudflared
-curl http://localhost:8000/health
-```
+## CRITICAL WARNINGS
 
 ### Correct chat prompt format for Qwen3.5
 Plain prompts hit EOS immediately. Always use:
@@ -289,36 +223,7 @@ Your prompt here<|im_end|>
 
 ---
 
-## Phase 3: HTTP API Wrapper (GorroAI Pro enabler)
-
-**Problem:** flash-moe is CLI only. No HTTP server. Cannot serve API requests.
-
-**Goal:** Build an OpenAI-compatible HTTP wrapper around the infer binary
-so flash-moe can be exposed as a proper API endpoint.
-
-**Requirements:**
-- OpenAI-compatible /v1/chat/completions endpoint
-- Streaming support (SSE)
-- Handle Qwen3.5 chat format internally
-- Queue incoming requests (single inference at a time)
-- Written in Python FastAPI or Go
-
-**This is a Claude Code project — start a new session with this CLAUDE.md
-and ask Claude Code to build the HTTP wrapper.**
-
----
-
-## Phase 4: GorroAI Pro Deployment
-
-- Cannot run both models simultaneously on one machine
-- Options: sequential routing, second machine, or Mac Studio Ultra
-- Target market: healthcare devs (HIPAA), legal tech, privacy-conscious devs
-- Owner is a physician — unique credibility for HIPAA-friendly pitch
-- New RapidAPI listing: "GorroAI Pro — 397B Local Inference"
-
----
-
-## Phase 5: Apple Neural Engine (ANE) Co-processing Research
+## Phase 3: Apple Neural Engine (ANE) Co-processing Research
 
 **Status:** Future research — 2-3 month project
 
@@ -549,7 +454,7 @@ Key synthesis outputs:
 - sx/bx Metal optimization pattern
 - Paper abstract draft
 - Related work section candidates
-- Business case for HIPAA-compliant local AI API
+
 
 ---
 
