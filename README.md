@@ -3,6 +3,8 @@
 > **ANEMLL fork** — Work in Progress. Primarily targeting **Apple M5 Max 128GB**.
 >
 > Forked from [danveloper/flash-moe](https://github.com/danveloper/flash-moe) — **[Read the original paper](paper/flash_moe.pdf)** for the full story of how an AI and a human built this in 24 hours.
+>
+> **[Read our paper](flash-moe-m5-max-optimization.pdf)** — Beyond the DRAM Wall: 20.34 tok/s on M5 Max, 4.67× over baseline.
 
 Pure C/Metal inference engine that runs **Qwen3.5-397B-A17B** (a 397 billion parameter Mixture-of-Experts model) on Apple Silicon. The entire model streams from SSD through a custom Metal compute pipeline. Features high-quality [Unsloth](https://github.com/unslothai/unsloth) Q3 expert quantization with optimized IQ3_XXS/IQ4_XS/Q5_K dequant kernels (llama.cpp GGUF-compatible), Metal 4 NAX tensor matmul support (M5+), and improved SSD cache throughput via page-aligned pread fanout (`--cache-io-split`, adapted from [ncdrone/rustane](https://github.com/ncdrone/rustane)). No Python. No frameworks. Just C, Objective-C, and hand-tuned Metal shaders.
 
