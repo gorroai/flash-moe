@@ -27,3 +27,4 @@ Exp03r-4bit	n/a	19.15	23.4	keep	Lever-quant	K=4 4-bit predict split=4 tokens=200
 Exp03r-Q3	n/a	20.38	24.0	keep	Lever-quant	K=4 Q3 predict split=4 tokens=200 RERUN
 Oracle-timing	n/a	29.3	100.0	keep	Oracle	K=4 Q3 split=4 timing-based oracle (Expert I/O=0): CMD1=19.9ms CMD2=9.6ms CMD3=1.8ms total=34.1ms tokens=200
 Baseline-timing	n/a	20.6	24.2	keep	Baseline-timing	K=4 Q3 split=4 timing breakdown: CMD1=19.9ms CMD2=9.6ms IO=14.5ms CMD3=1.8ms total=48.6ms tokens=200
+Exp06-gdn-cmd-encode	n/a	22.075	24.2	discard	Exp06-gdn-cmd	GDN recurrence gap profiling: cmd1_submit=0.014ms (ALL encoders L1-L5+CMD2 pre-encode included), no measurable gap; GDN CMD2 already pre-encoded (Exp27); gate fails — no actionable submission gap found

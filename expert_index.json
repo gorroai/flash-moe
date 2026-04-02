@@ -1,5 +1,5 @@
 {
-  "model_path": "/Users/anemll/Models/mlx-community-Qwen3.5-397B-A17B-4bit",
+  "model_path": "/Users/gorro/Models/mlx-community-Qwen3.5-397B-A17B-4bit",
   "expert_reads": {
     "0": {
       "gate_proj.weight": {
