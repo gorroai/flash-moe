@@ -1,0 +1,21 @@
+exp_id	commit	decode_tok_s	hit_rate_pct	status	lever	description
+Exp00	n/a	0.00	0.00	discard	Baseline	397B 4-bit no-predict split=4 tokens=200 — all warm runs failed
+Exp00	n/a	13.21	25.6	keep	Baseline	397B 4-bit no-predict split=4 tokens=200
+Exp01-split1	n/a	11.2	25.6	keep	Lever0-split	397B 4-bit no-predict split=1 tokens=200
+Exp01-split2	n/a	13.41	25.6	keep	Lever0-split	397B 4-bit no-predict split=2 tokens=200
+Exp01-split4	n/a	13.12	25.6	keep	Lever0-split	397B 4-bit no-predict split=4 tokens=200
+Exp01-split8	n/a	13.32	25.6	keep	Lever0-split	397B 4-bit no-predict split=8 tokens=200
+Exp01-split16	n/a	13.35	25.6	keep	Lever0-split	397B 4-bit no-predict split=16 tokens=200
+Exp02-Q3	n/a	14.3	24.7	keep	Lever-Q3	397B Q3 no-predict split=2 tokens=200
+Exp03-predict-off	n/a	13.73	24.7	keep	Lever1-predict	397B Q3 predict=off split=2 tokens=200
+Exp03-predict-on	n/a	12.09	24.7	keep	Lever1-predict	397B Q3 predict=on split=2 tokens=200
+Exp04-bank64	n/a	12.96	0.0	keep	Lever2-bank	397B Q3 predict split=2 bank=64 entries=3840 tokens=200
+Exp04-bank128	n/a	13.49	0.0	keep	Lever2-bank	397B Q3 predict split=2 bank=128 entries=7680 tokens=200
+Exp04-bank176	n/a	13.27	0.0	keep	Lever2-bank	397B Q3 predict split=2 bank=176 entries=10560 tokens=200
+Exp04-bank256	n/a	13.07	0.0	keep	Lever2-bank	397B Q3 predict split=2 bank=256 entries=15360 tokens=200
+Exp04-bank384	n/a	13.91	0.0	keep	Lever2-bank	397B Q3 predict split=2 bank=384 entries=23040 tokens=200
+Exp04-bank512	n/a	0.00	0.00	discard	Lever2-bank	397B Q3 predict split=2 bank=512 entries=30720 tokens=200 — all warm runs failed
+Exp05-bank64-split4	n/a	14.77	0.0	keep	Lever0-split-xval	397B Q3 predict bank=64 split=4 tokens=200
+Exp05-bank64-split2	n/a	14.06	0.0	keep	Lever0-split-xval	397B Q3 predict bank=64 split=2 tokens=200
+Exp05-bank256-split4	n/a	14.59	0.0	keep	Lever0-split-xval	397B Q3 predict bank=256 split=4 tokens=200
+Exp05-bank256-split2	n/a	14.74	0.0	keep	Lever0-split-xval	397B Q3 predict bank=256 split=2 tokens=200

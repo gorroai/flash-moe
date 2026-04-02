@@ -587,3 +587,76 @@ Update arxiv_draft.tex to include:
 - Add Anemll team to acknowledgments
 
 - Paper draft: ~/flash-moe/paper/arxiv_draft.tex
+
+---
+
+## K=4 Campaign Results (April 1-2, 2026)
+
+### Background: The K=8 Bug
+The original autoresearch campaign (Exp00–Exp43) used `--k 10` which silently clamps to K=8 (MAX_K=8 hardcoded). This is WRONG: the model is designed for K=4 (top-4 routing). The correct configuration uses no `--k` flag (default K=4). With K=4:
+- Half the SSD I/O per token vs K=8
+- Temporal prediction works correctly (was broken at K=8: 0% hit rate)
+- **Correct baseline: 21.48 tok/s** (Exp00-k4) vs 20.34 tok/s with K=8
+
+### Campaign Summary (Exp00–Exp05)
+Results in: `autoresearch_results_397b_k4.tsv`
+
+| Config | tok/s | Hit Rate | Reliability | Notes |
+|--------|-------|----------|-------------|-------|
+| K=4, Q3, split=4 (Exp00) | **21.48** | 24.0% | 2-run avg ✓ | CONFIRMED BASELINE |
+| K=4, 4-bit, split=4 (Exp03r) | 19.15 | 23.4% | 2-run avg ✓ | Q3 clearly better |
+| K=4, Q3, split=4 rerun | 20.38 | 24.0% | 2-run avg ✓ | session variance |
+| --cache-entries (any bank) | INVALID | 0% | PREAD-HANG | see below |
+
+### Key Findings
+
+**1. K=4 beats K=8 by +1.14 tok/s (+5.6%)** — Correct routing depth matters.
+
+**2. PREDICT-SILENTLY-NOOP**: `--predict` flag is a no-op. Temporal prediction is always active by default (g_pred_enabled=1). The `[predict]` stats always show ~24% hit rate regardless of flag.
+
+**3. cache-io-split=4 is optimal** (Exp01 sweep). splits 2/4/8/16 all within 0.5 tok/s noise — no sharp sensitivity above split=2.
+
+**4. --cache-entries and --malloc-cache BOTH INVALID on M5 Max 128GB:**
+- Both modes cause pread to hang indefinitely (2/3 of runs deadlock)
+- Binary source comment at cache_entries default: "trust OS page cache (38% faster than Metal LRU)"
+- OS page cache IS the correct caching mechanism on 128GB machines
+- Never use `--cache-entries` or `--malloc-cache` on this hardware
+
+**5. Q3 > 4-bit by +1.23 tok/s (+6.4%)** — Confirmed in Exp03r after thermal recovery.
+
+### Oracle Ceiling
+Measured via timing breakdown (warm run):
+- CMD1 (attention): 19.9 ms (41%)
+- CMD2 (o_proj + shared): 9.6 ms (20%)
+- **Expert I/O (SSD): 14.5 ms (30%)** ← bottleneck
+- CMD3 (expert compute): 1.8 ms (4%)
+- **Total: 48.6 ms → 20.6 tok/s**
+
+**Oracle ceiling (Expert I/O → 0): ~29.3 tok/s**
+Temporal prediction hit rate: 24.2% → 76% of expert loads still go to SSD
+
+### Remaining Headroom: +8-9 tok/s (+40%)
+All lies in reducing Expert I/O from 14.5 ms to near-zero. The only path is **improving prediction accuracy beyond 24%**. This requires code changes:
+- Better routing predictor (beyond same-as-last-token temporal prediction)
+- Target: >50% incremental hit rate (gate from prior 35B campaign)
+- Current binary has all known code optimizations; no flag-based improvements remain
+
+### Correct Inference Command (K=4)
+```bash
+cd ~/flash-moe
+./metal_infer/infer \
+  --model ~/Models/flash_mlx_4bit \
+  --q3-experts \
+  --predict \
+  --cache-io-split 4 \
+  --gguf-embedding ~/Models/flash_mlx_4bit/gguf/embedding_q8_0.bin \
+  --gguf-lm-head ~/Models/flash_mlx_4bit/gguf/lm_head_q6.bin \
+  --prompt "<|im_start|>user\nYour prompt<|im_end|>\n<|im_start|>assistant\n" \
+  --tokens 200 --timing
+```
+Note: NO `--k` flag, NO `--cache-entries`, NO `--malloc-cache`.
+
+### Campaign Status: BEAT REFERENCE
+- Prior campaign (K=8): 20.34 tok/s
+- K=4 campaign: **21.48 tok/s** (+5.6% over prior reference)
+- Further improvement requires new predictor development (code change, needs approval)

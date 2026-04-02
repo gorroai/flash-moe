@@ -1,0 +1,29 @@
+exp_id	commit	decode_tok_s	predict_hit_pct	status	lever	description
+Exp00-k4	n/a	21.48	24.0	keep	Baseline	K=4 Q3 predict split=4 tokens=200
+Exp01-split1	n/a	17.79	24.0	keep	Lever0-split	K=4 Q3 predict split=1 tokens=200
+Exp01-split2	n/a	20.23	24.0	keep	Lever0-split	K=4 Q3 predict split=2 tokens=200
+Exp01-split4	n/a	20.7	24.0	keep	Lever0-split	K=4 Q3 predict split=4 tokens=200
+Exp01-split8	n/a	20.36	24.0	keep	Lever0-split	K=4 Q3 predict split=8 tokens=200
+Exp01-split16	n/a	20.3	24.0	keep	Lever0-split	K=4 Q3 predict split=16 tokens=200
+Exp02-predict-off	n/a	20.27	24.0	keep	Lever1-predict	K=4 Q3 predict=off split=4 tokens=200
+Exp02-predict-on	n/a	19.63	24.0	keep	Lever1-predict	K=4 Q3 predict=on split=4 tokens=200
+Exp03-4bit	n/a	17.04	23.4	keep	Lever-quant	K=4 4-bit predict split=4 tokens=200
+Exp03-Q3	n/a	18.07	24.0	keep	Lever-quant	K=4 Q3 predict split=4 tokens=200
+Exp04-bank32	n/a	0.00	0.00	discard	Lever2-bank	K=4 Q3 predict split=4 bank=32/layer entries=1920 tokens=200 — HANG: binary deadlocked on tiny cache, killed after 16h
+Exp04-bank64	n/a	22.95	0.0	keep	Lever2-bank	K=4 Q3 predict split=4 bank=64/layer entries=3840 tokens=200
+Exp04-bank128	n/a	22.89	0.0	keep	Lever2-bank	K=4 Q3 predict split=4 bank=128/layer entries=7680 tokens=200
+Exp04-bank256	n/a	22.94	0.0	keep	Lever2-bank	K=4 Q3 predict split=4 bank=256/layer entries=15360 tokens=200
+Exp04-bank512	n/a	22.96	0.0	keep	Lever2-bank	K=4 Q3 predict split=4 bank=512/layer entries=30720 tokens=200
+Exp04-bank1024	n/a	0.00	0.00	discard	Lever2-bank	K=4 Q3 predict split=4 bank=1024/layer entries=61440 tokens=200 — all warm runs failed
+Exp05-bank512-split1	n/a	22.62	0.0	keep	Lever0-split-xval	K=4 Q3 predict bank=512/layer split=1 tokens=200
+Exp05-bank512-split2	n/a	22.16	0.0	keep	Lever0-split-xval	K=4 Q3 predict bank=512/layer split=2 tokens=200
+Exp05-bank512-split8	n/a	22.86	0.0	keep	Lever0-split-xval	K=4 Q3 predict bank=512/layer split=8 tokens=200
+Exp05-bank512-split16	n/a	0.00	0.00	discard	Lever0-split-xval	K=4 Q3 predict bank=512/layer split=16 tokens=200 — all warm runs failed
+Exp04-bank64-INVALID	n/a	22.95	0.0	discard	Lever2-bank	K=4 Q3 split=4 bank=64 entries=3840 — PREAD-HANG: pread blocks in MTLBuffer contents, 2/3 runs hang, single-run measurement
+Exp04-bank128-INVALID	n/a	22.89	0.0	discard	Lever2-bank	K=4 Q3 split=4 bank=128 entries=7680 — PREAD-HANG: single-run measurement, unreliable
+Exp04-bank256-INVALID	n/a	22.94	0.0	discard	Lever2-bank	K=4 Q3 split=4 bank=256 entries=15360 — PREAD-HANG: single-run measurement, unreliable
+Exp04-bank512-INVALID	n/a	22.96	0.0	discard	Lever2-bank	K=4 Q3 split=4 bank=512 entries=30720 — PREAD-HANG: single-run measurement, unreliable; Metal LRU inferior to OS page cache on 128GB
+Exp03r-4bit	n/a	19.15	23.4	keep	Lever-quant	K=4 4-bit predict split=4 tokens=200 RERUN
+Exp03r-Q3	n/a	20.38	24.0	keep	Lever-quant	K=4 Q3 predict split=4 tokens=200 RERUN
+Oracle-timing	n/a	29.3	100.0	keep	Oracle	K=4 Q3 split=4 timing-based oracle (Expert I/O=0): CMD1=19.9ms CMD2=9.6ms CMD3=1.8ms total=34.1ms tokens=200
+Baseline-timing	n/a	20.6	24.2	keep	Baseline-timing	K=4 Q3 split=4 timing breakdown: CMD1=19.9ms CMD2=9.6ms IO=14.5ms CMD3=1.8ms total=48.6ms tokens=200
