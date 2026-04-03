@@ -1,0 +1,6 @@
+experiment	config	tok_s	expert_io_ms	hit_rate	aot_rate	notes
+Exp00-baseline	K=4,Q3,split=4,predict	22.22	10.4	20.6%	N/A	reference R1=21.94 R2=22.19 R3=22.24 avg_r2r3=22.22
+Exp01-aot	K=4,Q3,split=4,predict,aot,vel	15.20	25.6	25.1%	11.0%	M2R2 AoT threshold=5.0 R1=15.59 R2=15.33 R3=15.07 avg_r2r3=15.20 FAIL
+Exp00-baseline-cold	K=4,Q3,split=4,predict	15.2	24.2	27.3%	N/A	COLD CACHE — fresh compile; shows true cold-state baseline; gate was invalid (Exp00 used warm-cache pre-built binary)
+Exp01-aot-fair	K=4,Q3,split=4,predict,aot,vel	15.2	25.6	25.1%	11.0%	FAIR COMPARISON — both cold cache; AoT neutral vs cold baseline; velocity overhead cancels prefetch win
+NOTE	—	—	—	—	—	21.48 tok/s requires warm page cache (202.5GB experts; cache builds over 24h of runs); binary not reproducible from fresh compile at same state
