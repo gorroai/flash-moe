@@ -1,5 +1,5 @@
 # Build artifacts
-metal_infer/infer
+# metal_infer/infer — intentionally NOT ignored; committed after each gate pass
 metal_infer/chat
 metal_infer/metal_infer
 metal_infer/bench_pread
