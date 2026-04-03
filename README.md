@@ -41,7 +41,18 @@ We achieved **20.34 tok/s with 4-bit experts** — faster than the 2-bit physica
 |---------|-------------|------------|
 | M3 Max 48GB — Dan Woods ([danveloper/flash-moe](https://github.com/danveloper/flash-moe)) | 4.36 tok/s | baseline |
 | M5 Max 128GB — Anemll fork (this repo, pre-autoresearch) | 12.9 tok/s | 3.0× |
-| **M5 Max 128GB — autoresearch/mar25 (this repo)** | **20.34 tok/s** | **4.67×** |
+| M5 Max 128GB — autoresearch/mar25 (this repo) | 20.34 tok/s | 4.67× |
+| **M5 Max 128GB — K=4 fix (this repo)** | **21.48 tok/s** | **4.93×** |
+
+### K=4 Routing Fix (April 2026)
+
+The autoresearch campaign accidentally used `--k 10`, which silently clamps to K=8 (hardcoded `MAX_K=8`). The model was trained with **K=4** top-k routing. Removing the `--k` flag restored correct behavior:
+
+- **+5.6% decode speed** (20.34 → 21.48 tok/s)
+- Temporal prediction hit rate restored to expected range (~24%)
+- Half the SSD I/O per token compared to K=8
+
+The K=4 result supersedes the March 2026 campaign result. All subsequent experiments use the default K=4 (no `--k` flag).
 
 ### Best Inference Command
 
@@ -65,6 +76,20 @@ We achieved **20.34 tok/s with 4-bit experts** — faster than the 2-bit physica
 - **Cross-layer prediction:** near-zero hit rate
 - **Encoder fusion:** zero improvement (encoder overhead only ~1μs)
 - **Shared memory optimizations:** hurt occupancy — M5 Max L2 handles it automatically
+
+---
+
+## Follow-Up Research (April 2026)
+
+### M2R2 Ahead-of-Time Expert Loading — Experiment
+
+Investigated [M2R2](https://arxiv.org/abs/2502.02040)-style ahead-of-time (AoT) expert prefetching driven by per-layer residual velocity tracking.
+
+**Velocity characterization:** Residual velocity (||h_t - h_{t-1}||) is monotonically increasing across the 60 layers — layer 0: 0.95, layer 27: 1.95, layer 59: 24.4. Layers 0–27 are ultra-stable (velocity < 2.0, 47% of network); layers 0–40 are below 5.0 (68%).
+
+**AoT result:** Neutral. The M2R2 concept doesn't transfer to SSD-streamed inference. In the original GPU context, expert transfers take longer than one attention layer, requiring a 2-layer lookahead. In flash-moe, Q3 expert reads take ~0.3ms per layer (K=4, cache-io-split 4) vs CMD1 attention at ~19.9ms — reads are already 66× faster than the compute window. Temporal prediction already hides them completely. Starting reads earlier provides no additional benefit.
+
+**Remaining headroom to oracle ceiling (29.3 tok/s):** Entirely in routing predictor accuracy. Temporal prediction hit rate of 24% must exceed ~50% to realize the remaining +8 tok/s. The only viable path is a better predictor — not faster I/O overlap.
 
 ---
 
