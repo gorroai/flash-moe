@@ -70,3 +70,4 @@ flash-moe-m5-max-optimization.pdf
 *_org.json
 *_org.md
 *.orig.md
+.worktrees/
